@@ -2,10 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# 依存を先に入れてキャッシュ効かせる
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+# アプリをコピー
+COPY app ./app
 
-# Cloud Run が渡す PORT を使って待ち受ける
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# Cloud Run は PORT 環境変数（なければ8080）で待ち受け
+ENV PORT=8080
+
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
