@@ -24,8 +24,9 @@ def kokkai_test():
     url = "https://kokkai.ndl.go.jp/api/meeting"
 
     params = {
-        "any": "AI",
-        "maximumRecords": 1,
+        "nameOfHouse": "衆議院",
+        "nameOfMeeting": "本会議",
+        "maximumRecords": 100,
         "recordPacking": "json",
     }
 
