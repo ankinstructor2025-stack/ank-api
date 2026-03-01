@@ -74,8 +74,8 @@ def ensure_user_db_in_gcs(uid: str) -> dict:
 
 
 @router.post("/user/init")
-def user_init(Authorization: str | None = Header(default=None)):
-    uid = get_uid_from_auth_header(Authorization)
+def user_init(authorization: str | None = Header(default=None)):
+    uid = get_uid_from_auth_header(authorization)
     r = ensure_user_db_in_gcs(uid)
 
     return {
