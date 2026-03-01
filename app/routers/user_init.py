@@ -24,7 +24,7 @@ def ensure_firebase_initialized():
         return
     # Cloud RunならADCでOK（環境変数不要）
     firebase_admin.initialize_app(
-        options={"projectId": "ank-project-77283"}
+        options={"projectId": "ank-firebase"}
     )
 
 def get_uid_from_auth_header(authorization: str | None) -> str:
