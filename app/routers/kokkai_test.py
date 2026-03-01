@@ -24,8 +24,9 @@ def kokkai_test():
     url = "https://kokkai.ndl.go.jp/api/meeting"
 
     params = {
-        "keyword": "AI",
-        "maximumRecords": 1
+        "any": "AI",
+        "maximumRecords": 1,
+        "recordPacking": "json",
     }
 
     try:
