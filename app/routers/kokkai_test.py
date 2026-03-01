@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 import requests
 
 router = APIRouter(
-    prefix="/ingest/kokkai",
+    prefix="/kokkai",
     tags=["kokkai"]
 )
 
