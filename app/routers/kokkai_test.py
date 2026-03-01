@@ -26,7 +26,7 @@ def kokkai_test():
     params = {
         "nameOfHouse": "衆議院",
         "nameOfMeeting": "本会議",
-        "maximumRecords": 1,
+        "maximumRecords": 10,
         "recordPacking": "json",
     }
 
