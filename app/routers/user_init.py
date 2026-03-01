@@ -23,8 +23,9 @@ def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
     # Cloud RunならADCでOK（環境変数不要）
-    firebase_admin.initialize_app()
-
+    firebase_admin.initialize_app(
+        options={"projectId": "ank-project-77283"}
+    )
 
 def get_uid_from_auth_header(authorization: str | None) -> str:
     if not authorization:
