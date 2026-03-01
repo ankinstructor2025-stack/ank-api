@@ -4,6 +4,7 @@ from app.routers.health import router as health_router
 from app.routers.session import router as session_router
 from app.routers.ingest import router as ingest_router
 from app.routers.search import router as search_router
+from app.routers.user_init import router as user_init_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -13,6 +14,7 @@ def create_app() -> FastAPI:
     app.include_router(session_router, prefix="/v1")
     app.include_router(ingest_router, prefix="/v1")
     app.include_router(search_router, prefix="/v1")
+    app.include_router(user_init_router, prefix="/v1")
     return app
 
 app = create_app()
