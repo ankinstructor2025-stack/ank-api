@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.routers.ingest.kokkai_test import router as kokkai_router
+from routers.ingest.kokkai_test import router as kokkai_router
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
