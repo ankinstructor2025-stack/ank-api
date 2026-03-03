@@ -9,6 +9,7 @@ from app.routers.opendata_test import router as opendata_router
 from app.routers.jma_test import router as jma_router
 from app.routers.egov_test import router as egov_router
 from app.routers.caa_test import router as caa_router
+from app.routers.tokyo_test import router as tokyo_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -23,6 +24,7 @@ def create_app() -> FastAPI:
     app.include_router(jma_router, prefix="/v1")
     app.include_router(egov_router, prefix="/v1")
     app.include_router(caa_router, prefix="/v1")
+    app.include_router(tokyo_router, prefix="/v1")
     return app
 
 app = create_app()
