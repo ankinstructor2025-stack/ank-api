@@ -7,6 +7,7 @@ from app.routers.user_init import router as user_init_router
 from app.routers.kokkai_test import router as kokkai_router
 from app.routers.opendata_test import router as opendata_router
 from app.routers.jma_test import router as jma_router
+from app.routers.egov_test import router as egov_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -19,6 +20,7 @@ def create_app() -> FastAPI:
     app.include_router(kokkai_router, prefix="/v1")
     app.include_router(opendata_router, prefix="/v1")
     app.include_router(jma_router, prefix="/v1")
+    app.include_router(egov_router, prefix="/v1")
     return app
 
 app = create_app()
