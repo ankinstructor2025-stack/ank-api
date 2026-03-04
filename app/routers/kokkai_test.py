@@ -1,17 +1,59 @@
-# app/routers/kokkai_router.py
+# app/routers/kokkai_test.py
 
 import os
 import json
+import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 import requests
 from google.cloud import storage
 
+import firebase_admin
+from firebase_admin import auth as fb_auth
+
+import ulid
+
 router = APIRouter(prefix="/kokkai", tags=["kokkai"])
+
+JST = ZoneInfo("Asia/Tokyo")
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 KOKKAI_TEMPLATE_PATH = "template/kokkai.json"
+
+
+# user_init.py / upload_and_register.py と合わせる
+def user_db_path(uid: str) -> str:
+    return f"users/{uid}/ank.db"
+
+
+def ensure_firebase_initialized():
+    if firebase_admin._apps:
+        return
+    firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
+
+
+def get_uid_from_auth_header(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    ensure_firebase_initialized()
+    try:
+        decoded = fb_auth.verify_id_token(token)
+        uid = decoded.get("uid")
+        if not uid:
+            raise HTTPException(status_code=401, detail="uid not found in token")
+        return uid
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
 def load_kokkai_template() -> dict:
@@ -101,21 +143,17 @@ def _summarize_first(url: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-@router.post("/test")
-def kokkai_test():
+def fetch_records_from_template() -> Tuple[str, str, List[Dict[str, Any]]]:
     """
-    国会議事録API 接続テスト（テンプレ参照）
-    - endpoint が meeting/speech どちらでも動く
-    - fetch.all=true の場合は startRecord でページングして max_total まで取得
+    template/kokkai.json に従って取得する
+    戻り値: (requested_url_last, record_type_key, records)
     """
-
     tpl = load_kokkai_template()
 
     url = tpl.get("endpoint") or "https://kokkai.ndl.go.jp/api/meeting"
     params = dict(tpl.get("params") or {})
     fetch_cfg = dict(tpl.get("fetch") or {})
 
-    # 必須系（テンプレが欠けてても動く）
     params.setdefault("recordPacking", "json")
     params["maximumRecords"] = _clamp_maximum_records(url, params.get("maximumRecords", 10))
 
@@ -133,18 +171,7 @@ def kokkai_test():
     if not all_mode:
         data, requested_url = _fetch_json(url, params)
         records = _extract_records(data, key)
-
-        return {
-            "mode": "single",
-            "record_type": key,
-            "requested_url": requested_url,
-            "count": len(records),
-            "first": _summarize_first(url, records),
-            # 0件切り分け用（デモで便利。不要なら後で消してOK）
-            "top_keys": list(data.keys()),
-            "numberOfRecords": data.get("numberOfRecords"),
-            "nextRecordPosition": data.get("nextRecordPosition"),
-        }
+        return requested_url, key, records
 
     # ---- all=true（ページング） ----
     collected: List[Dict[str, Any]] = []
@@ -168,11 +195,135 @@ def kokkai_test():
             break
         start = nxt
 
+    return requested_url_last, key, collected
+
+
+def speech_id_of(r: Dict[str, Any]) -> str:
+    return str(r.get("speechID") or r.get("speechId") or r.get("speech_id") or "")
+
+
+@router.post("/test")
+def kokkai_test():
+    """
+    国会議事録API 接続テスト（テンプレ参照）
+    """
+    requested_url, record_type, records = fetch_records_from_template()
+
     return {
-        "mode": "all",
-        "record_type": key,
-        "requested_url": requested_url_last,
-        "count": len(collected),
-        "max_total": max_total,
-        "first": _summarize_first(url, collected),
+        "mode": "test",
+        "record_type": record_type,
+        "requested_url": requested_url,
+        "count": len(records),
+        "first": _summarize_first(requested_url, records),
+    }
+
+
+@router.post("/ingest")
+def kokkai_ingest(
+    authorization: str | None = Header(default=None),
+):
+    """
+    template/kokkai.json の条件で取得した records を row_data に登録する。
+    ※テーブル作成はしない（存在しない場合はエラー）
+    ※重複は UNIQUE INDEX(uq_row_data_kokkai_item) に任せ、INSERT OR IGNORE でスキップする
+    """
+    uid = get_uid_from_auth_header(authorization)
+
+    requested_url, record_type, records = fetch_records_from_template()
+
+    if record_type != "speechRecord":
+        # いったん kokkai は speech 前提で設計しているので明示的に弾く
+        raise HTTPException(status_code=400, detail=f"record_type must be speechRecord. got={record_type}")
+
+    if not records:
+        return {
+            "mode": "ingest",
+            "requested_url": requested_url,
+            "fetched": 0,
+            "inserted": 0,
+            "skipped": 0,
+        }
+
+    # --- ank.db を GCS から /tmp へ ---
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
+
+    local_db_path = f"/tmp/ank_{uid}_kokkai.db"
+    db_blob.download_to_filename(local_db_path)
+
+    file_id = str(ulid.new())
+    created_at = datetime.now(tz=JST).isoformat()
+
+    inserted = 0
+    skipped = 0
+
+    # --- DB へ登録 ---
+    conn = sqlite3.connect(local_db_path)
+    try:
+        cur = conn.cursor()
+
+        # テーブルが無い場合はここで落とす（作成はしない）
+        # uploaded_files: 取り込みバッチの履歴として1件追加
+        logical_name = f"kokkai_{file_id[-6:]}"
+        cur.execute(
+            """
+            INSERT INTO uploaded_files
+              (file_id, logical_name, original_filename, ext, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (file_id, logical_name, "template/kokkai.json", "api", created_at),
+        )
+
+        # row_data: あなたのDDLに合わせる
+        # (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
+        row_index = 1
+        for r in records:
+            sid = speech_id_of(r)
+            if not sid:
+                skipped += 1
+                row_index += 1
+                continue
+
+            row_id = str(ulid.new())
+            content = json.dumps(r, ensure_ascii=False)
+
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO row_data
+                  (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (row_id, file_id, "kokkai", KOKKAI_TEMPLATE_PATH, sid, row_index, content, created_at),
+            )
+
+            if cur.rowcount == 1:
+                inserted += 1
+            else:
+                skipped += 1
+
+            row_index += 1
+
+        conn.commit()
+
+    except sqlite3.OperationalError as e:
+        # テーブル未作成など
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+    finally:
+        conn.close()
+
+    # --- GCSへ戻す ---
+    db_blob.upload_from_filename(local_db_path)
+
+    return {
+        "mode": "ingest",
+        "requested_url": requested_url,
+        "file_id": file_id,
+        "fetched": len(records),
+        "inserted": inserted,
+        "skipped": skipped,
     }
