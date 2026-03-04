@@ -201,43 +201,27 @@ def fetch_records_from_template() -> Tuple[str, str, List[Dict[str, Any]]]:
 def speech_id_of(r: Dict[str, Any]) -> str:
     return str(r.get("speechID") or r.get("speechId") or r.get("speech_id") or "")
 
-
 @router.post("/test")
-def kokkai_test():
-    """
-    国会議事録API 接続テスト（テンプレ参照）
-    """
-    requested_url, record_type, records = fetch_records_from_template()
-
-    return {
-        "mode": "test",
-        "record_type": record_type,
-        "requested_url": requested_url,
-        "count": len(records),
-        "first": _summarize_first(requested_url, records),
-    }
-
-
-@router.post("/ingest")
-def kokkai_ingest(
+def kokkai_test_and_ingest(
     authorization: str | None = Header(default=None),
 ):
     """
-    template/kokkai.json の条件で取得した records を row_data に登録する。
-    ※テーブル作成はしない（存在しない場合はエラー）
-    ※重複は UNIQUE INDEX(uq_row_data_kokkai_item) に任せ、INSERT OR IGNORE でスキップする
+    取得テスト + row_data登録（分けない）
+    - template/kokkai.json の条件で取得
+    - users/{uid}/ank.db の row_data に登録
+    - UNIQUE(uq_row_data_kokkai_item) は INSERT OR IGNORE でスキップ
     """
     uid = get_uid_from_auth_header(authorization)
 
     requested_url, record_type, records = fetch_records_from_template()
 
     if record_type != "speechRecord":
-        # いったん kokkai は speech 前提で設計しているので明示的に弾く
         raise HTTPException(status_code=400, detail=f"record_type must be speechRecord. got={record_type}")
 
-    if not records:
+    fetched = len(records)
+    if fetched == 0:
         return {
-            "mode": "ingest",
+            "mode": "test+ingest",
             "requested_url": requested_url,
             "fetched": 0,
             "inserted": 0,
@@ -262,13 +246,11 @@ def kokkai_ingest(
     inserted = 0
     skipped = 0
 
-    # --- DB へ登録 ---
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
 
-        # テーブルが無い場合はここで落とす（作成はしない）
-        # uploaded_files: 取り込みバッチの履歴として1件追加
+        # uploaded_files に履歴を1件（logical_name は UNIQUE 前提）
         logical_name = f"kokkai_{file_id[-6:]}"
         cur.execute(
             """
@@ -279,8 +261,6 @@ def kokkai_ingest(
             (file_id, logical_name, "template/kokkai.json", "api", created_at),
         )
 
-        # row_data: あなたのDDLに合わせる
-        # (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
         row_index = 1
         for r in records:
             sid = speech_id_of(r)
@@ -310,9 +290,6 @@ def kokkai_ingest(
 
         conn.commit()
 
-    except sqlite3.OperationalError as e:
-        # テーブル未作成など
-        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
     finally:
         conn.close()
 
@@ -320,10 +297,10 @@ def kokkai_ingest(
     db_blob.upload_from_filename(local_db_path)
 
     return {
-        "mode": "ingest",
+        "mode": "test+ingest",
         "requested_url": requested_url,
         "file_id": file_id,
-        "fetched": len(records),
+        "fetched": fetched,
         "inserted": inserted,
         "skipped": skipped,
     }
