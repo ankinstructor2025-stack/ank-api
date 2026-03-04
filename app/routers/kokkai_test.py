@@ -301,6 +301,7 @@ def kokkai_test_and_ingest(
         "requested_url": requested_url,
         "file_id": file_id,
         "fetched": fetched,
+        "count": fetched,
         "inserted": inserted,
         "skipped": skipped,
     }
