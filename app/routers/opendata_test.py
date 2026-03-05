@@ -31,6 +31,7 @@ def ensure_firebase_initialized():
 def get_uid_from_auth_header(authorization: str | None) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
+
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
@@ -39,15 +40,13 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail="Empty bearer token")
 
     ensure_firebase_initialized()
+
     try:
         decoded = fb_auth.verify_id_token(token)
-        uid = decoded.get("uid")
-        if not uid:
-            raise HTTPException(status_code=401, detail="uid not found in token")
-        return uid
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
+        return decoded["uid"]
 
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 # ---------------------------
 # Template 読み込み
