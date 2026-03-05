@@ -6,10 +6,8 @@ from app.routers.search import router as search_router
 from app.routers.user_init import router as user_init_router
 from app.routers.kokkai import router as kokkai_router
 from app.routers.opendata import router as opendata_router
-from app.routers.jma_test import router as jma_router
 from app.routers.egov_test import router as egov_router
 from app.routers.caa_test import router as caa_router
-from app.routers.tokyo_test import router as tokyo_router
 from app.routers.upload_and_register import router as upload_and_register
 from app.routers.row_data_ingest import router as row_data_ingest
 
@@ -23,10 +21,8 @@ def create_app() -> FastAPI:
     app.include_router(user_init_router, prefix="/v1")
     app.include_router(kokkai_router, prefix="/v1")
     app.include_router(opendata_router, prefix="/v1")
-    app.include_router(jma_router, prefix="/v1")
     app.include_router(egov_router, prefix="/v1")
     app.include_router(caa_router, prefix="/v1")
-    app.include_router(tokyo_router, prefix="/v1")
     app.include_router(upload_and_register, prefix="/v1")
     app.include_router(row_data_ingest, prefix="/v1")
     return app
