@@ -4,7 +4,7 @@ from app.routers.health import router as health_router
 from app.routers.session import router as session_router
 from app.routers.search import router as search_router
 from app.routers.user_init import router as user_init_router
-from app.routers.kokkai_test import router as kokkai_router
+from app.routers.kokkai import router as kokkai_router
 from app.routers.opendata_test import router as opendata_router
 from app.routers.jma_test import router as jma_router
 from app.routers.egov_test import router as egov_router
