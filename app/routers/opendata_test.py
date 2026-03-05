@@ -25,7 +25,7 @@ OPENDATA_TEMPLATE_PATH = "template/opendata.json"
 def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
-    firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
+    firebase_admin.initialize_app()
 
 
 def get_uid_from_auth_header(authorization: str | None) -> str:
