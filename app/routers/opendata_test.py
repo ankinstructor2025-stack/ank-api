@@ -14,24 +14,22 @@ router = APIRouter(prefix="/opendata", tags=["opendata"])
 # 既存の直書きは残す（/datasets/* が依存しているため）
 CKAN_BASE = "https://data.e-gov.go.jp/data/api/action"  # e-Govデータポータル CKAN API base
 
-# template/opendata.json を参照
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 OPENDATA_TEMPLATE_PATH = "template/opendata.json"
 
 
 # ---------------------------
-# Firebase 認証（kokkai と同じ）
+# Firebase 認証（kokkai_test.py と同じ）
 # ---------------------------
 def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
-    firebase_admin.initialize_app()
+    firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
 
 
 def get_uid_from_auth_header(authorization: str | None) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
@@ -40,21 +38,21 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail="Empty bearer token")
 
     ensure_firebase_initialized()
-
     try:
         decoded = fb_auth.verify_id_token(token)
-        return decoded["uid"]
-
+        uid = decoded.get("uid")
+        if not uid:
+            raise HTTPException(status_code=401, detail="uid not found in token")
+        return uid
     except Exception as e:
+        # まず原因を見える化（401の理由を返す）
         raise HTTPException(status_code=401, detail=str(e))
+
 
 # ---------------------------
 # Template 読み込み
 # ---------------------------
 def load_opendata_template() -> dict:
-    """
-    GCS: template/opendata.json を読み込んで dict で返す
-    """
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(OPENDATA_TEMPLATE_PATH)
@@ -69,47 +67,12 @@ def load_opendata_template() -> dict:
         raise HTTPException(status_code=500, detail=f"invalid template json: {e}")
 
 
-# ---------------------------
-# HTTP / CKAN helper
-# ---------------------------
-def _fetch_any_json(url: str, params: dict | None = None) -> tuple[dict, str]:
-    """
-    (json, requested_url) を返す
-    """
-    try:
-        res = requests.get(url, params=params or {}, timeout=20)
-        res.raise_for_status()
-        return res.json(), res.url
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"opendata api error: {str(e)}")
-
-
-def _ckan_get(action: str, params: dict | None = None) -> dict:
-    """
-    CKAN action API を GET で呼び出して result を返す（既存維持）
-    """
-    url = f"{CKAN_BASE}/{action}"
-    payload, _requested_url = _fetch_any_json(url, params=params)
-    if not payload.get("success", False):
-        raise HTTPException(status_code=502, detail=f"ckan api error: success=false ({action})")
-    return payload.get("result")
-
-
 def _resolve_template_endpoint_and_params(tpl: dict) -> tuple[str, dict]:
-    """
-    template/opendata.json から endpoint/params を取り出す
-
-    1) シンプル形式
-       { "endpoint": "...", "params": {...} }
-
-    2) 拡張形式
-       { "dataset_search": { "endpoint": "...", "params": {...} }, ... }
-
-    /test はどちらでも動くようにする
-    """
+    # 形式1: { "endpoint": "...", "params": {...} }
     if isinstance(tpl.get("endpoint"), str):
         return tpl["endpoint"], (tpl.get("params") or {})
 
+    # 形式2（拡張）: { "dataset_search": { "endpoint": "...", "params": {...} }, ... }
     ds = tpl.get("dataset_search") or {}
     if isinstance(ds.get("endpoint"), str):
         return ds["endpoint"], (ds.get("params") or {})
@@ -117,87 +80,75 @@ def _resolve_template_endpoint_and_params(tpl: dict) -> tuple[str, dict]:
     raise HTTPException(status_code=500, detail="template missing: endpoint")
 
 
-def _normalize_ckan_result(payload: dict) -> tuple[object, bool]:
-    """
-    CKAN形式 {"success": true, "result": ...} なら result を返す。
-    そうでなければ payload をそのまま返す。
-    """
+# ---------------------------
+# CKAN helper（既存）
+# ---------------------------
+def _fetch_any_json(url: str, params: dict | None = None) -> tuple[dict, str]:
+    try:
+        res = requests.get(url, params=params or {}, timeout=20)
+        res.raise_for_status()
+        return res.json(), res.url
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"ckan api error: {str(e)}")
+
+
+def _ckan_get(action: str, params: dict | None = None) -> dict:
+    url = f"{CKAN_BASE}/{action}"
+    payload, _requested_url = _fetch_any_json(url, params=params)
+    if not payload.get("success", False):
+        raise HTTPException(status_code=502, detail=f"ckan api error: success=false ({action})")
+    return payload.get("result")
+
+
+def _normalize_ckan_result(payload: dict) -> object:
+    # CKAN形式なら result を返す
     if isinstance(payload, dict) and "success" in payload and "result" in payload:
         if not payload.get("success", False):
-            return payload, False
-        return payload.get("result"), True
-    return payload, True
+            raise HTTPException(status_code=502, detail="ckan api error: success=false")
+        return payload.get("result")
+    return payload
 
 
-def _calc_count(result: object) -> tuple[int, int | None]:
-    """
-    UI向け count を安定して返す
-    - list => len(list)
-    - dict with results(list) => len(results), total=result.get("count")
-    - other => 0
-    """
+def _calc_count_and_items(result: object) -> tuple[int, list]:
+    # package_list: result は list
     if isinstance(result, list):
-        return len(result), None
+        return len(result), result[:20]
 
-    if isinstance(result, dict):
-        results = result.get("results")
-        if isinstance(results, list):
-            total = result.get("count")
-            try:
-                total = int(total) if total is not None else None
-            except Exception:
-                total = None
-            return len(results), total
+    # package_search: result は dict（count/results）
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        items = result["results"][:20]
+        return len(items), items
 
-    return 0, None
+    return 0, []
 
 
 # ----------------------------------------
-# 取得テスト（テンプレ参照 + 認証必須）
-# 呼び出し側（kokkai方式）に合わせる
+# 取得テスト（呼び出し側を kokkai に合わせる）
+#  - Authorization 必須
+#  - template/opendata.json 参照
+#  - count を返す
 # ----------------------------------------
 @router.get("/test")
-def opendata_test(
-    authorization: str | None = Header(default=None),
-):
-    """
-    e-Govデータポータル（CKAN）接続テスト（template/opendata.json を参照）
-    - Authorization: Bearer <idToken> を必須（kokkai と同じ）
-    - endpoint / params はテンプレに寄せる
-    - count は必ず返す
-    """
-    _uid = get_uid_from_auth_header(authorization)  # いまは認証確認のみ（将来の行登録で利用）
+def opendata_test(authorization: str | None = Header(default=None)):
+    _uid = get_uid_from_auth_header(authorization)  # 認証だけ合わせる（今はuid未使用）
 
     tpl = load_opendata_template()
     endpoint, params = _resolve_template_endpoint_and_params(tpl)
 
     payload, requested_url = _fetch_any_json(endpoint, params=params)
-    result, ok = _normalize_ckan_result(payload)
-    if not ok:
-        raise HTTPException(status_code=502, detail="ckan api error: success=false")
+    result = _normalize_ckan_result(payload)
 
-    count, total = _calc_count(result)
+    count, items = _calc_count_and_items(result)
 
-    resp = {
+    return {
         "mode": "test",
         "requested_url": requested_url,
         "count": count,
+        "items": items
     }
-    if total is not None:
-        resp["total"] = total  # package_searchの総件数など
-
-    # 返しすぎない（デモなので先頭だけ）
-    if isinstance(result, list):
-        resp["items"] = result[:20]
-    elif isinstance(result, dict) and isinstance(result.get("results"), list):
-        resp["items"] = result["results"][:20]
-    else:
-        resp["items"] = []
-
-    return resp
 
 
-# ---- 以下は既存のまま（直書き） ----
+# ---- 以下は既存のまま（必要なら後で認証を揃える） ----
 
 @router.get("/datasets/search")
 def search_datasets(
@@ -218,12 +169,7 @@ def search_datasets(
             "num_resources": len(ds.get("resources", []) or []),
         })
 
-    return {
-        "count": result.get("count", 0),
-        "rows": rows,
-        "start": start,
-        "items": items
-    }
+    return {"count": result.get("count", 0), "rows": rows, "start": start, "items": items}
 
 
 @router.get("/datasets/recent")
@@ -243,12 +189,7 @@ def recent_datasets(
             "num_resources": len(ds.get("resources", []) or []),
         })
 
-    return {
-        "count": len(items),
-        "limit": limit,
-        "offset": offset,
-        "items": items
-    }
+    return {"count": len(items), "limit": limit, "offset": offset, "items": items}
 
 
 @router.get("/datasets/{dataset_id}")
