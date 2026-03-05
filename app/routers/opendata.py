@@ -354,6 +354,7 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
         "mode": "fetch_and_register",
         "requested_url": requested_url,
         "file_id": file_id,
+        "count": fetched,
         "total_count": total_count,   # CKAN側の総件数
         "fetched": fetched,           # 実際に取得して登録対象にした件数（上限適用後）
         "inserted": inserted,
