@@ -5,7 +5,7 @@ import sqlite3
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -70,7 +70,180 @@ def load_egov_template() -> dict:
         raise HTTPException(status_code=500, detail=f"invalid template json: {e}")
 
 
-def fetch_html_from_template() -> tuple[str, str, int]:
+def fetch_html(url: str, headers: dict | None = None, timeout_sec: int = 15) -> tuple[str, str, int]:
+    try:
+        r = requests.get(url, headers=headers or {}, timeout=timeout_sec)
+        r.raise_for_status()
+        return r.url, r.text or "", r.status_code
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"egov fetch error: {str(e)}")
+
+
+def normalize_lines(text: str) -> list[str]:
+    lines = [x.strip() for x in text.splitlines()]
+    return [x for x in lines if x]
+
+
+def is_question_start(line: str) -> bool:
+    patterns = [
+        r"^Q[\.．:：]?\s*",
+        r"^問[1-9０-９0-9]*[\.．:：]?\s*",
+        r"^質問[1-9０-９0-9]*[\.．:：]?\s*",
+    ]
+    return any(re.match(p, line) for p in patterns)
+
+
+def is_answer_start(line: str) -> bool:
+    patterns = [
+        r"^A[\.．:：]?\s*",
+        r"^答[1-9０-９0-9]*[\.．:：]?\s*",
+        r"^回答[1-9０-９0-9]*[\.．:：]?\s*",
+    ]
+    return any(re.match(p, line) for p in patterns)
+
+
+def strip_question_prefix(line: str) -> str:
+    return re.sub(r"^(Q|問|質問)[1-9０-９0-9]*[\.．:：]?\s*", "", line).strip()
+
+
+def strip_answer_prefix(line: str) -> str:
+    return re.sub(r"^(A|答|回答)[1-9０-９0-9]*[\.．:：]?\s*", "", line).strip()
+
+
+def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
+    results = []
+    q = None
+    a_lines = []
+    mode = None
+
+    for line in lines:
+        if is_question_start(line):
+            if q and a_lines:
+                results.append({
+                    "question": strip_question_prefix(q).strip(),
+                    "answer": "\n".join(a_lines).strip()
+                })
+            q = line
+            a_lines = []
+            mode = "q"
+            continue
+
+        if is_answer_start(line):
+            mode = "a"
+            ans = strip_answer_prefix(line)
+            if ans:
+                a_lines.append(ans)
+            continue
+
+        if mode == "q" and q:
+            q += " " + line
+        elif mode == "a":
+            a_lines.append(line)
+
+    if q and a_lines:
+        results.append({
+            "question": strip_question_prefix(q).strip(),
+            "answer": "\n".join(a_lines).strip()
+        })
+
+    return dedupe_qa(results)
+
+
+def dedupe_qa(items: list[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+
+    for item in items:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if not q or not a:
+            continue
+
+        key = (q, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append({"question": q, "answer": a})
+
+    return unique
+
+
+def extract_qa_from_dl(soup: BeautifulSoup) -> list[dict]:
+    results = []
+
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        if not dts or not dds:
+            continue
+
+        pair_count = min(len(dts), len(dds))
+        for i in range(pair_count):
+            q = dts[i].get_text(" ", strip=True)
+            a = dds[i].get_text("\n", strip=True)
+            if q and a:
+                results.append({"question": q, "answer": a})
+
+    return dedupe_qa(results)
+
+
+def extract_qa_from_html(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    # 1) dl/dt/dd 形式
+    qa_from_dl = extract_qa_from_dl(soup)
+    if qa_from_dl:
+        return qa_from_dl
+
+    # 2) テキスト行ベース
+    text = soup.get_text("\n")
+    lines = normalize_lines(text)
+    return extract_qa_from_text_lines(lines)
+
+
+def is_same_domain(base_url: str, target_url: str) -> bool:
+    try:
+        return urlparse(base_url).netloc == urlparse(target_url).netloc
+    except Exception:
+        return False
+
+
+def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(index_html, "html.parser")
+    urls = []
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        label = a.get_text(" ", strip=True)
+
+        if not href:
+            continue
+
+        full_url = urljoin(base_url, href)
+
+        if not is_same_domain(base_url, full_url):
+            continue
+
+        text_hit = any(word in label for word in ["FAQ", "Q&A", "Q＆A", "質問", "よくある質問"])
+        url_hit = any(word in full_url.lower() for word in ["/faq", "faq", "question"])
+
+        if text_hit or url_hit:
+            urls.append(full_url)
+
+    unique_urls = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    return unique_urls
+
+
+def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
     tpl = load_egov_template()
 
     request_cfg = tpl.get("request") or {}
@@ -85,103 +258,68 @@ def fetch_html_from_template() -> tuple[str, str, int]:
     if method != "GET":
         raise HTTPException(status_code=400, detail=f"unsupported method: {method}")
 
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout_sec)
-        r.raise_for_status()
-        html = r.text or ""
-        return r.url, html, r.status_code
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"egov fetch error: {str(e)}")
+    index_url, index_html, status_code = fetch_html(url, headers=headers, timeout_sec=timeout_sec)
 
-
-def normalize_lines(text: str) -> list[str]:
-    lines = [x.strip() for x in text.splitlines()]
-    return [x for x in lines if x]
-
-
-def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
-    """
-    Q. / A. 形式のFAQを抽出
-    """
-    results = []
-    q = None
-    a_lines = []
-    mode = None
-
-    for line in lines:
-        if re.match(r"^Q[\.．]?\s*", line):
-            if q and a_lines:
-                results.append({
-                    "question": re.sub(r"^Q[\.．]?\s*", "", q).strip(),
-                    "answer": "\n".join(a_lines).strip()
-                })
-            q = line
-            a_lines = []
-            mode = "q"
-            continue
-
-        if re.match(r"^A[\.．]?\s*", line):
-            mode = "a"
-            ans = re.sub(r"^A[\.．]?\s*", "", line).strip()
-            if ans:
-                a_lines.append(ans)
-            continue
-
-        if mode == "q" and q:
-            q += " " + line
-        elif mode == "a":
-            a_lines.append(line)
-
-    if q and a_lines:
-        results.append({
-            "question": re.sub(r"^Q[\.．]?\s*", "", q).strip(),
-            "answer": "\n".join(a_lines).strip()
+    # 入口ページ自身も抽出対象にする
+    all_qa = []
+    for i, qa in enumerate(extract_qa_from_html(index_html), start=1):
+        all_qa.append({
+            "question": qa.get("question", ""),
+            "answer": qa.get("answer", ""),
+            "source_url": index_url,
+            "source_no": i,
         })
 
-    return results
+    # FAQらしいリンク先も抽出対象にする
+    detail_urls = extract_egov_qa_links(index_html, index_url)
 
+    for detail_url in detail_urls:
+        fetched_url, detail_html, _ = fetch_html(detail_url, headers=headers, timeout_sec=timeout_sec)
+        qa_list = extract_qa_from_html(detail_html)
 
-def extract_qa_from_html(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
+        for i, qa in enumerate(qa_list, start=1):
+            all_qa.append({
+                "question": qa.get("question", ""),
+                "answer": qa.get("answer", ""),
+                "source_url": fetched_url,
+                "source_no": i,
+            })
 
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+    # source_url込みで重複除去
+    unique = []
+    seen = set()
+    for item in all_qa:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        s = (item.get("source_url") or "").strip()
+        if not q or not a:
+            continue
 
-    text = soup.get_text("\n")
-    lines = normalize_lines(text)
-    return extract_qa_from_text_lines(lines)
+        key = (q, a, s)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    return index_url, unique, status_code
 
 
 @router.get("/test")
 def egov_test():
-    tpl = load_egov_template()
-    request_cfg = tpl.get("request") or {}
-    url = request_cfg.get("url")
-    timeout_sec = request_cfg.get("timeout_sec", 15)
-    headers = request_cfg.get("headers") or {}
-
-    if not url:
-        raise HTTPException(status_code=400, detail="template url is empty")
-
-    r = requests.get(url, headers=headers, timeout=timeout_sec)
-    r.raise_for_status()
-
-    html = r.text or ""
-    qa_list = extract_qa_from_html(html)
+    requested_url, qa_list, status_code = fetch_index_and_detail_qa_from_template()
 
     return {
         "count": len(qa_list),
-        "bytes": len(html.encode("utf-8")),
-        "status": r.status_code,
+        "status": status_code,
         "sample": qa_list[:3],
+        "requested_url": requested_url,
     }
 
 
 def _egov_fetch_and_register_impl(authorization: str | None):
     uid = get_uid_from_auth_header(authorization)
 
-    requested_url, html, status_code = fetch_html_from_template()
-    qa_list = extract_qa_from_html(html)
+    requested_url, qa_list, status_code = fetch_index_and_detail_qa_from_template()
 
     fetched = len(qa_list)
     if fetched == 0:
@@ -192,7 +330,6 @@ def _egov_fetch_and_register_impl(authorization: str | None):
             "fetched": 0,
             "inserted": 0,
             "skipped": 0,
-            "bytes": len(html.encode("utf-8")),
             "status": status_code,
         }
 
@@ -224,6 +361,7 @@ def _egov_fetch_and_register_impl(authorization: str | None):
         for qa in qa_list:
             question = (qa.get("question") or "").strip()
             answer = (qa.get("answer") or "").strip()
+            source_url = (qa.get("source_url") or requested_url).strip()
 
             if not question or not answer:
                 skipped += 1
@@ -231,12 +369,12 @@ def _egov_fetch_and_register_impl(authorization: str | None):
                 continue
 
             row_id = str(ulid.new())
-            source_item_id = f"{requested_url}#qa-{row_index}"
+            source_item_id = f"{source_url}#qa-{row_index}"
             content = json.dumps(
                 {
                     "question": question,
                     "answer": answer,
-                    "source_url": requested_url,
+                    "source_url": source_url,
                 },
                 ensure_ascii=False,
             )
@@ -271,7 +409,6 @@ def _egov_fetch_and_register_impl(authorization: str | None):
         "fetched": fetched,
         "inserted": inserted,
         "skipped": skipped,
-        "bytes": len(html.encode("utf-8")),
         "status": status_code,
         "sample": qa_list[:3],
     }
