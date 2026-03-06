@@ -305,17 +305,6 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
     try:
         cur = conn.cursor()
 
-        # uploaded_files に履歴を1件（kokkaiと同様）
-        logical_name = f"opendata_{file_id[-6:]}"
-        cur.execute(
-            """
-            INSERT INTO uploaded_files
-              (file_id, logical_name, original_filename, ext, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (file_id, logical_name, OPENDATA_TEMPLATE_PATH, "api", created_at),
-        )
-
         row_index = 1
         for item in items:
             did = _dataset_id(item)

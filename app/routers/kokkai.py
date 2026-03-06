@@ -250,17 +250,6 @@ def kokkai_fetch_and_register(
     try:
         cur = conn.cursor()
 
-        # uploaded_files に履歴を1件（logical_name は UNIQUE 前提）
-        logical_name = f"kokkai_{file_id[-6:]}"
-        cur.execute(
-            """
-            INSERT INTO uploaded_files
-              (file_id, logical_name, original_filename, ext, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (file_id, logical_name, "template/kokkai.json", "api", created_at),
-        )
-
         row_index = 1
         for r in records:
             sid = speech_id_of(r)
