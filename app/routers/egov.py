@@ -215,22 +215,24 @@ def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(index_html, "html.parser")
     urls = []
 
+    base_prefix = "https://shinsei.e-gov.go.jp/contents/help/faq"
+
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
-        label = a.get_text(" ", strip=True)
-
         if not href:
             continue
 
         full_url = urljoin(base_url, href)
 
+        # 同一ドメインのみ
         if not is_same_domain(base_url, full_url):
             continue
 
-        text_hit = any(word in label for word in ["FAQ", "Q&A", "Q＆A", "質問", "よくある質問"])
-        url_hit = any(word in full_url.lower() for word in ["/faq", "faq", "question"])
-
-        if text_hit or url_hit:
+        # FAQ一覧配下のリンクを広く拾う
+        if full_url.startswith(base_prefix):
+            # 一覧ページ自身は除外
+            if full_url.rstrip("/") == base_prefix.rstrip("/"):
+                continue
             urls.append(full_url)
 
     unique_urls = []
