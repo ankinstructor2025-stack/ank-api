@@ -5,7 +5,7 @@ import sqlite3
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -84,6 +84,62 @@ def normalize_lines(text: str) -> list[str]:
     return [x for x in lines if x]
 
 
+def is_same_domain(base_url: str, target_url: str) -> bool:
+    try:
+        return urlparse(base_url).netloc == urlparse(target_url).netloc
+    except Exception:
+        return False
+
+
+def is_question_start(line: str) -> bool:
+    patterns = [
+        r"^Q[\.．:：]?\s*",
+        r"^問[0-9０-９]*[\.．:：]?\s*",
+        r"^質問[0-9０-９]*[\.．:：]?\s*",
+    ]
+    return any(re.match(p, line) for p in patterns)
+
+
+def is_answer_start(line: str) -> bool:
+    patterns = [
+        r"^A[\.．:：]?\s*",
+        r"^答[0-9０-９]*[\.．:：]?\s*",
+        r"^回答[0-9０-９]*[\.．:：]?\s*",
+    ]
+    return any(re.match(p, line) for p in patterns)
+
+
+def strip_question_prefix(line: str) -> str:
+    return re.sub(r"^(Q|問|質問)[0-9０-９]*[\.．:：]?\s*", "", line).strip()
+
+
+def strip_answer_prefix(line: str) -> str:
+    return re.sub(r"^(A|答|回答)[0-9０-９]*[\.．:：]?\s*", "", line).strip()
+
+
+def dedupe_qa(items: list[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+
+    for item in items:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if not q or not a:
+            continue
+
+        key = (q, a)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append({
+            "question": q,
+            "answer": a,
+        })
+
+    return unique
+
+
 def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
     results = []
     q = None
@@ -91,10 +147,10 @@ def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
     mode = None
 
     for line in lines:
-        if re.match(r"^Q[\.．]?\s*", line):
+        if is_question_start(line):
             if q and a_lines:
                 results.append({
-                    "question": re.sub(r"^Q[\.．]?\s*", "", q).strip(),
+                    "question": strip_question_prefix(q).strip(),
                     "answer": "\n".join(a_lines).strip()
                 })
             q = line
@@ -102,9 +158,9 @@ def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
             mode = "q"
             continue
 
-        if re.match(r"^A[\.．]?\s*", line):
+        if is_answer_start(line):
             mode = "a"
-            ans = re.sub(r"^A[\.．]?\s*", "", line).strip()
+            ans = strip_answer_prefix(line)
             if ans:
                 a_lines.append(ans)
             continue
@@ -116,11 +172,33 @@ def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
 
     if q and a_lines:
         results.append({
-            "question": re.sub(r"^Q[\.．]?\s*", "", q).strip(),
+            "question": strip_question_prefix(q).strip(),
             "answer": "\n".join(a_lines).strip()
         })
 
-    return results
+    return dedupe_qa(results)
+
+
+def extract_qa_from_dl(soup: BeautifulSoup) -> list[dict]:
+    results = []
+
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        if not dts or not dds:
+            continue
+
+        pair_count = min(len(dts), len(dds))
+        for i in range(pair_count):
+            q = dts[i].get_text(" ", strip=True)
+            a = dds[i].get_text("\n", strip=True)
+            if q and a:
+                results.append({
+                    "question": q,
+                    "answer": a,
+                })
+
+    return dedupe_qa(results)
 
 
 def extract_qa_from_html(html: str) -> list[dict]:
@@ -129,33 +207,45 @@ def extract_qa_from_html(html: str) -> list[dict]:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
+    qa_from_dl = extract_qa_from_dl(soup)
+    if qa_from_dl:
+        return qa_from_dl
+
     text = soup.get_text("\n")
     lines = normalize_lines(text)
     return extract_qa_from_text_lines(lines)
 
 
 def extract_caa_qa_links(index_html: str, base_url: str) -> list[str]:
-    """
-    一覧ページから Q&A ページのリンクを抽出
-    """
     soup = BeautifulSoup(index_html, "html.parser")
     urls = []
 
+    base_prefix = "https://www.caa.go.jp/policies/policy/consumer_policy/"
+
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = (a.get("href") or "").strip()
         label = a.get_text(" ", strip=True)
+
+        if not href:
+            continue
 
         full_url = urljoin(base_url, href)
 
-        if "Q&A" in label or "Q＆A" in label or "FAQ" in label:
-            urls.append(full_url)
+        if not is_same_domain(base_url, full_url):
             continue
 
-        if "/faq/" in full_url:
-            urls.append(full_url)
-            continue
+        text_hit = any(word in label for word in [
+            "FAQ", "Q&A", "Q＆A", "よくある質問", "質問", "相談"
+        ])
+        url_hit = any(word in full_url.lower() for word in [
+            "/faq", "faq", "qanda", "question"
+        ])
+        prefix_hit = full_url.startswith(base_prefix)
 
-    # 同一URL除去
+        if text_hit or url_hit or prefix_hit:
+            if full_url.rstrip("/") != base_url.rstrip("/"):
+                urls.append(full_url)
+
     unique_urls = []
     seen = set()
     for u in urls:
@@ -186,6 +276,14 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
 
     all_qa = []
 
+    for i, qa in enumerate(extract_qa_from_html(index_html), start=1):
+        all_qa.append({
+            "question": qa.get("question", ""),
+            "answer": qa.get("answer", ""),
+            "source_url": index_url,
+            "source_no": i,
+        })
+
     for detail_url in detail_urls:
         fetched_url, detail_html, _ = fetch_html(detail_url, headers=headers, timeout_sec=timeout_sec)
         qa_list = extract_qa_from_html(detail_html)
@@ -198,7 +296,24 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
                 "source_no": i,
             })
 
-    return index_url, all_qa, status_code
+    unique = []
+    seen = set()
+    for item in all_qa:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        s = (item.get("source_url") or "").strip()
+
+        if not q or not a:
+            continue
+
+        key = (q, a, s)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(item)
+
+    return index_url, unique, status_code
 
 
 @router.get("/test")
