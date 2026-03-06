@@ -6,8 +6,8 @@ from app.routers.search import router as search_router
 from app.routers.user_init import router as user_init_router
 from app.routers.kokkai import router as kokkai_router
 from app.routers.opendata import router as opendata_router
-from app.routers.egov_test import router as egov_router
-from app.routers.caa_test import router as caa_router
+from app.routers.egov import router as egov_router
+from app.routers.caa import router as caa_router
 from app.routers.upload_and_register import router as upload_and_register
 from app.routers.row_data_ingest import router as row_data_ingest
 
