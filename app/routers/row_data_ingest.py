@@ -55,7 +55,6 @@ def ingest_uploaded_file(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    # -------- ank.db を取得 --------
     db_blob_path = user_db_path(uid)
     db_blob = bucket.blob(db_blob_path)
 
@@ -68,11 +67,34 @@ def ingest_uploaded_file(
     conn = sqlite3.connect(local_db_path)
     cur = conn.cursor()
 
-    # uploaded_files から対象取得
     cur.execute("""
-        SELECT original_filename, ext
-        FROM uploaded_files
-        WHERE file_id = ?
+        CREATE TABLE IF NOT EXISTS source_documents (
+            source_id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            logical_name TEXT NOT NULL,
+            original_name TEXT,
+            ext TEXT,
+            source_key TEXT,
+            source_item_id TEXT,
+            source_url TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS ix_source_documents_created_at
+        ON source_documents(created_at DESC)
+    """)
+
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_source_documents_item
+        ON source_documents(source_type, source_item_id)
+    """)
+
+    cur.execute("""
+        SELECT original_name, ext
+        FROM source_documents
+        WHERE source_id = ? AND source_type = 'upload'
     """, (file_id,))
     row = cur.fetchone()
 
@@ -82,7 +104,6 @@ def ingest_uploaded_file(
 
     original_filename, ext = row
 
-    # -------- row_data テーブル作成 --------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS row_data (
             row_id TEXT PRIMARY KEY,
@@ -95,14 +116,12 @@ def ingest_uploaded_file(
         )
     """)
 
-    # 二重取り込み防止
     cur.execute("SELECT 1 FROM row_data WHERE file_id = ? LIMIT 1", (file_id,))
     if cur.fetchone():
         conn.close()
         os.remove(local_db_path)
         raise HTTPException(status_code=409, detail="already ingested")
 
-    # -------- GCS uploads から読み込み --------
     upload_blob_path = f"users/{uid}/uploads/{file_id}_{original_filename}"
     upload_blob = bucket.blob(upload_blob_path)
 
@@ -114,7 +133,6 @@ def ingest_uploaded_file(
     file_bytes = upload_blob.download_as_bytes()
     text = file_bytes.decode("utf-8", errors="replace")
 
-    # -------- 拡張子別処理 --------
     if ext == "csv":
         reader = csv.DictReader(text.splitlines())
         rows = [json.dumps(r, ensure_ascii=False) for r in reader]
@@ -127,7 +145,6 @@ def ingest_uploaded_file(
     else:
         rows = [line for line in text.splitlines() if line.strip()]
 
-    # -------- INSERT --------
     created_at = datetime.now(tz=JST).isoformat()
 
     for i, content in enumerate(rows):
@@ -148,7 +165,6 @@ def ingest_uploaded_file(
     conn.commit()
     conn.close()
 
-    # DBをGCSへ戻す
     db_blob.upload_from_filename(local_db_path)
 
     os.remove(local_db_path)

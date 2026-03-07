@@ -19,7 +19,6 @@ JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
 
-# user_init.py と合わせる
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
@@ -60,8 +59,8 @@ async def upload_and_register(
     仕様:
     - uidは Authorization Bearer の Firebase IDトークンから取得
     - GCS: users/{uid}/uploads/{file_id}_{original_filename} にアップロード
-    - SQLite(ank.db): uploaded_files に1行INSERT
-    - 同名(logical_name)は弾く（409）
+    - SQLite(ank.db): source_documents に1行INSERT
+    - 同名(logical_name)は upload 内で弾く（409）
     - ank.db は GCS: users/{uid}/ank.db を /tmp に落として更新→上書き戻し
     """
 
@@ -74,74 +73,96 @@ async def upload_and_register(
     bucket = client.bucket(BUCKET_NAME)
 
     original_filename = file.filename
-    logical_name = original_filename  # 同名判定の基準（画面表示名）
+    logical_name = original_filename
     ext = original_filename.rsplit(".", 1)[-1] if "." in original_filename else ""
 
     file_id = str(ulid.new())
+    source_type = "upload"
+    source_key = None
+    source_item_id = logical_name
+    source_url = None
 
-    # -------- ank.db を /tmp に用意 --------
     db_blob_path = user_db_path(uid)
     db_blob = bucket.blob(db_blob_path)
 
     local_db_path = f"/tmp/ank_{uid}_{file_id}.db"
 
-    # ank.db は user_init で作成される前提だが、念のため無い場合は 400 にする
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
             detail=f"ank.db not found. call /v1/user/init first. path=gs://{BUCKET_NAME}/{db_blob_path}"
         )
 
-    # ダウンロード
     db_blob.download_to_filename(local_db_path)
 
     upload_blob = None
     try:
-        # -------- SQLite 更新 --------
         conn = sqlite3.connect(local_db_path)
         cur = conn.cursor()
 
-        # logical_name UNIQUE
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS uploaded_files (
-                file_id TEXT PRIMARY KEY,
-                logical_name TEXT NOT NULL UNIQUE,
-                original_filename TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS source_documents (
+                source_id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                logical_name TEXT NOT NULL,
+                original_name TEXT,
                 ext TEXT,
+                source_key TEXT,
+                source_item_id TEXT,
+                source_url TEXT,
                 created_at TEXT NOT NULL
             )
         """)
 
-        # 同名チェック（アップロード前）
-        cur.execute(
-            "SELECT 1 FROM uploaded_files WHERE logical_name = ? LIMIT 1",
-            (logical_name,),
-        )
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS ix_source_documents_created_at
+            ON source_documents(created_at DESC)
+        """)
+
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_source_documents_item
+            ON source_documents(source_type, source_item_id)
+        """)
+
+        cur.execute("""
+            SELECT 1
+            FROM source_documents
+            WHERE source_type = ? AND source_item_id = ?
+            LIMIT 1
+        """, (source_type, source_item_id))
         if cur.fetchone():
             conn.close()
             raise HTTPException(status_code=409, detail="同名ファイルはアップロードできません")
 
-        # -------- GCS uploads へアップロード --------
         upload_blob_path = f"users/{uid}/uploads/{file_id}_{original_filename}"
         upload_blob = bucket.blob(upload_blob_path)
 
         file.file.seek(0)
         upload_blob.upload_from_file(file.file)
 
-        # INSERT
         created_at = datetime.now(tz=JST).isoformat()
+
         try:
             cur.execute(
                 """
-                INSERT INTO uploaded_files
-                  (file_id, logical_name, original_filename, ext, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO source_documents
+                  (source_id, source_type, logical_name, original_name, ext, source_key, source_item_id, source_url, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (file_id, logical_name, original_filename, ext, created_at),
+                (
+                    file_id,
+                    source_type,
+                    logical_name,
+                    original_filename,
+                    ext,
+                    source_key,
+                    source_item_id,
+                    source_url,
+                    created_at,
+                ),
             )
             conn.commit()
         except sqlite3.IntegrityError:
-            # UNIQUE違反（同時実行など）
             conn.close()
             if upload_blob is not None:
                 try:
@@ -152,7 +173,6 @@ async def upload_and_register(
 
         conn.close()
 
-        # -------- DB を GCS へ上書き --------
         db_blob.upload_from_filename(local_db_path)
 
         return {
