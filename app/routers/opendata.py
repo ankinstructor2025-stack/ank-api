@@ -93,6 +93,52 @@ def normalize_text(v: Any) -> str:
     return str(v or "").strip()
 
 
+def safe_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+# =========================
+# template 読み取り
+# =========================
+
+def get_fetch_max_total(tpl: dict) -> int:
+    fetch_cfg = tpl.get("fetch") or {}
+    ds = tpl.get("dataset_search") or {}
+    params = ds.get("params") or {}
+
+    n = safe_int(fetch_cfg.get("max_total", params.get("rows", 10)), 10)
+    return max(1, n)
+
+
+def get_resource_filter_formats(tpl: dict) -> set[str]:
+    rf = tpl.get("resource_filter") or {}
+    formats = rf.get("formats") or []
+    if not isinstance(formats, list):
+        return set()
+    return {str(x).strip().lower() for x in formats if str(x).strip()}
+
+
+def get_resource_limit(tpl: dict) -> int:
+    rf = tpl.get("resource_filter") or {}
+    n = safe_int(rf.get("limit_resources", 1), 1)
+    return max(1, n)
+
+
+def get_data_fetch_max_rows(tpl: dict) -> int:
+    df = tpl.get("data_fetch") or {}
+    n = safe_int(df.get("max_rows", 200), 200)
+    return max(1, n)
+
+
+def get_data_fetch_encoding(tpl: dict) -> str:
+    df = tpl.get("data_fetch") or {}
+    enc = str(df.get("encoding") or "utf-8").strip()
+    return enc or "utf-8"
+
+
 # =========================
 # DB
 # =========================
@@ -209,27 +255,13 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
     if not endpoint:
         raise HTTPException(status_code=500, detail="template missing dataset_search.endpoint")
 
-    fetch_cfg = tpl.get("fetch") or {}
-    try:
-        max_total = int(fetch_cfg.get("max_total", params.get("rows", 10)))
-    except Exception:
-        max_total = 10
-    if max_total < 1:
-        max_total = 1
+    max_total = get_fetch_max_total(tpl)
 
-    try:
-        rows = int(params.get("rows", 10))
-    except Exception:
-        rows = 10
-    if rows < 1:
-        rows = 10
+    rows = safe_int(params.get("rows", 10), 10)
+    rows = max(1, rows)
 
-    try:
-        start = int(params.get("start", 0))
-    except Exception:
-        start = 0
-    if start < 0:
-        start = 0
+    start = safe_int(params.get("start", 0), 0)
+    start = max(0, start)
 
     requested_url_last = endpoint
     collected: List[dict] = []
@@ -254,10 +286,7 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
             if isinstance(item, dict):
                 collected.append(item)
 
-        try:
-            total_count = int(result.get("count", 0))
-        except Exception:
-            total_count = 0
+        total_count = safe_int(result.get("count", 0), 0)
 
         if len(collected) >= max_total:
             break
@@ -290,7 +319,6 @@ def dataset_page_url_of(ds: dict, requested_url: str) -> str:
 
 
 def dataset_ext_of(ds: dict) -> str:
-    # 親は dataset なので固定で json 扱い
     return "json"
 
 
@@ -312,55 +340,79 @@ def detect_resource_kind(resource: dict, source_path: str, content_type: str = "
     fmt = normalize_text(resource.get("format")).lower()
     mimetype = normalize_text(resource.get("mimetype")).lower()
     ext = guess_ext_from_url(source_path)
+    ctype = content_type.lower()
 
-    if fmt == "csv" or ext == "csv" or "csv" in mimetype or "csv" in content_type.lower():
+    if fmt == "csv" or ext == "csv" or "csv" in mimetype or "csv" in ctype:
         return "csv"
 
-    if fmt == "json" or ext == "json" or "json" in mimetype or "json" in content_type.lower():
+    if fmt == "json" or ext == "json" or "json" in mimetype or "json" in ctype:
         return "json"
 
-    if fmt == "pdf" or ext == "pdf" or "pdf" in mimetype or "pdf" in content_type.lower():
+    if fmt == "pdf" or ext == "pdf" or "pdf" in mimetype or "pdf" in ctype:
         return "pdf"
 
     return ""
+
+
+def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, content_type: str = "") -> bool:
+    allowed_formats = get_resource_filter_formats(tpl)
+    if not allowed_formats:
+        return True
+
+    fmt = normalize_text(resource.get("format")).lower()
+    kind = detect_resource_kind(resource, source_path, content_type)
+
+    if fmt in allowed_formats:
+        return True
+
+    if kind in allowed_formats:
+        return True
+
+    return False
 
 
 # =========================
 # row_data 分解
 # =========================
 
-def split_csv_records(binary: bytes) -> List[dict]:
-    text = binary.decode("utf-8-sig", errors="replace")
+def split_csv_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
+    text = binary.decode(encoding, errors="replace")
     f = io.StringIO(text)
     reader = csv.DictReader(f)
 
     rows = []
     for row in reader:
         rows.append(dict(row))
+        if len(rows) >= max_rows:
+            break
     return rows
 
 
-def split_json_records(binary: bytes) -> List[dict]:
-    text = binary.decode("utf-8-sig", errors="replace")
+def split_json_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
+    text = binary.decode(encoding, errors="replace")
     obj = json.loads(text)
 
     if isinstance(obj, list):
-        return [x if isinstance(x, dict) else {"value": x} for x in obj]
+        out = []
+        for x in obj[:max_rows]:
+            out.append(x if isinstance(x, dict) else {"value": x})
+        return out
 
     if isinstance(obj, dict):
-        # よくある配列キーを優先
         for key in ["results", "items", "data", "records"]:
             v = obj.get(key)
             if isinstance(v, list):
-                return [x if isinstance(x, dict) else {"value": x} for x in v]
+                out = []
+                for x in v[:max_rows]:
+                    out.append(x if isinstance(x, dict) else {"value": x})
+                return out
 
-        # 配列がなければ全体を1件
         return [obj]
 
     return [{"value": obj}]
 
 
-def split_pdf_records(binary: bytes) -> List[dict]:
+def split_pdf_records(binary: bytes, max_rows: int) -> List[dict]:
     reader = PdfReader(io.BytesIO(binary))
     pages = []
 
@@ -377,27 +429,39 @@ def split_pdf_records(binary: bytes) -> List[dict]:
             "char_count": len(text),
         })
 
+        if len(pages) >= max_rows:
+            break
+
     return pages
 
 
-def build_row_records_for_resource(resource: dict) -> Tuple[List[dict], str]:
+def build_row_records_for_resource(resource: dict, tpl: dict) -> Tuple[List[dict], str, str]:
     source_path = normalize_text(resource.get("url"))
     if not source_path:
-        return [], ""
+        return [], "", ""
 
     binary, final_url, content_type = _fetch_binary(source_path)
+
+    if not resource_allowed_by_template(resource, tpl, final_url, content_type):
+        return [], final_url, ""
+
     kind = detect_resource_kind(resource, final_url, content_type)
+    if not kind:
+        return [], final_url, ""
+
+    max_rows = get_data_fetch_max_rows(tpl)
+    encoding = get_data_fetch_encoding(tpl)
 
     if kind == "csv":
-        return split_csv_records(binary), final_url
+        return split_csv_records(binary, encoding, max_rows), final_url, kind
 
     if kind == "json":
-        return split_json_records(binary), final_url
+        return split_json_records(binary, encoding, max_rows), final_url, kind
 
     if kind == "pdf":
-        return split_pdf_records(binary), final_url
+        return split_pdf_records(binary, max_rows), final_url, kind
 
-    return [], final_url
+    return [], final_url, ""
 
 
 # =========================
@@ -461,6 +525,7 @@ def register_row_data_for_dataset(
     cur: sqlite3.Cursor,
     source_id: str,
     ds: dict,
+    tpl: dict,
     created_at: str,
 ) -> Tuple[int, int, int]:
     """
@@ -472,34 +537,55 @@ def register_row_data_for_dataset(
     if not isinstance(resources, list):
         resources = []
 
+    resource_limit = get_resource_limit(tpl)
+
     inserted_rows = 0
     skipped_rows = 0
     resource_count = 0
-
+    used_resources = 0
     row_index = 1
 
+    print(f"[opendata] dataset start dataset_id={dataset_id} resources_total={len(resources)} resource_limit={resource_limit}")
+
     for idx, resource in enumerate(resources, start=1):
+        if used_resources >= resource_limit:
+            break
+
         if not isinstance(resource, dict):
+            skipped_rows += 1
             continue
 
         resource_id = resource_id_of(resource, idx)
         resource_name = resource_name_of(resource, idx)
 
         try:
-            records, source_path = build_row_records_for_resource(resource)
-        except Exception:
-            skipped_rows += 1
-            continue
+            print(f"[opendata] resource fetch start dataset_id={dataset_id} resource_id={resource_id}")
+            records, source_path, kind = build_row_records_for_resource(resource, tpl)
+            print(
+                f"[opendata] resource fetch done "
+                f"dataset_id={dataset_id} resource_id={resource_id} kind={kind} "
+                f"records={len(records)} source_path={source_path}"
+            )
+        except Exception as e:
+            print(
+                f"[opendata] resource fetch error "
+                f"dataset_id={dataset_id} resource_id={resource_id} error={repr(e)}"
+            )
+            raise
 
         if not source_path:
             skipped_rows += 1
             continue
 
-        if len(records) == 0:
-            # CSV/JSON/PDF以外、または分解不能
+        if not kind:
             skipped_rows += 1
             continue
 
+        if len(records) == 0:
+            skipped_rows += 1
+            continue
+
+        used_resources += 1
         resource_count += 1
 
         for sub_idx, rec in enumerate(records, start=1):
@@ -546,9 +632,13 @@ def register_row_data_for_dataset(
 
 def _opendata_fetch_and_register_impl(authorization: str | None):
     uid = get_uid_from_auth_header(authorization)
+    print(f"[opendata] start uid={uid}")
+
     tpl = load_opendata_template()
+    print("[opendata] template loaded")
 
     datasets, requested_url = _dataset_search_all_from_template(tpl)
+    print(f"[opendata] dataset search done count={len(datasets)} requested_url={requested_url}")
 
     if len(datasets) == 0:
         return {
@@ -575,6 +665,7 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
 
     local_db_path = f"/tmp/ank_{uid}_opendata.db"
     db_blob.download_to_filename(local_db_path)
+    print(f"[opendata] db downloaded path={local_db_path}")
 
     parent_inserted = 0
     parent_skipped = 0
@@ -589,6 +680,8 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
 
         for ds in datasets:
             created_at = now_iso()
+            dataset_id = dataset_id_of(ds)
+            print(f"[opendata] parent register start dataset_id={dataset_id}")
 
             source_id, inserted_new = register_dataset_parent(
                 cur=cur,
@@ -599,19 +692,22 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
 
             if not source_id:
                 parent_skipped += 1
+                print(f"[opendata] parent skipped dataset_id={dataset_id} reason=no_dataset_id")
                 continue
 
             if inserted_new:
                 parent_inserted += 1
+                print(f"[opendata] parent inserted dataset_id={dataset_id} source_id={source_id}")
             else:
-                # 既存 dataset は row_data 再登録まで進まない
                 parent_skipped += 1
+                print(f"[opendata] parent skipped dataset_id={dataset_id} reason=already_exists")
                 continue
 
             used_count, ins_rows, skip_rows = register_row_data_for_dataset(
                 cur=cur,
                 source_id=source_id,
                 ds=ds,
+                tpl=tpl,
                 created_at=created_at,
             )
 
@@ -620,11 +716,13 @@ def _opendata_fetch_and_register_impl(authorization: str | None):
             row_skipped += skip_rows
 
         conn.commit()
+        print("[opendata] db commit done")
 
     finally:
         conn.close()
 
     db_blob.upload_from_filename(local_db_path)
+    print("[opendata] db uploaded")
 
     return {
         "mode": "fetch_and_register",
