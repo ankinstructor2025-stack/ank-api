@@ -10,6 +10,7 @@ from app.routers.egov import router as egov_router
 from app.routers.caa import router as caa_router
 from app.routers.upload_and_register import router as upload_and_register
 from app.routers.row_data_ingest import router as row_data_ingest
+from app.routers.row_data import router as row_data_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
     app.include_router(caa_router, prefix="/v1")
     app.include_router(upload_and_register, prefix="/v1")
     app.include_router(row_data_ingest, prefix="/v1")
+    app.include_router(row_data_router, prefix="/v1")
     return app
 
 app = create_app()
