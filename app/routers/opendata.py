@@ -28,10 +28,6 @@ BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 OPENDATA_TEMPLATE_PATH = "template/opendata.json"
 
 
-# =========================
-# 共通
-# =========================
-
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
@@ -100,10 +96,6 @@ def safe_int(v: Any, default: int) -> int:
         return default
 
 
-# =========================
-# template 読み取り
-# =========================
-
 def get_fetch_max_total(tpl: dict) -> int:
     fetch_cfg = tpl.get("fetch") or {}
     ds = tpl.get("dataset_search") or {}
@@ -121,12 +113,6 @@ def get_resource_filter_formats(tpl: dict) -> set[str]:
     return {str(x).strip().lower() for x in formats if str(x).strip()}
 
 
-def get_resource_limit(tpl: dict) -> int:
-    rf = tpl.get("resource_filter") or {}
-    n = safe_int(rf.get("limit_resources", 1), 1)
-    return max(1, n)
-
-
 def get_data_fetch_max_rows(tpl: dict) -> int:
     df = tpl.get("data_fetch") or {}
     n = safe_int(df.get("max_rows", 200), 200)
@@ -138,10 +124,6 @@ def get_data_fetch_encoding(tpl: dict) -> str:
     enc = str(df.get("encoding") or "utf-8").strip()
     return enc or "utf-8"
 
-
-# =========================
-# CKAN
-# =========================
 
 def _fetch_json(url: str, params: dict | None = None) -> Tuple[dict, str]:
     try:
@@ -225,10 +207,6 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
 
     return collected, requested_url_last
 
-
-# =========================
-# dataset / resource
-# =========================
 
 def dataset_id_of(ds: dict) -> str:
     return normalize_text(ds.get("id") or ds.get("name"))
@@ -343,10 +321,6 @@ def find_resource_by_id(ds: dict, resource_id: str) -> Tuple[Optional[dict], Opt
     return None, None
 
 
-# =========================
-# row_data 分解
-# =========================
-
 def split_csv_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
     text = binary.decode(encoding, errors="replace")
     f = io.StringIO(text)
@@ -378,7 +352,6 @@ def split_json_records(binary: bytes, encoding: str, max_rows: int) -> List[dict
                 for x in v[:max_rows]:
                     out.append(x if isinstance(x, dict) else {"value": x})
                 return out
-
         return [obj]
 
     return [{"value": obj}]
@@ -436,10 +409,6 @@ def build_row_records_for_resource(resource: dict, tpl: dict) -> Tuple[List[dict
     return [], final_url, ""
 
 
-# =========================
-# DB登録
-# =========================
-
 def register_opendata_resource(
     cur: sqlite3.Cursor,
     ds: dict,
@@ -466,7 +435,6 @@ def register_opendata_resource(
     if not resource_url:
         raise HTTPException(status_code=400, detail="resource url not found")
 
-    # 親重複チェック（resource単位）
     cur.execute("""
         SELECT source_id
         FROM opendata_documents
@@ -553,10 +521,6 @@ def register_opendata_resource(
 
     return source_id, inserted_rows, skipped_rows, logical_name, kind
 
-
-# =========================
-# 3段階API
-# =========================
 
 def _fetch_datasets_impl(authorization: str | None):
     get_uid_from_auth_header(authorization)
@@ -670,10 +634,6 @@ def _register_resource_impl(
         "row_skipped": skipped_rows,
     }
 
-
-# =========================
-# API
-# =========================
 
 @router.get("/fetch_datasets")
 def opendata_fetch_datasets_get(
