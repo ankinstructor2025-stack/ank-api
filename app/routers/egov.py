@@ -110,6 +110,25 @@ def strip_answer_prefix(line: str) -> str:
     return re.sub(r"^(A|答|回答)[1-9０-９0-9]*[\.．:：]?\s*", "", line).strip()
 
 
+def dedupe_qa(items: list[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+
+    for item in items:
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        if not q or not a:
+            continue
+
+        key = (q, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append({"question": q, "answer": a})
+
+    return unique
+
+
 def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
     results = []
     q = None
@@ -147,25 +166,6 @@ def extract_qa_from_text_lines(lines: list[str]) -> list[dict]:
         })
 
     return dedupe_qa(results)
-
-
-def dedupe_qa(items: list[dict]) -> list[dict]:
-    unique = []
-    seen = set()
-
-    for item in items:
-        q = (item.get("question") or "").strip()
-        a = (item.get("answer") or "").strip()
-        if not q or not a:
-            continue
-
-        key = (q, a)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append({"question": q, "answer": a})
-
-    return unique
 
 
 def extract_qa_from_dl(soup: BeautifulSoup) -> list[dict]:
@@ -209,11 +209,31 @@ def is_same_domain(base_url: str, target_url: str) -> bool:
         return False
 
 
-def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(index_html, "html.parser")
-    urls = []
+def _normalize_url_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(v).strip() for v in values if str(v).strip()]
 
-    base_prefix = "https://shinsei.e-gov.go.jp/contents/help/faq"
+
+def _normalize_keyword_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(v).strip() for v in values if str(v).strip()]
+
+
+def extract_links_by_template(index_html: str, base_url: str, tpl: dict) -> list[str]:
+    soup = BeautifulSoup(index_html, "html.parser")
+    crawl = tpl.get("crawl") or {}
+
+    same_domain_only = bool(crawl.get("same_domain_only", True))
+    link_mode = str(crawl.get("link_mode") or "prefix").strip().lower()
+
+    page_url_prefixes = _normalize_url_list(crawl.get("page_url_prefixes"))
+    page_url_keywords = [x.lower() for x in _normalize_keyword_list(crawl.get("page_url_keywords"))]
+    link_text_keywords = _normalize_keyword_list(crawl.get("link_text_keywords"))
+    exclude_exact_urls = set(_normalize_url_list(crawl.get("exclude_exact_urls")))
+
+    urls = []
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
@@ -221,13 +241,30 @@ def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
             continue
 
         full_url = urljoin(base_url, href)
+        label = a.get_text(" ", strip=True)
+        full_url_lower = full_url.lower()
 
-        if not is_same_domain(base_url, full_url):
+        if same_domain_only and not is_same_domain(base_url, full_url):
             continue
 
-        if full_url.startswith(base_prefix):
-            if full_url.rstrip("/") == base_prefix.rstrip("/"):
-                continue
+        if full_url in exclude_exact_urls or full_url.rstrip("/") in {u.rstrip("/") for u in exclude_exact_urls}:
+            continue
+
+        prefix_hit = any(full_url.startswith(prefix) for prefix in page_url_prefixes)
+        url_keyword_hit = any(keyword in full_url_lower for keyword in page_url_keywords)
+        text_hit = any(keyword in label for keyword in link_text_keywords)
+
+        matched = False
+        if link_mode == "prefix":
+            matched = prefix_hit
+        elif link_mode == "keyword":
+            matched = url_keyword_hit or text_hit
+        elif link_mode == "prefix_or_keyword":
+            matched = prefix_hit or url_keyword_hit or text_hit
+        else:
+            matched = prefix_hit
+
+        if matched:
             urls.append(full_url)
 
     unique_urls = []
@@ -273,7 +310,7 @@ def ensure_url_tables(cur: sqlite3.Cursor):
     """)
 
 
-def get_or_create_root(cur: sqlite3.Cursor, root_url: str, created_at: str) -> str:
+def get_or_create_root(cur: sqlite3.Cursor, source_type: str, root_url: str, created_at: str) -> str:
     cur.execute("""
         SELECT root_id
         FROM url_roots
@@ -288,7 +325,7 @@ def get_or_create_root(cur: sqlite3.Cursor, root_url: str, created_at: str) -> s
     cur.execute("""
         INSERT INTO url_roots (root_id, source_type, root_url, created_at)
         VALUES (?, ?, ?, ?)
-    """, (root_id, "egov", root_url, created_at))
+    """, (root_id, source_type, root_url, created_at))
     return root_id
 
 
@@ -319,6 +356,26 @@ def update_page_status(cur: sqlite3.Cursor, page_url: str, status: str):
     """, (status, page_url))
 
 
+def get_pages_by_root(cur: sqlite3.Cursor, root_id: str) -> list[dict]:
+    cur.execute("""
+        SELECT page_id, page_url, status, created_at
+        FROM url_pages
+        WHERE root_id = ?
+        ORDER BY created_at, page_url
+    """, (root_id,))
+    rows = cur.fetchall()
+
+    return [
+        {
+            "page_id": row[0],
+            "page_url": row[1],
+            "status": row[2],
+            "created_at": row[3],
+        }
+        for row in rows
+    ]
+
+
 def build_target_url(override_target_url: str | None = None) -> tuple[str, dict]:
     tpl = load_egov_template()
 
@@ -337,23 +394,27 @@ def build_target_url(override_target_url: str | None = None) -> tuple[str, dict]
 
 def fetch_index_and_detail_qa(target_url: str, tpl: dict) -> tuple[str, list[dict], int, list[str]]:
     request_cfg = tpl.get("request") or {}
+    crawl_cfg = tpl.get("crawl") or {}
+
     timeout_sec = request_cfg.get("timeout_sec", 15)
     headers = request_cfg.get("headers") or {}
+    include_root_page = bool(crawl_cfg.get("include_root_page", True))
 
     index_url, index_html, status_code = fetch_html(target_url, headers=headers, timeout_sec=timeout_sec)
 
     all_qa = []
-    crawled_pages = [index_url]
+    crawled_pages = [index_url] if include_root_page else []
 
-    for i, qa in enumerate(extract_qa_from_html(index_html), start=1):
-        all_qa.append({
-            "question": qa.get("question", ""),
-            "answer": qa.get("answer", ""),
-            "source_url": index_url,
-            "source_no": i,
-        })
+    if include_root_page:
+        for i, qa in enumerate(extract_qa_from_html(index_html), start=1):
+            all_qa.append({
+                "question": qa.get("question", ""),
+                "answer": qa.get("answer", ""),
+                "source_url": index_url,
+                "source_no": i,
+            })
 
-    detail_urls = extract_egov_qa_links(index_html, index_url)
+    detail_urls = extract_links_by_template(index_html, index_url, tpl)
 
     for detail_url in detail_urls:
         fetched_url, detail_html, _ = fetch_html(detail_url, headers=headers, timeout_sec=timeout_sec)
@@ -402,6 +463,7 @@ def egov_test():
         "count": len(qa_list),
         "status": status_code,
         "page_count": len(page_urls),
+        "pages": [{"page_url": u} for u in page_urls],
         "sample": qa_list[:3],
         "requested_url": requested_url,
     }
@@ -430,13 +492,15 @@ def _egov_fetch_and_register_impl(authorization: str | None, target_url: str | N
     created_at = datetime.now(tz=JST).isoformat()
     inserted = 0
     skipped = 0
+    source_key = (tpl.get("source_key") or "egov").strip()
+    source_type = (tpl.get("source_type") or "public_url").strip()
 
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
         ensure_url_tables(cur)
 
-        root_id = get_or_create_root(cur, requested_url, created_at)
+        root_id = get_or_create_root(cur, source_key, requested_url, created_at)
 
         for page_url in page_urls:
             get_or_create_page(cur, root_id, page_url, created_at)
@@ -478,8 +542,8 @@ def _egov_fetch_and_register_impl(authorization: str | None, target_url: str | N
                 (
                     row_id,
                     root_id,
-                    "egov",
-                    requested_url,
+                    source_type,
+                    source_key,
                     source_item_id,
                     page_row_no,
                     content,
@@ -498,6 +562,8 @@ def _egov_fetch_and_register_impl(authorization: str | None, target_url: str | N
             for page_url in page_urls:
                 update_page_status(cur, page_url, "skipped")
 
+        pages = get_pages_by_root(cur, root_id)
+
         conn.commit()
     finally:
         conn.close()
@@ -515,6 +581,7 @@ def _egov_fetch_and_register_impl(authorization: str | None, target_url: str | N
         "row_inserted": inserted,
         "row_skipped": skipped,
         "status": status_code,
+        "pages": pages,
         "sample": qa_list[:3],
     }
 
