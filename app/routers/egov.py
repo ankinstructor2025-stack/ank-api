@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 import os
 import json
 import sqlite3
@@ -193,12 +193,10 @@ def extract_qa_from_html(html: str) -> list[dict]:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    # 1) dl/dt/dd 形式
     qa_from_dl = extract_qa_from_dl(soup)
     if qa_from_dl:
         return qa_from_dl
 
-    # 2) テキスト行ベース
     text = soup.get_text("\n")
     lines = normalize_lines(text)
     return extract_qa_from_text_lines(lines)
@@ -224,13 +222,10 @@ def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
 
         full_url = urljoin(base_url, href)
 
-        # 同一ドメインのみ
         if not is_same_domain(base_url, full_url):
             continue
 
-        # FAQ一覧配下のリンクを広く拾う
         if full_url.startswith(base_prefix):
-            # 一覧ページ自身は除外
             if full_url.rstrip("/") == base_prefix.rstrip("/"):
                 continue
             urls.append(full_url)
@@ -245,14 +240,91 @@ def extract_egov_qa_links(index_html: str, base_url: str) -> list[str]:
     return unique_urls
 
 
-def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
+def ensure_url_tables(cur: sqlite3.Cursor):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS url_roots (
+          root_id TEXT PRIMARY KEY,
+          source_type TEXT NOT NULL,
+          root_url TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_roots_root_url
+        ON url_roots(root_url)
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS url_pages (
+          page_id TEXT PRIMARY KEY,
+          root_id TEXT NOT NULL,
+          page_url TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_page_url
+        ON url_pages(page_url)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS ix_url_pages_root_id
+        ON url_pages(root_id)
+    """)
+
+
+def get_or_create_root(cur: sqlite3.Cursor, root_url: str, created_at: str) -> str:
+    cur.execute("""
+        SELECT root_id
+        FROM url_roots
+        WHERE root_url = ?
+        LIMIT 1
+    """, (root_url,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    root_id = str(ulid.new())
+    cur.execute("""
+        INSERT INTO url_roots (root_id, source_type, root_url, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (root_id, "egov", root_url, created_at))
+    return root_id
+
+
+def get_or_create_page(cur: sqlite3.Cursor, root_id: str, page_url: str, created_at: str) -> str:
+    cur.execute("""
+        SELECT page_id
+        FROM url_pages
+        WHERE page_url = ?
+        LIMIT 1
+    """, (page_url,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    page_id = str(ulid.new())
+    cur.execute("""
+        INSERT INTO url_pages (page_id, root_id, page_url, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (page_id, root_id, page_url, "new", created_at))
+    return page_id
+
+
+def update_page_status(cur: sqlite3.Cursor, page_url: str, status: str):
+    cur.execute("""
+        UPDATE url_pages
+        SET status = ?
+        WHERE page_url = ?
+    """, (status, page_url))
+
+
+def build_target_url(override_target_url: str | None = None) -> tuple[str, dict]:
     tpl = load_egov_template()
 
     request_cfg = tpl.get("request") or {}
     method = (request_cfg.get("method") or "GET").upper()
-    url = request_cfg.get("url")
-    timeout_sec = request_cfg.get("timeout_sec", 15)
-    headers = request_cfg.get("headers") or {}
+    url = (override_target_url or request_cfg.get("url") or "").strip()
 
     if not url:
         raise HTTPException(status_code=400, detail="template url is empty")
@@ -260,10 +332,19 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
     if method != "GET":
         raise HTTPException(status_code=400, detail=f"unsupported method: {method}")
 
-    index_url, index_html, status_code = fetch_html(url, headers=headers, timeout_sec=timeout_sec)
+    return url, tpl
 
-    # 入口ページ自身も抽出対象にする
+
+def fetch_index_and_detail_qa(target_url: str, tpl: dict) -> tuple[str, list[dict], int, list[str]]:
+    request_cfg = tpl.get("request") or {}
+    timeout_sec = request_cfg.get("timeout_sec", 15)
+    headers = request_cfg.get("headers") or {}
+
+    index_url, index_html, status_code = fetch_html(target_url, headers=headers, timeout_sec=timeout_sec)
+
     all_qa = []
+    crawled_pages = [index_url]
+
     for i, qa in enumerate(extract_qa_from_html(index_html), start=1):
         all_qa.append({
             "question": qa.get("question", ""),
@@ -272,11 +353,11 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
             "source_no": i,
         })
 
-    # FAQらしいリンク先も抽出対象にする
     detail_urls = extract_egov_qa_links(index_html, index_url)
 
     for detail_url in detail_urls:
         fetched_url, detail_html, _ = fetch_html(detail_url, headers=headers, timeout_sec=timeout_sec)
+        crawled_pages.append(fetched_url)
         qa_list = extract_qa_from_html(detail_html)
 
         for i, qa in enumerate(qa_list, start=1):
@@ -287,7 +368,6 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
                 "source_no": i,
             })
 
-    # source_url込みで重複除去
     unique = []
     seen = set()
     for item in all_qa:
@@ -303,37 +383,35 @@ def fetch_index_and_detail_qa_from_template() -> tuple[str, list[dict], int]:
         seen.add(key)
         unique.append(item)
 
-    return index_url, unique, status_code
+    unique_pages = []
+    seen_pages = set()
+    for u in crawled_pages:
+        if u not in seen_pages:
+            seen_pages.add(u)
+            unique_pages.append(u)
+
+    return index_url, unique, status_code, unique_pages
 
 
 @router.get("/test")
 def egov_test():
-    requested_url, qa_list, status_code = fetch_index_and_detail_qa_from_template()
+    target_url, tpl = build_target_url()
+    requested_url, qa_list, status_code, page_urls = fetch_index_and_detail_qa(target_url, tpl)
 
     return {
         "count": len(qa_list),
         "status": status_code,
+        "page_count": len(page_urls),
         "sample": qa_list[:3],
         "requested_url": requested_url,
     }
 
 
-def _egov_fetch_and_register_impl(authorization: str | None):
+def _egov_fetch_and_register_impl(authorization: str | None, target_url: str | None = None):
     uid = get_uid_from_auth_header(authorization)
 
-    requested_url, qa_list, status_code = fetch_index_and_detail_qa_from_template()
-
-    fetched = len(qa_list)
-    if fetched == 0:
-        return {
-            "mode": "fetch_and_register",
-            "requested_url": requested_url,
-            "count": 0,
-            "fetched": 0,
-            "inserted": 0,
-            "skipped": 0,
-            "status": status_code,
-        }
+    effective_target_url, tpl = build_target_url(target_url)
+    requested_url, qa_list, status_code, page_urls = fetch_index_and_detail_qa(effective_target_url, tpl)
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -349,17 +427,21 @@ def _egov_fetch_and_register_impl(authorization: str | None):
     local_db_path = f"/tmp/ank_{uid}_egov.db"
     db_blob.download_to_filename(local_db_path)
 
-    file_id = str(ulid.new())
     created_at = datetime.now(tz=JST).isoformat()
-
     inserted = 0
     skipped = 0
 
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
+        ensure_url_tables(cur)
 
-        row_index = 1
+        root_id = get_or_create_root(cur, requested_url, created_at)
+
+        for page_url in page_urls:
+            get_or_create_page(cur, root_id, page_url, created_at)
+
+        row_no_by_page = {}
         for qa in qa_list:
             question = (qa.get("question") or "").strip()
             answer = (qa.get("answer") or "").strip()
@@ -367,16 +449,22 @@ def _egov_fetch_and_register_impl(authorization: str | None):
 
             if not question or not answer:
                 skipped += 1
-                row_index += 1
+                update_page_status(cur, source_url, "skipped")
                 continue
 
+            page_id = get_or_create_page(cur, root_id, source_url, created_at)
+            row_no_by_page[source_url] = row_no_by_page.get(source_url, 0) + 1
+            page_row_no = row_no_by_page[source_url]
+
             row_id = str(ulid.new())
-            source_item_id = f"{source_url}#qa-{row_index}"
+            source_item_id = f"{source_url}#qa-{page_row_no}"
             content = json.dumps(
                 {
+                    "page_id": page_id,
+                    "root_url": requested_url,
+                    "page_url": source_url,
                     "question": question,
                     "answer": answer,
-                    "source_url": source_url,
                 },
                 ensure_ascii=False,
             )
@@ -387,15 +475,28 @@ def _egov_fetch_and_register_impl(authorization: str | None):
                   (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (row_id, file_id, "egov", EGOV_TEMPLATE_PATH, source_item_id, row_index, content, created_at),
+                (
+                    row_id,
+                    root_id,
+                    "egov",
+                    requested_url,
+                    source_item_id,
+                    page_row_no,
+                    content,
+                    created_at,
+                ),
             )
 
             if cur.rowcount == 1:
                 inserted += 1
+                update_page_status(cur, source_url, "done")
             else:
                 skipped += 1
+                update_page_status(cur, source_url, "done")
 
-            row_index += 1
+        if len(qa_list) == 0:
+            for page_url in page_urls:
+                update_page_status(cur, page_url, "skipped")
 
         conn.commit()
     finally:
@@ -405,12 +506,14 @@ def _egov_fetch_and_register_impl(authorization: str | None):
 
     return {
         "mode": "fetch_and_register",
+        "target_url": effective_target_url,
         "requested_url": requested_url,
-        "file_id": file_id,
-        "count": fetched,
-        "fetched": fetched,
-        "inserted": inserted,
-        "skipped": skipped,
+        "root_id": root_id,
+        "count": len(qa_list),
+        "fetched": len(qa_list),
+        "page_count": len(page_urls),
+        "row_inserted": inserted,
+        "row_skipped": skipped,
         "status": status_code,
         "sample": qa_list[:3],
     }
@@ -422,5 +525,10 @@ def egov_fetch_and_register_get(authorization: str | None = Header(default=None)
 
 
 @router.post("/fetch_and_register")
-def egov_fetch_and_register_post(authorization: str | None = Header(default=None)):
-    return _egov_fetch_and_register_impl(authorization)
+async def egov_fetch_and_register_post(
+    request: Request,
+    authorization: str | None = Header(default=None)
+):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    target_url = (body.get("target_url") or "").strip() or None
+    return _egov_fetch_and_register_impl(authorization, target_url)
