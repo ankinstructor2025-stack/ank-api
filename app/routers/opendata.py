@@ -113,6 +113,12 @@ def get_resource_filter_formats(tpl: dict) -> set[str]:
     return {str(x).strip().lower() for x in formats if str(x).strip()}
 
 
+def get_resource_limit(tpl: dict) -> int:
+    rf = tpl.get("resource_filter") or {}
+    n = safe_int(rf.get("limit_resources", 0), 0)
+    return max(0, n)
+
+
 def get_data_fetch_max_rows(tpl: dict) -> int:
     df = tpl.get("data_fetch") or {}
     n = safe_int(df.get("max_rows", 200), 200)
@@ -223,35 +229,6 @@ def dataset_page_url_of(ds: dict, requested_url: str) -> str:
     return requested_url
 
 
-def infer_ext_from_resources(ds: dict) -> Optional[str]:
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list):
-        return None
-
-    priority = ["csv", "json", "pdf"]
-    found: List[str] = []
-
-    for resource in resources:
-        if not isinstance(resource, dict):
-            continue
-
-        fmt = normalize_text(resource.get("format")).lower()
-        if fmt in priority:
-            found.append(fmt)
-            continue
-
-        url = normalize_text(resource.get("url"))
-        ext = guess_ext_from_url(url)
-        if ext in priority:
-            found.append(ext)
-
-    for p in priority:
-        if p in found:
-            return p
-
-    return found[0] if found else None
-
-
 def ckan_datastore_search_endpoint(dataset_search_endpoint: str) -> Optional[str]:
     if not dataset_search_endpoint:
         return None
@@ -265,11 +242,61 @@ def ckan_datastore_search_endpoint(dataset_search_endpoint: str) -> Optional[str
     return None
 
 
-def try_get_row_count_from_metadata(ds: dict, tpl: dict) -> Optional[int]:
+def resource_meta_ext(resource: dict) -> str:
+    fmt = normalize_text(resource.get("format")).lower()
+    if fmt:
+        return fmt
+    return guess_ext_from_url(normalize_text(resource.get("url")))
+
+
+def filter_allowed_resources(ds: dict, tpl: dict) -> List[dict]:
     resources = ds.get("resources") or []
     if not isinstance(resources, list):
+        return []
+
+    allowed_formats = get_resource_filter_formats(tpl)
+    limit_resources = get_resource_limit(tpl)
+
+    matched: List[dict] = []
+
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+
+        ext = resource_meta_ext(resource)
+        if allowed_formats and ext not in allowed_formats:
+            continue
+
+        matched.append(resource)
+
+        if limit_resources > 0 and len(matched) >= limit_resources:
+            break
+
+    return matched
+
+
+def infer_ext_from_resources(resources: List[dict], tpl: dict) -> Optional[str]:
+    if not resources:
         return None
 
+    allowed_formats = list(get_resource_filter_formats(tpl))
+    if not allowed_formats:
+        allowed_formats = ["csv", "json", "pdf"]
+
+    found: List[str] = []
+    for resource in resources:
+        ext = resource_meta_ext(resource)
+        if ext:
+            found.append(ext)
+
+    for p in allowed_formats:
+        if p in found:
+            return p
+
+    return found[0] if found else None
+
+
+def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optional[int]:
     ds_search = tpl.get("dataset_search") or {}
     dataset_search_endpoint = ds_search.get("endpoint") or ""
     datastore_endpoint = ckan_datastore_search_endpoint(dataset_search_endpoint)
@@ -300,18 +327,18 @@ def try_get_row_count_from_metadata(ds: dict, tpl: dict) -> Optional[int]:
     return None
 
 
-def summarize_dataset_from_api(ds: dict, requested_url: str, tpl: dict) -> dict:
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list):
-        resources = []
+def summarize_dataset_from_api(ds: dict, requested_url: str, tpl: dict) -> Optional[dict]:
+    allowed_resources = filter_allowed_resources(ds, tpl)
+    if len(allowed_resources) == 0:
+        return None
 
     return {
         "dataset_id": dataset_id_of(ds),
         "title": dataset_title_of(ds),
         "dataset_url": dataset_page_url_of(ds, requested_url),
-        "resource_count": len(resources),
-        "ext": infer_ext_from_resources(ds),
-        "row_count": try_get_row_count_from_metadata(ds, tpl),
+        "resource_count": len(allowed_resources),
+        "ext": infer_ext_from_resources(allowed_resources, tpl),
+        "row_count": try_get_row_count_from_metadata(allowed_resources, tpl),
     }
 
 
@@ -340,11 +367,15 @@ def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, co
 
     fmt = normalize_text(resource.get("format")).lower()
     kind = detect_resource_kind(resource, source_path, content_type)
+    meta_ext = resource_meta_ext(resource)
 
     if fmt in allowed_formats:
         return True
 
     if kind in allowed_formats:
+        return True
+
+    if meta_ext in allowed_formats:
         return True
 
     return False
@@ -457,10 +488,14 @@ def upsert_dataset_headers(
         if not dataset_id:
             continue
 
+        allowed_resources = filter_allowed_resources(ds, tpl)
+        if len(allowed_resources) == 0:
+            continue
+
         title = dataset_title_of(ds)
         dataset_url = dataset_page_url_of(ds, requested_url)
-        ext = infer_ext_from_resources(ds)
-        row_count = try_get_row_count_from_metadata(ds, tpl)
+        ext = infer_ext_from_resources(allowed_resources, tpl)
+        row_count = try_get_row_count_from_metadata(allowed_resources, tpl)
 
         cur.execute("""
             SELECT source_id, status, row_count, ext
@@ -472,7 +507,6 @@ def upsert_dataset_headers(
 
         if row:
             source_id = row[0]
-            status = row[1]
             old_row_count = row[2]
             old_ext = row[3]
 
@@ -574,19 +608,16 @@ def expand_dataset_into_row_data(
     if status == "done":
         raise HTTPException(status_code=409, detail="dataset already expanded")
 
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list) or len(resources) == 0:
-        raise HTTPException(status_code=400, detail="resource not found")
+    allowed_resources = filter_allowed_resources(ds, tpl)
+    if len(allowed_resources) == 0:
+        raise HTTPException(status_code=400, detail="登録対象データがありません")
 
     inserted_rows = 0
     skipped_rows = 0
     row_index = 1
-    detected_ext = None
+    detected_ext = infer_ext_from_resources(allowed_resources, tpl)
 
-    for resource in resources:
-        if not isinstance(resource, dict):
-            continue
-
+    for resource in allowed_resources:
         resource_url = normalize_text(resource.get("url"))
         if not resource_url:
             continue
@@ -594,9 +625,6 @@ def expand_dataset_into_row_data(
         records, final_url, kind = build_row_records_for_resource(resource, tpl)
         if not kind or len(records) == 0:
             continue
-
-        if detected_ext is None:
-            detected_ext = kind
 
         resource_name = normalize_text(resource.get("name") or resource.get("id") or "resource")
         resource_id = normalize_text(resource.get("id") or resource_name)
