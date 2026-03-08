@@ -33,6 +33,7 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
     token = authorization.replace("Bearer ", "", 1).strip()
+
     ensure_firebase_initialized()
 
     try:
@@ -50,6 +51,7 @@ def ingest_uploaded_file(
     file_id: str,
     authorization: str | None = Header(default=None),
 ):
+
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
@@ -64,113 +66,84 @@ def ingest_uploaded_file(
     local_db_path = f"/tmp/ank_{uid}_{file_id}.db"
     db_blob.download_to_filename(local_db_path)
 
-    conn = sqlite3.connect(local_db_path)
-    cur = conn.cursor()
+    try:
+        conn = sqlite3.connect(local_db_path)
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS source_documents (
-            source_id TEXT PRIMARY KEY,
-            source_type TEXT NOT NULL,
-            logical_name TEXT NOT NULL,
-            original_name TEXT,
-            ext TEXT,
-            source_key TEXT,
-            source_item_id TEXT,
-            source_url TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS ix_source_documents_created_at
-        ON source_documents(created_at DESC)
-    """)
-
-    cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_source_documents_item
-        ON source_documents(source_type, source_item_id)
-    """)
-
-    cur.execute("""
-        SELECT original_name, ext
-        FROM source_documents
-        WHERE source_id = ? AND source_type = 'upload'
-    """, (file_id,))
-    row = cur.fetchone()
-
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="file not found")
-
-    original_filename, ext = row
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS row_data (
-            row_id TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_key TEXT,
-            row_index INTEGER,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("SELECT 1 FROM row_data WHERE file_id = ? LIMIT 1", (file_id,))
-    if cur.fetchone():
-        conn.close()
-        os.remove(local_db_path)
-        raise HTTPException(status_code=409, detail="already ingested")
-
-    upload_blob_path = f"users/{uid}/uploads/{file_id}_{original_filename}"
-    upload_blob = bucket.blob(upload_blob_path)
-
-    if not upload_blob.exists():
-        conn.close()
-        os.remove(local_db_path)
-        raise HTTPException(status_code=404, detail="uploaded file not found")
-
-    file_bytes = upload_blob.download_as_bytes()
-    text = file_bytes.decode("utf-8", errors="replace")
-
-    if ext == "csv":
-        reader = csv.DictReader(text.splitlines())
-        rows = [json.dumps(r, ensure_ascii=False) for r in reader]
-    elif ext == "json":
-        obj = json.loads(text)
-        if isinstance(obj, list):
-            rows = [json.dumps(r, ensure_ascii=False) for r in obj]
-        else:
-            rows = [json.dumps(obj, ensure_ascii=False)]
-    else:
-        rows = [line for line in text.splitlines() if line.strip()]
-
-    created_at = datetime.now(tz=JST).isoformat()
-
-    for i, content in enumerate(rows):
         cur.execute("""
-            INSERT INTO row_data
-            (row_id, file_id, source_type, source_key, row_index, content, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(ulid.new()),
-            file_id,
-            "upload",
-            None,
-            i,
-            content,
-            created_at
-        ))
+            SELECT logical_name, original_name, ext
+            FROM upload_files
+            WHERE file_id = ?
+        """, (file_id,))
 
-    conn.commit()
-    conn.close()
+        row = cur.fetchone()
 
-    db_blob.upload_from_filename(local_db_path)
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="file not found")
 
-    os.remove(local_db_path)
+        logical_name, original_filename, ext = row
 
-    return {
-        "file_id": file_id,
-        "row_count": len(rows),
-        "db_gcs_path": db_blob_path
-    }
+        cur.execute("SELECT 1 FROM row_data WHERE file_id = ? LIMIT 1", (file_id,))
+        if cur.fetchone():
+            conn.close()
+            raise HTTPException(status_code=409, detail="already ingested")
+
+        upload_blob_path = f"users/{uid}/uploads/{file_id}_{original_filename}"
+        upload_blob = bucket.blob(upload_blob_path)
+
+        if not upload_blob.exists():
+            conn.close()
+            raise HTTPException(status_code=404, detail="uploaded file not found")
+
+        file_bytes = upload_blob.download_as_bytes()
+        text = file_bytes.decode("utf-8", errors="replace")
+
+        ext_lower = (ext or "").lower()
+
+        if ext_lower == "csv":
+            reader = csv.DictReader(text.splitlines())
+            rows = [json.dumps(r, ensure_ascii=False) for r in reader]
+        elif ext_lower == "json":
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                rows = [json.dumps(r, ensure_ascii=False) for r in obj]
+            else:
+                rows = [json.dumps(obj, ensure_ascii=False)]
+        else:
+            rows = [line for line in text.splitlines() if line.strip()]
+
+        created_at = datetime.now(tz=JST).isoformat()
+
+        for i, content in enumerate(rows):
+            cur.execute("""
+                INSERT INTO row_data
+                (row_id, file_id, source_type, source_key, row_index, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(ulid.new()),
+                file_id,
+                "upload",
+                logical_name,
+                i,
+                content,
+                created_at
+            ))
+
+        conn.commit()
+        conn.close()
+
+        db_blob.upload_from_filename(local_db_path)
+
+        return {
+            "file_id": file_id,
+            "logical_name": logical_name,
+            "row_count": len(rows)
+        }
+
+    finally:
+        if os.path.exists(local_db_path):
+            try:
+                os.remove(local_db_path)
+            except Exception:
+                pass

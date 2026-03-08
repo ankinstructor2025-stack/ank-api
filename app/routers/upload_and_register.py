@@ -1,4 +1,3 @@
-# routers/upload_and_register.py
 import os
 import sqlite3
 from datetime import datetime
@@ -36,10 +35,9 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
     token = authorization.replace("Bearer ", "", 1).strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Empty bearer token")
 
     ensure_firebase_initialized()
+
     try:
         decoded = fb_auth.verify_id_token(token)
         uid = decoded.get("uid")
@@ -55,14 +53,6 @@ async def upload_and_register(
     file: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ):
-    """
-    仕様:
-    - uidは Authorization Bearer の Firebase IDトークンから取得
-    - GCS: users/{uid}/uploads/{file_id}_{original_filename} にアップロード
-    - SQLite(ank.db): source_documents に1行INSERT
-    - 同名(logical_name)は upload 内で弾く（409）
-    - ank.db は GCS: users/{uid}/ank.db を /tmp に落として更新→上書き戻し
-    """
 
     uid = get_uid_from_auth_header(authorization)
 
@@ -74,13 +64,9 @@ async def upload_and_register(
 
     original_filename = file.filename
     logical_name = original_filename
-    ext = original_filename.rsplit(".", 1)[-1] if "." in original_filename else ""
+    ext = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else ""
 
     file_id = str(ulid.new())
-    source_type = "upload"
-    source_key = None
-    source_item_id = logical_name
-    source_url = None
 
     db_blob_path = user_db_path(uid)
     db_blob = bucket.blob(db_blob_path)
@@ -90,46 +76,24 @@ async def upload_and_register(
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path=gs://{BUCKET_NAME}/{db_blob_path}"
+            detail=f"ank.db not found"
         )
 
     db_blob.download_to_filename(local_db_path)
 
     upload_blob = None
+
     try:
         conn = sqlite3.connect(local_db_path)
         cur = conn.cursor()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS source_documents (
-                source_id TEXT PRIMARY KEY,
-                source_type TEXT NOT NULL,
-                logical_name TEXT NOT NULL,
-                original_name TEXT,
-                ext TEXT,
-                source_key TEXT,
-                source_item_id TEXT,
-                source_url TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS ix_source_documents_created_at
-            ON source_documents(created_at DESC)
-        """)
-
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_source_documents_item
-            ON source_documents(source_type, source_item_id)
-        """)
-
+        # 同名チェック
         cur.execute("""
             SELECT 1
-            FROM source_documents
-            WHERE source_type = ? AND source_item_id = ?
+            FROM upload_files
+            WHERE original_name = ?
             LIMIT 1
-        """, (source_type, source_item_id))
+        """, (original_filename,))
         if cur.fetchone():
             conn.close()
             raise HTTPException(status_code=409, detail="同名ファイルはアップロードできません")
@@ -142,35 +106,22 @@ async def upload_and_register(
 
         created_at = datetime.now(tz=JST).isoformat()
 
-        try:
-            cur.execute(
-                """
-                INSERT INTO source_documents
-                  (source_id, source_type, logical_name, original_name, ext, source_key, source_item_id, source_url, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    file_id,
-                    source_type,
-                    logical_name,
-                    original_filename,
-                    ext,
-                    source_key,
-                    source_item_id,
-                    source_url,
-                    created_at,
-                ),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            conn.close()
-            if upload_blob is not None:
-                try:
-                    upload_blob.delete()
-                except Exception:
-                    pass
-            raise HTTPException(status_code=409, detail="同名ファイルはアップロードできません")
+        cur.execute(
+            """
+            INSERT INTO upload_files
+            (file_id, logical_name, original_name, ext, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                file_id,
+                logical_name,
+                original_filename,
+                ext,
+                created_at,
+            ),
+        )
 
+        conn.commit()
         conn.close()
 
         db_blob.upload_from_filename(local_db_path)
@@ -181,8 +132,7 @@ async def upload_and_register(
             "original_filename": original_filename,
             "ext": ext,
             "created_at": created_at,
-            "gcs_path": upload_blob_path,
-            "db_gcs_path": db_blob_path,
+            "gcs_path": upload_blob_path
         }
 
     finally:
