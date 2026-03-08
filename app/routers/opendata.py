@@ -121,7 +121,7 @@ def get_resource_limit(tpl: dict) -> int:
 
 def get_data_fetch_max_rows(tpl: dict) -> int:
     df = tpl.get("data_fetch") or {}
-    n = safe_int(df.get("max_rows", 200), 200)
+    n = safe_int(df.get("max_rows", 2000), 2000)
     return max(1, n)
 
 
@@ -181,7 +181,11 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
     requested_url_last = endpoint
     collected: List[dict] = []
 
-    while len(collected) < max_total:
+    # 取り切れないループ防止
+    max_scan_pages = 10
+    scanned_pages = 0
+
+    while len(collected) < max_total and scanned_pages < max_scan_pages:
         p = dict(params)
         p["rows"] = rows
         p["start"] = start
@@ -205,7 +209,6 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
                 continue
 
             collected.append(item)
-
             if len(collected) >= max_total:
                 break
 
@@ -218,6 +221,7 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
             break
 
         start += rows
+        scanned_pages += 1
 
     return collected, requested_url_last
 
@@ -304,31 +308,98 @@ def infer_ext_from_resources(resources: List[dict], tpl: dict) -> Optional[str]:
     return found[0] if found else None
 
 
+def count_csv_rows_from_binary(binary: bytes, encoding: str) -> Optional[int]:
+    try:
+        text = binary.decode(encoding, errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        cnt = 0
+        for _ in reader:
+            cnt += 1
+        return cnt
+    except Exception:
+        return None
+
+
+def count_json_rows_from_binary(binary: bytes, encoding: str) -> Optional[int]:
+    try:
+        text = binary.decode(encoding, errors="replace")
+        obj = json.loads(text)
+
+        if isinstance(obj, list):
+            return len(obj)
+
+        if isinstance(obj, dict):
+            for key in ["results", "items", "data", "records"]:
+                v = obj.get(key)
+                if isinstance(v, list):
+                    return len(v)
+            return 1
+
+        return 1
+    except Exception:
+        return None
+
+
 def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optional[int]:
     ds_search = tpl.get("dataset_search") or {}
     dataset_search_endpoint = ds_search.get("endpoint") or ""
     datastore_endpoint = ckan_datastore_search_endpoint(dataset_search_endpoint)
-    if not datastore_endpoint:
-        return None
+
+    # 1. datastore_search が使えるならそれを優先
+    if datastore_endpoint:
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+
+            if not resource.get("datastore_active", False):
+                continue
+
+            resource_id = normalize_text(resource.get("id"))
+            if not resource_id:
+                continue
+
+            try:
+                payload, _ = _fetch_json(datastore_endpoint, {"resource_id": resource_id, "limit": 0})
+                result = _normalize_ckan_result(payload)
+                if isinstance(result, dict):
+                    count = result.get("total") or result.get("count")
+                    if count is not None:
+                        return safe_int(count, 0)
+            except Exception:
+                continue
+
+    # 2. CSV / JSON は実データを軽く読んで件数を出す
+    encoding = get_data_fetch_encoding(tpl)
 
     for resource in resources:
         if not isinstance(resource, dict):
             continue
 
-        if not resource.get("datastore_active", False):
+        ext = resource_meta_ext(resource)
+        if ext not in {"csv", "json"}:
             continue
 
-        resource_id = normalize_text(resource.get("id"))
-        if not resource_id:
+        url = normalize_text(resource.get("url"))
+        if not url:
             continue
 
         try:
-            payload, _ = _fetch_json(datastore_endpoint, {"resource_id": resource_id, "limit": 0})
-            result = _normalize_ckan_result(payload)
-            if isinstance(result, dict):
-                count = result.get("total") or result.get("count")
-                if count is not None:
-                    return safe_int(count, 0)
+            binary, final_url, content_type = _fetch_binary(url)
+
+            # URLやContent-Typeから再判定
+            ext2 = guess_ext_from_url(final_url) or ext
+            ctype = (content_type or "").lower()
+
+            if ext == "csv" or ext2 == "csv" or "csv" in ctype:
+                cnt = count_csv_rows_from_binary(binary, encoding)
+                if cnt is not None:
+                    return cnt
+
+            if ext == "json" or ext2 == "json" or "json" in ctype:
+                cnt = count_json_rows_from_binary(binary, encoding)
+                if cnt is not None:
+                    return cnt
+
         except Exception:
             continue
 
@@ -506,7 +577,7 @@ def upsert_dataset_headers(
         row_count = try_get_row_count_from_metadata(allowed_resources, tpl)
 
         cur.execute("""
-            SELECT source_id, status, row_count, ext
+            SELECT source_id, status
             FROM opendata_documents
             WHERE source_item_id = ?
             LIMIT 1
@@ -515,8 +586,6 @@ def upsert_dataset_headers(
 
         if row:
             source_id = row[0]
-            old_row_count = row[2]
-            old_ext = row[3]
 
             cur.execute("""
                 UPDATE opendata_documents
@@ -531,8 +600,8 @@ def upsert_dataset_headers(
                 title,
                 dataset_id,
                 dataset_url,
-                ext or old_ext,
-                row_count if row_count is not None else old_row_count,
+                ext,
+                row_count,
                 created_at,
                 source_id,
             ))
