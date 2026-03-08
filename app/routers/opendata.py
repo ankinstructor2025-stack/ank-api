@@ -223,7 +223,84 @@ def dataset_page_url_of(ds: dict, requested_url: str) -> str:
     return requested_url
 
 
-def summarize_dataset_from_api(ds: dict, requested_url: str) -> dict:
+def infer_ext_from_resources(ds: dict) -> Optional[str]:
+    resources = ds.get("resources") or []
+    if not isinstance(resources, list):
+        return None
+
+    priority = ["csv", "json", "pdf"]
+    found: List[str] = []
+
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+
+        fmt = normalize_text(resource.get("format")).lower()
+        if fmt in priority:
+            found.append(fmt)
+            continue
+
+        url = normalize_text(resource.get("url"))
+        ext = guess_ext_from_url(url)
+        if ext in priority:
+            found.append(ext)
+
+    for p in priority:
+        if p in found:
+            return p
+
+    return found[0] if found else None
+
+
+def ckan_datastore_search_endpoint(dataset_search_endpoint: str) -> Optional[str]:
+    if not dataset_search_endpoint:
+        return None
+
+    if dataset_search_endpoint.endswith("/package_search"):
+        return dataset_search_endpoint[:-len("/package_search")] + "/datastore_search"
+
+    if "/package_search" in dataset_search_endpoint:
+        return dataset_search_endpoint.replace("/package_search", "/datastore_search")
+
+    return None
+
+
+def try_get_row_count_from_metadata(ds: dict, tpl: dict) -> Optional[int]:
+    resources = ds.get("resources") or []
+    if not isinstance(resources, list):
+        return None
+
+    ds_search = tpl.get("dataset_search") or {}
+    dataset_search_endpoint = ds_search.get("endpoint") or ""
+    datastore_endpoint = ckan_datastore_search_endpoint(dataset_search_endpoint)
+    if not datastore_endpoint:
+        return None
+
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+
+        if not resource.get("datastore_active", False):
+            continue
+
+        resource_id = normalize_text(resource.get("id"))
+        if not resource_id:
+            continue
+
+        try:
+            payload, _ = _fetch_json(datastore_endpoint, {"resource_id": resource_id, "limit": 0})
+            result = _normalize_ckan_result(payload)
+            if isinstance(result, dict):
+                count = result.get("total") or result.get("count")
+                if count is not None:
+                    return safe_int(count, 0)
+        except Exception:
+            continue
+
+    return None
+
+
+def summarize_dataset_from_api(ds: dict, requested_url: str, tpl: dict) -> dict:
     resources = ds.get("resources") or []
     if not isinstance(resources, list):
         resources = []
@@ -233,6 +310,8 @@ def summarize_dataset_from_api(ds: dict, requested_url: str) -> dict:
         "title": dataset_title_of(ds),
         "dataset_url": dataset_page_url_of(ds, requested_url),
         "resource_count": len(resources),
+        "ext": infer_ext_from_resources(ds),
+        "row_count": try_get_row_count_from_metadata(ds, tpl),
     }
 
 
@@ -366,10 +445,11 @@ def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
     return None
 
 
-def register_dataset_headers(
+def upsert_dataset_headers(
     cur: sqlite3.Cursor,
     datasets: List[dict],
     requested_url: str,
+    tpl: dict,
     created_at: str,
 ) -> None:
     for ds in datasets:
@@ -379,22 +459,57 @@ def register_dataset_headers(
 
         title = dataset_title_of(ds)
         dataset_url = dataset_page_url_of(ds, requested_url)
+        ext = infer_ext_from_resources(ds)
+        row_count = try_get_row_count_from_metadata(ds, tpl)
 
         cur.execute("""
-            INSERT OR IGNORE INTO opendata_documents
-              (source_id, status, logical_name, source_key, source_item_id, source_url, ext, row_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(ulid.new()),
-            "new",
-            title,
-            dataset_id,
-            dataset_id,
-            dataset_url,
-            None,
-            None,
-            created_at,
-        ))
+            SELECT source_id, status, row_count, ext
+            FROM opendata_documents
+            WHERE source_item_id = ?
+            LIMIT 1
+        """, (dataset_id,))
+        row = cur.fetchone()
+
+        if row:
+            source_id = row[0]
+            status = row[1]
+            old_row_count = row[2]
+            old_ext = row[3]
+
+            cur.execute("""
+                UPDATE opendata_documents
+                SET logical_name = ?,
+                    source_key = ?,
+                    source_url = ?,
+                    ext = ?,
+                    row_count = ?,
+                    created_at = ?
+                WHERE source_id = ?
+            """, (
+                title,
+                dataset_id,
+                dataset_url,
+                ext or old_ext,
+                row_count if row_count is not None else old_row_count,
+                created_at,
+                source_id,
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO opendata_documents
+                  (source_id, status, logical_name, source_key, source_item_id, source_url, ext, row_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(ulid.new()),
+                "new",
+                title,
+                dataset_id,
+                dataset_id,
+                dataset_url,
+                ext,
+                row_count,
+                created_at,
+            ))
 
 
 def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
@@ -568,7 +683,7 @@ def _fetch_datasets_impl(authorization: str | None):
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
-        register_dataset_headers(cur, datasets, requested_url, created_at)
+        upsert_dataset_headers(cur, datasets, requested_url, tpl, created_at)
         conn.commit()
         items = list_registered_datasets(cur)
     finally:
