@@ -223,18 +223,17 @@ def dataset_page_url_of(ds: dict, requested_url: str) -> str:
     return requested_url
 
 
-def resource_id_of(r: dict, fallback_index: int) -> str:
-    rid = normalize_text(r.get("id"))
-    if rid:
-        return rid
-    return f"resource_{fallback_index}"
+def summarize_dataset_from_api(ds: dict, requested_url: str) -> dict:
+    resources = ds.get("resources") or []
+    if not isinstance(resources, list):
+        resources = []
 
-
-def resource_name_of(r: dict, fallback_index: int) -> str:
-    name = normalize_text(r.get("name"))
-    if name:
-        return name
-    return f"resource_{fallback_index}"
+    return {
+        "dataset_id": dataset_id_of(ds),
+        "title": dataset_title_of(ds),
+        "dataset_url": dataset_page_url_of(ds, requested_url),
+        "resource_count": len(resources),
+    }
 
 
 def detect_resource_kind(resource: dict, source_path: str, content_type: str = "") -> str:
@@ -270,55 +269,6 @@ def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, co
         return True
 
     return False
-
-
-def summarize_dataset(ds: dict, requested_url: str) -> dict:
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list):
-        resources = []
-
-    return {
-        "dataset_id": dataset_id_of(ds),
-        "title": dataset_title_of(ds),
-        "dataset_url": dataset_page_url_of(ds, requested_url),
-        "resource_count": len(resources),
-    }
-
-
-def summarize_resource(resource: dict, tpl: dict, fallback_index: int) -> dict:
-    resource_url = normalize_text(resource.get("url"))
-    kind = detect_resource_kind(resource, resource_url)
-    allowed = resource_allowed_by_template(resource, tpl, resource_url)
-
-    return {
-        "resource_id": resource_id_of(resource, fallback_index),
-        "resource_name": resource_name_of(resource, fallback_index),
-        "resource_url": resource_url,
-        "format": normalize_text(resource.get("format")),
-        "kind": kind,
-        "allowed": allowed,
-    }
-
-
-def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
-    for ds in datasets:
-        if dataset_id_of(ds) == dataset_id:
-            return ds
-    return None
-
-
-def find_resource_by_id(ds: dict, resource_id: str) -> Tuple[Optional[dict], Optional[int]]:
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list):
-        return None, None
-
-    for idx, resource in enumerate(resources, start=1):
-        if not isinstance(resource, dict):
-            continue
-        if resource_id_of(resource, idx) == resource_id:
-            return resource, idx
-
-    return None, None
 
 
 def split_csv_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
@@ -409,181 +359,195 @@ def build_row_records_for_resource(resource: dict, tpl: dict) -> Tuple[List[dict
     return [], final_url, ""
 
 
-def register_opendata_resource(
+def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
+    for ds in datasets:
+        if dataset_id_of(ds) == dataset_id:
+            return ds
+    return None
+
+
+def register_dataset_headers(
+    cur: sqlite3.Cursor,
+    datasets: List[dict],
+    requested_url: str,
+    created_at: str,
+) -> None:
+    for ds in datasets:
+        dataset_id = dataset_id_of(ds)
+        if not dataset_id:
+            continue
+
+        title = dataset_title_of(ds)
+        dataset_url = dataset_page_url_of(ds, requested_url)
+
+        cur.execute("""
+            INSERT OR IGNORE INTO opendata_documents
+              (source_id, status, logical_name, source_key, source_item_id, source_url, ext, row_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(ulid.new()),
+            "new",
+            title,
+            dataset_id,
+            dataset_id,
+            dataset_url,
+            None,
+            None,
+            created_at,
+        ))
+
+
+def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
+    cur.execute("""
+        SELECT
+          source_id,
+          status,
+          logical_name,
+          source_key,
+          source_item_id,
+          source_url,
+          ext,
+          row_count,
+          created_at
+        FROM opendata_documents
+        ORDER BY created_at DESC
+    """)
+
+    rows = cur.fetchall()
+    out = []
+    for row in rows:
+        out.append({
+            "source_id": row[0],
+            "status": row[1],
+            "title": row[2],
+            "dataset_id": row[4],
+            "dataset_url": row[5],
+            "ext": row[6],
+            "row_count": row[7],
+            "created_at": row[8],
+        })
+    return out
+
+
+def expand_dataset_into_row_data(
     cur: sqlite3.Cursor,
     ds: dict,
-    resource: dict,
-    resource_index: int,
     requested_url: str,
     tpl: dict,
     created_at: str,
-) -> Tuple[str, int, int, str, str]:
+) -> Tuple[int, int]:
     dataset_id = dataset_id_of(ds)
     dataset_title = dataset_title_of(ds)
     dataset_url = dataset_page_url_of(ds, requested_url)
 
-    resource_id = resource_id_of(resource, resource_index)
-    resource_name = resource_name_of(resource, resource_index)
-    resource_url = normalize_text(resource.get("url"))
-
     if not dataset_id:
         raise HTTPException(status_code=400, detail="dataset_id not found")
 
-    if not resource_id:
-        raise HTTPException(status_code=400, detail="resource_id not found")
-
-    if not resource_url:
-        raise HTTPException(status_code=400, detail="resource url not found")
-
     cur.execute("""
-        SELECT source_id
+        SELECT source_id, status
         FROM opendata_documents
         WHERE source_item_id = ?
         LIMIT 1
-    """, (resource_id,))
-    exists = cur.fetchone()
-    if exists:
-        raise HTTPException(status_code=409, detail="同じオープンデータ resource は登録済みです")
+    """, (dataset_id,))
+    row = cur.fetchone()
 
-    records, final_url, kind = build_row_records_for_resource(resource, tpl)
+    if not row:
+        raise HTTPException(status_code=404, detail="dataset not registered in opendata_documents")
 
-    if not final_url:
-        raise HTTPException(status_code=400, detail="resource url not found")
+    source_id, status = row
 
-    if not kind:
-        raise HTTPException(status_code=400, detail="対象外の形式です")
+    if status == "done":
+        raise HTTPException(status_code=409, detail="dataset already expanded")
 
-    if len(records) == 0:
-        raise HTTPException(status_code=400, detail="登録対象データがありません")
-
-    source_id = str(ulid.new())
-    logical_name = f"{dataset_title} / {resource_name}"
-    source_key = dataset_id
-    ext = kind
-
-    cur.execute("""
-        INSERT INTO opendata_documents
-          (source_id, logical_name, source_key, source_item_id, source_url, ext, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        source_id,
-        logical_name,
-        source_key,
-        resource_id,
-        final_url,
-        ext,
-        created_at,
-    ))
+    resources = ds.get("resources") or []
+    if not isinstance(resources, list) or len(resources) == 0:
+        raise HTTPException(status_code=400, detail="resource not found")
 
     inserted_rows = 0
     skipped_rows = 0
     row_index = 1
+    detected_ext = None
 
-    for sub_idx, rec in enumerate(records, start=1):
-        row_source_item_id = f"{dataset_id}:{resource_id}:{sub_idx}"
-        row_id = str(ulid.new())
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
 
-        content_obj = {
-            "dataset_id": dataset_id,
-            "dataset_title": dataset_title,
-            "dataset_url": dataset_url,
-            "resource_id": resource_id,
-            "resource_name": resource_name,
-            "resource_format": normalize_text(resource.get("format")),
-            "source_path": final_url,
-            "record_index": sub_idx,
-            "data": rec,
-        }
+        resource_url = normalize_text(resource.get("url"))
+        if not resource_url:
+            continue
 
-        content = json.dumps(content_obj, ensure_ascii=False)
+        records, final_url, kind = build_row_records_for_resource(resource, tpl)
+        if not kind or len(records) == 0:
+            continue
 
-        cur.execute("""
-            INSERT OR IGNORE INTO row_data
-              (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row_id,
-            source_id,
-            "opendata",
-            dataset_id,
-            row_source_item_id,
-            row_index,
-            content,
-            created_at,
-        ))
+        if detected_ext is None:
+            detected_ext = kind
 
-        if cur.rowcount == 1:
-            inserted_rows += 1
-        else:
-            skipped_rows += 1
+        resource_name = normalize_text(resource.get("name") or resource.get("id") or "resource")
+        resource_id = normalize_text(resource.get("id") or resource_name)
 
-        row_index += 1
+        for sub_idx, rec in enumerate(records, start=1):
+            row_source_item_id = f"{dataset_id}:{resource_id}:{sub_idx}"
+            row_id = str(ulid.new())
 
-    return source_id, inserted_rows, skipped_rows, logical_name, kind
+            content_obj = {
+                "dataset_id": dataset_id,
+                "dataset_title": dataset_title,
+                "dataset_url": dataset_url,
+                "resource_id": resource_id,
+                "resource_name": resource_name,
+                "resource_format": normalize_text(resource.get("format")),
+                "source_path": final_url,
+                "record_index": sub_idx,
+                "data": rec,
+            }
+
+            content = json.dumps(content_obj, ensure_ascii=False)
+
+            cur.execute("""
+                INSERT OR IGNORE INTO row_data
+                  (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row_id,
+                source_id,
+                "opendata",
+                dataset_id,
+                row_source_item_id,
+                row_index,
+                content,
+                created_at,
+            ))
+
+            if cur.rowcount == 1:
+                inserted_rows += 1
+            else:
+                skipped_rows += 1
+
+            row_index += 1
+
+    if inserted_rows == 0 and skipped_rows == 0:
+        raise HTTPException(status_code=400, detail="登録対象データがありません")
+
+    cur.execute("""
+        UPDATE opendata_documents
+        SET status = ?, row_count = ?, ext = ?
+        WHERE source_id = ?
+    """, (
+        "done",
+        inserted_rows,
+        detected_ext,
+        source_id,
+    ))
+
+    return inserted_rows, skipped_rows
 
 
 def _fetch_datasets_impl(authorization: str | None):
-    get_uid_from_auth_header(authorization)
-
-    tpl = load_opendata_template()
-    datasets, requested_url = _dataset_search_all_from_template(tpl)
-
-    items = [summarize_dataset(ds, requested_url) for ds in datasets]
-
-    return {
-        "mode": "fetch_datasets",
-        "requested_url": requested_url,
-        "dataset_count": len(items),
-        "datasets": items,
-    }
-
-
-def _fetch_resources_impl(dataset_id: str, authorization: str | None):
-    get_uid_from_auth_header(authorization)
-
-    tpl = load_opendata_template()
-    datasets, requested_url = _dataset_search_all_from_template(tpl)
-
-    ds = find_dataset_by_id(datasets, dataset_id)
-    if not ds:
-        raise HTTPException(status_code=404, detail="dataset not found")
-
-    resources = ds.get("resources") or []
-    if not isinstance(resources, list):
-        resources = []
-
-    items = []
-    for idx, resource in enumerate(resources, start=1):
-        if not isinstance(resource, dict):
-            continue
-        items.append(summarize_resource(resource, tpl, idx))
-
-    return {
-        "mode": "fetch_resources",
-        "requested_url": requested_url,
-        "dataset": summarize_dataset(ds, requested_url),
-        "resource_count": len(items),
-        "resources": items,
-    }
-
-
-def _register_resource_impl(
-    dataset_id: str,
-    resource_id: str,
-    authorization: str | None,
-):
     uid = get_uid_from_auth_header(authorization)
 
     tpl = load_opendata_template()
     datasets, requested_url = _dataset_search_all_from_template(tpl)
-
-    ds = find_dataset_by_id(datasets, dataset_id)
-    if not ds:
-        raise HTTPException(status_code=404, detail="dataset not found")
-
-    resource, resource_index = find_resource_by_id(ds, resource_id)
-    if not resource or resource_index is None:
-        raise HTTPException(status_code=404, detail="resource not found")
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -596,7 +560,7 @@ def _register_resource_impl(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
         )
 
-    local_db_path = f"/tmp/ank_{uid}_opendata_{resource_id}.db"
+    local_db_path = f"/tmp/ank_{uid}_opendata_fetch.db"
     db_blob.download_to_filename(local_db_path)
 
     created_at = now_iso()
@@ -604,18 +568,71 @@ def _register_resource_impl(
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
+        register_dataset_headers(cur, datasets, requested_url, created_at)
+        conn.commit()
+        items = list_registered_datasets(cur)
+    finally:
+        conn.close()
 
-        source_id, inserted_rows, skipped_rows, logical_name, kind = register_opendata_resource(
+    db_blob.upload_from_filename(local_db_path)
+
+    return {
+        "mode": "fetch_datasets",
+        "requested_url": requested_url,
+        "dataset_count": len(items),
+        "datasets": items,
+    }
+
+
+def _expand_dataset_impl(dataset_id: str, authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    tpl = load_opendata_template()
+    datasets, requested_url = _dataset_search_all_from_template(tpl)
+
+    ds = find_dataset_by_id(datasets, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="dataset not found")
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_opendata_expand_{dataset_id}.db"
+    db_blob.download_to_filename(local_db_path)
+
+    created_at = now_iso()
+
+    conn = sqlite3.connect(local_db_path)
+    try:
+        cur = conn.cursor()
+        inserted_rows, skipped_rows = expand_dataset_into_row_data(
             cur=cur,
             ds=ds,
-            resource=resource,
-            resource_index=resource_index,
             requested_url=requested_url,
             tpl=tpl,
             created_at=created_at,
         )
-
         conn.commit()
+
+        cur.execute("""
+            SELECT source_id, status, row_count, ext
+            FROM opendata_documents
+            WHERE source_item_id = ?
+            LIMIT 1
+        """, (dataset_id,))
+        row = cur.fetchone()
+        source_id = row[0] if row else None
+        status = row[1] if row else None
+        row_count = row[2] if row else None
+        ext = row[3] if row else None
 
     finally:
         conn.close()
@@ -623,13 +640,12 @@ def _register_resource_impl(
     db_blob.upload_from_filename(local_db_path)
 
     return {
-        "mode": "register_resource",
-        "requested_url": requested_url,
-        "source_id": source_id,
+        "mode": "expand_dataset",
         "dataset_id": dataset_id,
-        "resource_id": resource_id,
-        "logical_name": logical_name,
-        "ext": kind,
+        "source_id": source_id,
+        "status": status,
+        "row_count": row_count,
+        "ext": ext,
         "row_inserted": inserted_rows,
         "row_skipped": skipped_rows,
     }
@@ -649,35 +665,17 @@ def opendata_fetch_datasets_post(
     return _fetch_datasets_impl(authorization)
 
 
-@router.get("/fetch_resources")
-def opendata_fetch_resources_get(
+@router.get("/expand_dataset")
+def opendata_expand_dataset_get(
     dataset_id: str = Query(...),
     authorization: str | None = Header(default=None),
 ):
-    return _fetch_resources_impl(dataset_id, authorization)
+    return _expand_dataset_impl(dataset_id, authorization)
 
 
-@router.post("/fetch_resources")
-def opendata_fetch_resources_post(
+@router.post("/expand_dataset")
+def opendata_expand_dataset_post(
     dataset_id: str = Query(...),
     authorization: str | None = Header(default=None),
 ):
-    return _fetch_resources_impl(dataset_id, authorization)
-
-
-@router.get("/register_resource")
-def opendata_register_resource_get(
-    dataset_id: str = Query(...),
-    resource_id: str = Query(...),
-    authorization: str | None = Header(default=None),
-):
-    return _register_resource_impl(dataset_id, resource_id, authorization)
-
-
-@router.post("/register_resource")
-def opendata_register_resource_post(
-    dataset_id: str = Query(...),
-    resource_id: str = Query(...),
-    authorization: str | None = Header(default=None),
-):
-    return _register_resource_impl(dataset_id, resource_id, authorization)
+    return _expand_dataset_impl(dataset_id, authorization)
