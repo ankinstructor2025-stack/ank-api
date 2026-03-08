@@ -749,16 +749,18 @@ def expand_dataset_into_row_data(
     if inserted_rows == 0 and skipped_rows == 0:
         raise HTTPException(status_code=400, detail="登録対象データがありません")
 
-    cur.execute("""
-        UPDATE opendata_documents
-        SET status = ?, row_count = ?, ext = ?
-        WHERE source_id = ?
-    """, (
-        "done",
-        inserted_rows,
-        detected_ext,
-        source_id,
-    ))
+    # row_data に1件以上登録できたら完了
+    if inserted_rows > 0:
+        cur.execute("""
+            UPDATE opendata_documents
+            SET status = ?, row_count = ?, ext = ?
+            WHERE source_id = ?
+        """, (
+            "done",
+            inserted_rows,
+            detected_ext,
+            source_id,
+        ))
 
     return inserted_rows, skipped_rows
 
