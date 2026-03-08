@@ -196,10 +196,18 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
         if not isinstance(items, list) or len(items) == 0:
             break
 
-        remain = max_total - len(collected)
-        for item in items[:remain]:
-            if isinstance(item, dict):
-                collected.append(item)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            allowed_resources = filter_allowed_resources(item, tpl)
+            if len(allowed_resources) == 0:
+                continue
+
+            collected.append(item)
+
+            if len(collected) >= max_total:
+                break
 
         total_count = safe_int(result.get("count", 0), 0)
 
