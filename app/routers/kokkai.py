@@ -56,9 +56,6 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
 
 
 def load_kokkai_template() -> dict:
-    """
-    GCS: template/kokkai.json を読み込んで dict で返す
-    """
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(KOKKAI_TEMPLATE_PATH)
@@ -82,10 +79,6 @@ def _record_key(url: str) -> str:
 
 
 def _clamp_maximum_records(url: str, value: Any) -> int:
-    """
-    speech: 1..100
-    meeting: 条件次第で10制限になりやすいので 1..10
-    """
     try:
         n = int(value)
     except Exception:
@@ -97,9 +90,6 @@ def _clamp_maximum_records(url: str, value: Any) -> int:
 
 
 def _fetch_json(url: str, params: dict) -> Tuple[dict, str]:
-    """
-    (json, requested_url) を返す
-    """
     try:
         res = requests.get(url, params=params, timeout=20)
         res.raise_for_status()
@@ -123,30 +113,7 @@ def _next_record_position(data: dict) -> Optional[int]:
         return None
 
 
-def _summarize_first(url: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not records:
-        return {}
-
-    r = records[0]
-    if _is_speech(url):
-        return {
-            "speech_id": r.get("speechID") or r.get("speechId") or r.get("speech_id"),
-            "speaker": r.get("speaker"),
-            "date": r.get("date"),
-            "nameOfMeeting": r.get("nameOfMeeting"),
-        }
-
-    return {
-        "meeting_name": r.get("nameOfMeeting"),
-        "date": r.get("date"),
-    }
-
-
 def fetch_records_from_template() -> Tuple[str, str, List[Dict[str, Any]]]:
-    """
-    template/kokkai.json に従って取得する
-    戻り値: (requested_url_last, record_type_key, records)
-    """
     tpl = load_kokkai_template()
 
     url = tpl.get("endpoint") or "https://kokkai.ndl.go.jp/api/meeting"
@@ -199,44 +166,30 @@ def speech_id_of(r: Dict[str, Any]) -> str:
     return str(r.get("speechID") or r.get("speechId") or r.get("speech_id") or "")
 
 
-def speech_url_of(r: Dict[str, Any]) -> str:
-    return str(r.get("speechURL") or r.get("speechUrl") or r.get("speech_url") or "")
-
-
 def row_source_item_id_of(r: Dict[str, Any]) -> str:
     """
     row_data 側の一意識別子
-    - speechURL があれば優先
-    - なければ speechID
+    国会議事録は speechID を使う
     """
-    speech_url = speech_url_of(r)
-    if speech_url:
-        return speech_url
-
     sid = speech_id_of(r)
     if sid:
         return sid
-
     return ""
 
 
-def build_logical_name(records: List[Dict[str, Any]], requested_url: str) -> str:
+def build_source_key(records: List[Dict[str, Any]]) -> str:
     """
-    デモ用の見せる名前
+    row_data.source_key に入れる取得条件の簡易表現
     """
     if not records:
-        return "国会議事録"
+        return "kokkai"
 
     first = records[0]
-    date = str(first.get("date") or "")
     house = str(first.get("nameOfHouse") or "")
     meeting = str(first.get("nameOfMeeting") or "")
 
-    parts = [p for p in [date, house, meeting] if p]
-    if parts:
-        return " / ".join(parts)
-
-    return requested_url
+    parts = [p for p in [house, meeting] if p]
+    return " / ".join(parts) if parts else "kokkai"
 
 
 @router.post("/fetch_and_register")
@@ -244,11 +197,11 @@ def kokkai_fetch_and_register(
     authorization: str | None = Header(default=None),
 ):
     """
-    取得テスト + row_data登録（分けない）
+    取得テスト + row_data登録
     - template/kokkai.json の条件で取得
-    - users/{uid}/ank.db の source_documents に親登録
-    - 同じ requested_url なら row_data 登録まで進まない
-    - row_data には speechURL 優先 / speechID fallback で source_item_id を入れる
+    - source_documents は使わない
+    - row_data のみ登録
+    - source_item_id には speechID を入れる
     """
     uid = get_uid_from_auth_header(authorization)
 
@@ -286,14 +239,8 @@ def kokkai_fetch_and_register(
 
     file_id = str(ulid.new())
     created_at = datetime.now(tz=JST).isoformat()
-
     source_type = "kokkai"
-    source_key = KOKKAI_TEMPLATE_PATH
-    source_item_id = requested_url
-    source_url = requested_url
-    logical_name = build_logical_name(records, requested_url)
-    original_name = logical_name
-    ext = "json"
+    source_key = build_source_key(records)
 
     inserted = 0
     skipped = 0
@@ -302,112 +249,6 @@ def kokkai_fetch_and_register(
     try:
         cur = conn.cursor()
 
-        # 親テーブル
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS source_documents (
-                source_id TEXT PRIMARY KEY,
-                source_type TEXT NOT NULL,
-                logical_name TEXT NOT NULL,
-                original_name TEXT,
-                ext TEXT,
-                source_key TEXT,
-                source_item_id TEXT NOT NULL,
-                source_url TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS ix_source_documents_created_at
-            ON source_documents(created_at DESC)
-        """)
-
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_source_documents_item
-            ON source_documents(source_type, source_item_id)
-        """)
-
-        # row_data
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS row_data (
-                row_id TEXT PRIMARY KEY,
-                file_id TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                source_key TEXT,
-                source_item_id TEXT,
-                row_index INTEGER,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_row_data_file_id
-            ON row_data(file_id)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_row_data_source_type
-            ON row_data(source_type)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_row_data_source_key
-            ON row_data(source_key)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_row_data_file_row
-            ON row_data(file_id, row_index)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_row_data_type_created
-            ON row_data(source_type, created_at DESC)
-        """)
-
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_row_data_source_item
-            ON row_data(source_type, source_item_id)
-        """)
-
-        # 親で重複チェック
-        cur.execute("""
-            SELECT source_id
-            FROM source_documents
-            WHERE source_type = ? AND source_item_id = ?
-            LIMIT 1
-        """, (source_type, source_item_id))
-        exists = cur.fetchone()
-
-        if exists:
-            conn.close()
-            raise HTTPException(
-                status_code=409,
-                detail="同じ取得条件の国会議事録は登録済みです"
-            )
-
-        # 親登録
-        cur.execute(
-            """
-            INSERT INTO source_documents
-              (source_id, source_type, logical_name, original_name, ext, source_key, source_item_id, source_url, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                file_id,
-                source_type,
-                logical_name,
-                original_name,
-                ext,
-                source_key,
-                source_item_id,
-                source_url,
-                created_at,
-            ),
-        )
-
-        # 子登録
         row_index = 1
         for r in records:
             item_id = row_source_item_id_of(r)
@@ -459,5 +300,5 @@ def kokkai_fetch_and_register(
         "count": fetched,
         "inserted": inserted,
         "skipped": skipped,
-        "logical_name": logical_name,
+        "source_key": source_key,
     }
