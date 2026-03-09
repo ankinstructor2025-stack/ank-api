@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, Header, HTTPException
+from google.cloud import storage
 from pydantic import BaseModel, Field
 
 try:
@@ -19,34 +22,26 @@ except ImportError:
 
 router = APIRouter(tags=["public_url"])
 
-
 DB_PATH = "ank.db"
+BUCKET_NAME = os.getenv("BUCKET_NAME", "ank-bucket")
+TEMPLATE_PREFIX = os.getenv("TEMPLATE_PREFIX", "template")
+
+SOURCE_FILE_MAP = {
+    "url_egov": "egov.json",
+    "url_caa": "caa.json",
+}
 
 
-# =========================
-# request model
-# =========================
 class PublicUrlRequest(BaseModel):
     source_key: str = Field(..., min_length=1)
-    target_url: str | None = None
-    config: dict[str, Any] = Field(default_factory=dict)
 
 
-# =========================
-# internal model
-# =========================
 @dataclass
 class CrawlRule:
     same_domain_only: bool
     include_root_page: bool
-    link_mode: str
-    page_url_prefixes: list[str]
-    exclude_exact_urls: set[str]
 
 
-# =========================
-# utility
-# =========================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -54,7 +49,6 @@ def now_iso() -> str:
 def make_id() -> str:
     if ulid is not None:
         return str(ulid.new())
-    # ulid未導入でも落とさない
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
 
@@ -67,7 +61,6 @@ def normalize_url(url: str) -> str:
     if path != "/" and path.endswith("/"):
         path = path[:-1]
 
-    # query / fragment はURL管理上ノイズになりやすいので除外
     return f"{scheme}://{netloc}{path}"
 
 
@@ -75,37 +68,52 @@ def same_domain(url1: str, url2: str) -> bool:
     return urlparse(url1).netloc.lower() == urlparse(url2).netloc.lower()
 
 
+def get_blob_path(source_key: str) -> str:
+    file_name = SOURCE_FILE_MAP.get(source_key)
+    if not file_name:
+        raise HTTPException(status_code=400, detail=f"unsupported source_key: {source_key}")
+    return f"{TEMPLATE_PREFIX}/{file_name}"
+
+
+def load_source_config(source_key: str) -> dict[str, Any]:
+    blob_path = get_blob_path(source_key)
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(blob_path)
+
+        if not blob.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"config not found: gs://{BUCKET_NAME}/{blob_path}"
+            )
+
+        text = blob.download_as_text(encoding="utf-8")
+        return json.loads(text)
+
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"invalid json in gs://{BUCKET_NAME}/{blob_path}: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to load source config: {e}"
+        )
+
+
 def load_crawl_rule(config: dict[str, Any]) -> tuple[dict[str, Any], CrawlRule]:
     request_conf = config.get("request", {}) or {}
     crawl_conf = config.get("crawl", {}) or {}
 
-    prefixes = crawl_conf.get("page_url_prefixes") or []
-    exclude_exact_urls = set(crawl_conf.get("exclude_exact_urls") or [])
-
     return request_conf, CrawlRule(
         same_domain_only=bool(crawl_conf.get("same_domain_only", True)),
         include_root_page=bool(crawl_conf.get("include_root_page", True)),
-        link_mode=str(crawl_conf.get("link_mode", "prefix")),
-        page_url_prefixes=[normalize_url(x) for x in prefixes if x],
-        exclude_exact_urls={normalize_url(x) for x in exclude_exact_urls if x},
     )
-
-
-def is_target_page(url: str, root_url: str, rule: CrawlRule) -> bool:
-    normalized = normalize_url(url)
-
-    if rule.same_domain_only and not same_domain(normalized, root_url):
-        return False
-
-    if normalized in rule.exclude_exact_urls:
-        return False
-
-    if rule.link_mode == "prefix":
-        if not rule.page_url_prefixes:
-            return True
-        return any(normalized.startswith(prefix) for prefix in rule.page_url_prefixes)
-
-    return True
 
 
 def fetch_html(url: str, request_conf: dict[str, Any]) -> str:
@@ -159,41 +167,89 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-# =========================
-# DB
-# 既存テーブル前提
-# =========================
-def insert_url_root(
+def ensure_url_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS url_roots (
+          root_id TEXT PRIMARY KEY,
+          source_type TEXT NOT NULL,
+          root_url TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_roots_root_url
+        ON url_roots(root_url)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS url_pages (
+          page_id TEXT PRIMARY KEY,
+          root_id TEXT NOT NULL,
+          page_url TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_page_url
+        ON url_pages(page_url)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_url_pages_root_id
+        ON url_pages(root_id)
+        """
+    )
+
+
+def insert_url_root_if_not_exists(
     conn: sqlite3.Connection,
     root_id: str,
-    source_key: str,
-    requested_url: str,
-    target_url: str,
-) -> None:
+    source_type: str,
+    root_url: str,
+) -> str:
     now = now_iso()
+
+    cur = conn.execute(
+        """
+        SELECT root_id
+        FROM url_roots
+        WHERE root_url = ?
+        """,
+        (root_url,),
+    )
+    row = cur.fetchone()
+    if row:
+        return row["root_id"]
+
     conn.execute(
         """
         INSERT INTO url_roots (
             root_id,
-            source_key,
-            requested_url,
-            target_url,
-            created_at,
-            updated_at
+            source_type,
+            root_url,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?)
         """,
-        (root_id, source_key, requested_url, target_url, now, now),
+        (root_id, source_type, root_url, now),
     )
+    return root_id
 
 
 def insert_url_page_if_not_exists(
     conn: sqlite3.Connection,
     page_id: str,
     root_id: str,
-    source_key: str,
     page_url: str,
-    row_index: int,
 ) -> bool:
     now = now_iso()
 
@@ -202,61 +258,66 @@ def insert_url_page_if_not_exists(
         INSERT OR IGNORE INTO url_pages (
             page_id,
             root_id,
-            source_key,
             page_url,
             status,
-            row_index,
-            created_at,
-            updated_at
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (page_id, root_id, source_key, page_url, "discovered", row_index, now, now),
+        (page_id, root_id, page_url, "new", now),
     )
     return cur.rowcount > 0
 
 
-# =========================
-# route
-# =========================
 @router.post("/public-url/register")
 async def public_url_register(
     req: PublicUrlRequest,
     authorization: str | None = Header(default=None),
 ):
-    # authorization は既存構成に合わせて受けるだけ
-    # 認証チェックは既存共通処理があるならそちらへ寄せる
-
-    config = req.config or {}
+    config = load_source_config(req.source_key)
     request_conf, rule = load_crawl_rule(config)
 
-    requested_url = (req.target_url or "").strip()
-    config_url = str(request_conf.get("url") or "").strip()
-    target_url = config_url or requested_url
-
+    target_url = str(request_conf.get("url") or "").strip()
     if not target_url:
-        raise HTTPException(status_code=400, detail="target_url is required")
+        raise HTTPException(status_code=400, detail="request.url is required in template json")
 
     target_url = normalize_url(target_url)
 
-    html = fetch_html(target_url, request_conf)
-    extracted = extract_links(html, target_url)
+    # root
+    root_html = fetch_html(target_url, request_conf)
+    level1_urls_all = extract_links(root_html, target_url)
 
-    pages: list[str] = []
-    seen: set[str] = set()
+    level1_urls: list[str] = []
+    seen_pages: set[str] = set()
 
-    if rule.include_root_page and target_url not in rule.exclude_exact_urls:
-        if is_target_page(target_url, target_url, rule):
-            seen.add(target_url)
-            pages.append(target_url)
-
-    for url in extracted:
-        if url in seen:
+    for url in level1_urls_all:
+        if rule.same_domain_only and not same_domain(url, target_url):
             continue
-        if not is_target_page(url, target_url, rule):
+        if url == target_url:
             continue
-        seen.add(url)
-        pages.append(url)
+        if url not in seen_pages:
+            seen_pages.add(url)
+            level1_urls.append(url)
+
+    # level2
+    level2_urls: list[str] = []
+    for page_url in level1_urls:
+        try:
+            html = fetch_html(page_url, request_conf)
+            child_urls = extract_links(html, page_url)
+        except HTTPException:
+            continue
+
+        for child_url in child_urls:
+            if rule.same_domain_only and not same_domain(child_url, target_url):
+                continue
+            if child_url == target_url:
+                continue
+            if child_url not in seen_pages:
+                seen_pages.add(child_url)
+                level2_urls.append(child_url)
+
+    pages = level1_urls + level2_urls
 
     root_id = make_id()
     row_inserted = 0
@@ -264,29 +325,28 @@ async def public_url_register(
 
     try:
         with get_conn() as conn:
-            insert_url_root(
+            ensure_url_tables(conn)
+
+            root_id = insert_url_root_if_not_exists(
                 conn=conn,
                 root_id=root_id,
-                source_key=req.source_key,
-                requested_url=requested_url or target_url,
-                target_url=target_url,
+                source_type=req.source_key,
+                root_url=target_url,
             )
 
             result_pages: list[dict[str, Any]] = []
 
-            for idx, page_url in enumerate(pages, start=1):
+            for page_url in pages:
                 inserted = insert_url_page_if_not_exists(
                     conn=conn,
                     page_id=make_id(),
                     root_id=root_id,
-                    source_key=req.source_key,
                     page_url=page_url,
-                    row_index=idx,
                 )
 
                 if inserted:
                     row_inserted += 1
-                    status = "discovered"
+                    status = "new"
                 else:
                     row_skipped += 1
                     status = "duplicate"
@@ -309,8 +369,7 @@ async def public_url_register(
     return {
         "mode": "public_url_register",
         "source_key": req.source_key,
-        "requested_url": requested_url or target_url,
-        "target_url": target_url,
+        "root_url": target_url,
         "root_id": root_id,
         "page_count": len(pages),
         "row_inserted": row_inserted,
