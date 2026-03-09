@@ -40,6 +40,15 @@ class PublicUrlRequest(BaseModel):
 class CrawlRule:
     same_domain_only: bool
     include_root_page: bool
+    max_depth: int
+    max_pages: int
+
+
+@dataclass
+class CrawlNode:
+    url: str
+    parent_page_id: str | None
+    depth: int
 
 
 def now_iso() -> str:
@@ -66,6 +75,16 @@ def normalize_url(url: str) -> str:
 
 def same_domain(url1: str, url2: str) -> bool:
     return urlparse(url1).netloc.lower() == urlparse(url2).netloc.lower()
+
+
+def is_html_like_url(url: str) -> bool:
+    lower = url.lower()
+    blocked_exts = (
+        ".pdf", ".zip", ".xls", ".xlsx", ".csv", ".json",
+        ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
+        ".doc", ".docx", ".ppt", ".pptx", ".xml"
+    )
+    return not lower.endswith(blocked_exts)
 
 
 def get_blob_path(source_key: str) -> str:
@@ -112,7 +131,9 @@ def load_crawl_rule(config: dict[str, Any]) -> tuple[dict[str, Any], CrawlRule]:
 
     return request_conf, CrawlRule(
         same_domain_only=bool(crawl_conf.get("same_domain_only", True)),
-        include_root_page=bool(crawl_conf.get("include_root_page", True)),
+        include_root_page=bool(crawl_conf.get("include_root_page", False)),
+        max_depth=int(crawl_conf.get("max_depth", 3)),
+        max_pages=int(crawl_conf.get("max_pages", 200)),
     )
 
 
@@ -161,6 +182,30 @@ def extract_links(html: str, base_url: str) -> list[str]:
     return urls
 
 
+def filter_child_urls(
+    urls: list[str],
+    target_url: str,
+    rule: CrawlRule,
+    seen_urls: set[str],
+) -> list[str]:
+    result: list[str] = []
+
+    for url in urls:
+        if rule.same_domain_only and not same_domain(url, target_url):
+            continue
+        if url == target_url:
+            continue
+        if not is_html_like_url(url):
+            continue
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        result.append(url)
+
+    return result
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -190,22 +235,37 @@ def ensure_url_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS url_pages (
           page_id TEXT PRIMARY KEY,
           root_id TEXT NOT NULL,
+          parent_page_id TEXT,
           page_url TEXT NOT NULL,
+          depth INTEGER NOT NULL,
           status TEXT NOT NULL,
+          child_count INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL
         )
         """
     )
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_page_url
-        ON url_pages(page_url)
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_root_page_url
+        ON url_pages(root_id, page_url)
         """
     )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS ix_url_pages_root_id
         ON url_pages(root_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_url_pages_parent_page_id
+        ON url_pages(parent_page_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_url_pages_root_depth
+        ON url_pages(root_id, depth)
         """
     )
 
@@ -245,28 +305,132 @@ def insert_url_root_if_not_exists(
     return root_id
 
 
+def find_page_id(
+    conn: sqlite3.Connection,
+    root_id: str,
+    page_url: str,
+) -> str | None:
+    cur = conn.execute(
+        """
+        SELECT page_id
+        FROM url_pages
+        WHERE root_id = ? AND page_url = ?
+        """,
+        (root_id, page_url),
+    )
+    row = cur.fetchone()
+    return row["page_id"] if row else None
+
+
 def insert_url_page_if_not_exists(
     conn: sqlite3.Connection,
     page_id: str,
     root_id: str,
+    parent_page_id: str | None,
     page_url: str,
-) -> bool:
+    depth: int,
+    status: str = "new",
+    child_count: int = 0,
+) -> tuple[bool, str]:
     now = now_iso()
 
-    cur = conn.execute(
+    existing_page_id = find_page_id(conn, root_id, page_url)
+    if existing_page_id:
+        return False, existing_page_id
+
+    conn.execute(
         """
-        INSERT OR IGNORE INTO url_pages (
+        INSERT INTO url_pages (
             page_id,
             root_id,
+            parent_page_id,
             page_url,
+            depth,
             status,
+            child_count,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (page_id, root_id, page_url, "new", now),
+        (page_id, root_id, parent_page_id, page_url, depth, status, child_count, now),
     )
-    return cur.rowcount > 0
+    return True, page_id
+
+
+def update_page_child_count(
+    conn: sqlite3.Connection,
+    page_id: str,
+    child_count: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE url_pages
+        SET child_count = ?, status = ?
+        WHERE page_id = ?
+        """,
+        (child_count, "expanded", page_id),
+    )
+
+
+def crawl_tree(
+    target_url: str,
+    request_conf: dict[str, Any],
+    rule: CrawlRule,
+) -> list[dict[str, Any]]:
+    root_html = fetch_html(target_url, request_conf)
+    root_links_all = extract_links(root_html, target_url)
+
+    seen_urls: set[str] = set()
+    pages: list[dict[str, Any]] = []
+
+    level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
+
+    queue: list[CrawlNode] = [
+        CrawlNode(url=url, parent_page_id=None, depth=1)
+        for url in level1_urls
+    ]
+
+    idx = 0
+    while idx < len(queue) and len(pages) < rule.max_pages:
+        node = queue[idx]
+        idx += 1
+
+        page_info = {
+            "page_url": node.url,
+            "parent_page_url": None,
+            "parent_page_id": node.parent_page_id,
+            "depth": node.depth,
+            "status": "new",
+            "child_count": 0,
+        }
+        pages.append(page_info)
+
+        if node.depth >= rule.max_depth:
+            continue
+
+        try:
+            html = fetch_html(node.url, request_conf)
+            child_urls_all = extract_links(html, node.url)
+            child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+        except HTTPException:
+            page_info["status"] = "fetch_error"
+            continue
+
+        page_info["child_count"] = len(child_urls)
+
+        for child_url in child_urls:
+            if len(queue) >= rule.max_pages:
+                break
+
+            queue.append(
+                CrawlNode(
+                    url=child_url,
+                    parent_page_id=None,  # DB登録後に差し替える
+                    depth=node.depth + 1,
+                )
+            )
+
+    return pages
 
 
 @router.post("/public-url/register")
@@ -283,47 +447,68 @@ async def public_url_register(
 
     target_url = normalize_url(target_url)
 
-    # root
-    root_html = fetch_html(target_url, request_conf)
-    level1_urls_all = extract_links(root_html, target_url)
-
-    level1_urls: list[str] = []
-    seen_pages: set[str] = set()
-
-    for url in level1_urls_all:
-        if rule.same_domain_only and not same_domain(url, target_url):
-            continue
-        if url == target_url:
-            continue
-        if url not in seen_pages:
-            seen_pages.add(url)
-            level1_urls.append(url)
-
-    # level2
-    level2_urls: list[str] = []
-    for page_url in level1_urls:
-        try:
-            html = fetch_html(page_url, request_conf)
-            child_urls = extract_links(html, page_url)
-        except HTTPException:
-            continue
-
-        for child_url in child_urls:
-            if rule.same_domain_only and not same_domain(child_url, target_url):
-                continue
-            if child_url == target_url:
-                continue
-            if child_url not in seen_pages:
-                seen_pages.add(child_url)
-                level2_urls.append(child_url)
-
-    pages = level1_urls + level2_urls
-
     root_id = make_id()
     row_inserted = 0
     row_skipped = 0
+    result_pages: list[dict[str, Any]] = []
 
     try:
+        # 先にクロール
+        root_html = fetch_html(target_url, request_conf)
+        root_links_all = extract_links(root_html, target_url)
+
+        seen_urls: set[str] = set()
+        level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
+
+        crawl_nodes: list[CrawlNode] = [
+            CrawlNode(url=url, parent_page_id=None, depth=1)
+            for url in level1_urls
+        ]
+
+        page_results: list[dict[str, Any]] = []
+        idx = 0
+
+        while idx < len(crawl_nodes) and len(page_results) < rule.max_pages:
+            node = crawl_nodes[idx]
+            idx += 1
+
+            page_results.append(
+                {
+                    "page_id": None,
+                    "page_url": node.url,
+                    "parent_page_id": node.parent_page_id,
+                    "depth": node.depth,
+                    "status": "new",
+                    "child_count": 0,
+                    "created_at": now_iso(),
+                }
+            )
+
+            if node.depth >= rule.max_depth:
+                continue
+
+            try:
+                html = fetch_html(node.url, request_conf)
+                child_urls_all = extract_links(html, node.url)
+                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+            except HTTPException:
+                page_results[-1]["status"] = "fetch_error"
+                continue
+
+            page_results[-1]["child_count"] = len(child_urls)
+
+            for child_url in child_urls:
+                if len(page_results) + len(crawl_nodes) - idx >= rule.max_pages:
+                    break
+
+                crawl_nodes.append(
+                    CrawlNode(
+                        url=child_url,
+                        parent_page_id=node.url,  # 一時的に親URLを入れる
+                        depth=node.depth + 1,
+                    )
+                )
+
         with get_conn() as conn:
             ensure_url_tables(conn)
 
@@ -334,30 +519,38 @@ async def public_url_register(
                 root_url=target_url,
             )
 
-            result_pages: list[dict[str, Any]] = []
+            url_to_page_id: dict[str, str] = {}
 
-            for page_url in pages:
-                inserted = insert_url_page_if_not_exists(
+            for page in page_results:
+                parent_page_id = None
+                parent_url = page["parent_page_id"]
+                if isinstance(parent_url, str):
+                    parent_page_id = url_to_page_id.get(parent_url)
+
+                inserted, actual_page_id = insert_url_page_if_not_exists(
                     conn=conn,
                     page_id=make_id(),
                     root_id=root_id,
-                    page_url=page_url,
+                    parent_page_id=parent_page_id,
+                    page_url=page["page_url"],
+                    depth=page["depth"],
+                    status=page["status"],
+                    child_count=page["child_count"],
                 )
+
+                url_to_page_id[page["page_url"]] = actual_page_id
 
                 if inserted:
                     row_inserted += 1
-                    status = "new"
+                    page["status"] = "new" if page["status"] == "new" else page["status"]
                 else:
                     row_skipped += 1
-                    status = "duplicate"
+                    if page["status"] == "new":
+                        page["status"] = "duplicate"
 
-                result_pages.append(
-                    {
-                        "page_url": page_url,
-                        "status": status,
-                        "created_at": now_iso(),
-                    }
-                )
+                page["page_id"] = actual_page_id
+                page["parent_page_id"] = parent_page_id
+                result_pages.append(page)
 
             conn.commit()
 
@@ -371,7 +564,9 @@ async def public_url_register(
         "source_key": req.source_key,
         "root_url": target_url,
         "root_id": root_id,
-        "page_count": len(pages),
+        "max_depth": rule.max_depth,
+        "max_pages": rule.max_pages,
+        "page_count": len(result_pages),
         "row_inserted": row_inserted,
         "row_skipped": row_skipped,
         "pages": result_pages,
