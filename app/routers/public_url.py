@@ -243,7 +243,7 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
     faq_keywords = ["faq", "q&a", "qanda", "よくある質問", "質問", "回答"]
     guide_keywords = ["手続き", "申請", "届出", "利用方法", "使い方", "必要書類", "準備", "案内", "方法"]
     notice_keywords = ["お知らせ", "新着", "更新情報", "障害", "報道発表", "発生について", "掲載", "公表"]
-    list_keywords = ["一覧", "カテゴリ", "メニュー", "index", "list"]
+    list_keywords = ["一覧", "カテゴリ", "index", "list", "ヘルプ", "help", "ガイド"]
 
     if any(k in lower_url for k in ["faq", "qanda", "guide", "help", "manual"]):
         score += 20
@@ -261,13 +261,11 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
         score -= 40
         reasons.append("title_notice")
 
-    if any(k in title for k in list_keywords):
-        score -= 25
-        reasons.append("title_list")
-
     qa_pattern_count = 0
-    for pat in [r"\bq\s*[:：]", r"\ba\s*[:：]", r"質問", r"回答"]:
-        qa_pattern_count += len(re.findall(pat, lower_text if "q" in pat or "a" in pat else text))
+    for pat in [r"\bq\s*[:：]", r"\ba\s*[:：]"]:
+        qa_pattern_count += len(re.findall(pat, lower_text))
+    qa_pattern_count += text.count("質問")
+    qa_pattern_count += text.count("回答")
 
     if qa_pattern_count >= 2:
         score += 35
@@ -287,8 +285,8 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
         score -= 25
         reasons.append("too_short")
 
-    if link_count >= 30 and text_length < 800:
-        score -= 25
+    if link_count >= 20 and text_length < 1200:
+        score -= 20
         reasons.append("link_heavy")
 
     if "pdf" in lower_text and text_length < 400:
@@ -297,14 +295,24 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
 
     page_type = "unknown"
 
-    if any(k in lower_title for k in faq_keywords) or qa_pattern_count >= 2:
+    # notice を優先
+    if any(k in title for k in notice_keywords):
+        page_type = "notice"
+    # 一覧 / メニュー / ヘルプ入口ページ
+    elif (
+        any(k in lower_title for k in ["一覧", "カテゴリ", "index", "list"])
+        or (link_count >= 10 and text_length < 1500)
+        or ("ヘルプ" in title and link_count >= 5)
+    ):
+        page_type = "list"
+    elif any(k in lower_title for k in faq_keywords) or qa_pattern_count >= 2:
         page_type = "faq"
     elif any(k in title for k in guide_keywords):
         page_type = "guide"
-    elif any(k in title for k in notice_keywords):
-        page_type = "notice"
-    elif any(k in title for k in list_keywords) or (link_count >= 30 and text_length < 800):
-        page_type = "list"
+
+    # list は高得点でも採用しない
+    if page_type == "list":
+        score = min(score, 60)
 
     score = max(0, min(100, score))
 
@@ -534,17 +542,16 @@ def build_page_results(
     seen_urls: set[str] = set()
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
 
-    queue: list[CrawlNode] = [
+    # 深さ優先にするため stack を使う
+    stack: list[CrawlNode] = [
         CrawlNode(url=url, parent_url=None, depth=1)
-        for url in level1_urls
+        for url in reversed(level1_urls)
     ]
 
     page_results: list[dict[str, Any]] = []
-    idx = 0
 
-    while idx < len(queue) and len(page_results) < rule.max_pages:
-        node = queue[idx]
-        idx += 1
+    while stack and len(page_results) < rule.max_pages:
+        node = stack.pop()
 
         page_info = {
             "page_id": None,
@@ -564,21 +571,11 @@ def build_page_results(
         try:
             html = fetch_html(node.url, request_conf)
             features = extract_page_features(html)
-            child_urls_all = extract_links(html, node.url)
 
-            child_urls = []
+            child_urls: list[str] = []
             if node.depth < rule.max_depth:
+                child_urls_all = extract_links(html, node.url)
                 child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
-                for child_url in child_urls:
-                    if len(queue) >= rule.max_pages:
-                        break
-                    queue.append(
-                        CrawlNode(
-                            url=child_url,
-                            parent_url=node.url,
-                            depth=node.depth + 1,
-                        )
-                    )
 
             page_info["child_count"] = len(child_urls)
 
@@ -593,6 +590,19 @@ def build_page_results(
             page_info["page_type"] = judged["page_type"]
             page_info["is_usable"] = judged["is_usable"]
             page_info["judge_reason"] = judged["judge_reason"]
+
+            # 深さ優先で子を積む
+            if node.depth < rule.max_depth:
+                for child_url in reversed(child_urls):
+                    if len(page_results) + len(stack) >= rule.max_pages:
+                        break
+                    stack.append(
+                        CrawlNode(
+                            url=child_url,
+                            parent_url=node.url,
+                            depth=node.depth + 1,
+                        )
+                    )
 
         except HTTPException:
             page_info["status"] = "fetch_error"
@@ -611,7 +621,6 @@ async def public_url_register(
     req: PublicUrlRequest,
     authorization: str | None = Header(default=None),
 ):
-    # authorization は現時点では未使用だが、既存APIとの整合のため残す
     _ = authorization
 
     config = load_source_config(req.source_key)
