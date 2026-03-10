@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,7 +48,7 @@ class CrawlRule:
 @dataclass
 class CrawlNode:
     url: str
-    parent_page_id: str | None
+    parent_url: str | None
     depth: int
 
 
@@ -70,7 +71,8 @@ def normalize_url(url: str) -> str:
     if path != "/" and path.endswith("/"):
         path = path[:-1]
 
-    return f"{scheme}://{netloc}{path}"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{scheme}://{netloc}{path}{query}"
 
 
 def same_domain(url1: str, url2: str) -> bool:
@@ -82,7 +84,8 @@ def is_html_like_url(url: str) -> bool:
     blocked_exts = (
         ".pdf", ".zip", ".xls", ".xlsx", ".csv", ".json",
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
-        ".doc", ".docx", ".ppt", ".pptx", ".xml"
+        ".doc", ".docx", ".ppt", ".pptx", ".xml",
+        ".mp3", ".mp4", ".avi", ".mov"
     )
     return not lower.endswith(blocked_exts)
 
@@ -165,11 +168,9 @@ def extract_links(html: str, base_url: str) -> list[str]:
             continue
         if href.startswith("#"):
             continue
-        if href.lower().startswith("javascript:"):
-            continue
-        if href.lower().startswith("mailto:"):
-            continue
-        if href.lower().startswith("tel:"):
+
+        lower = href.lower()
+        if lower.startswith(("javascript:", "mailto:", "tel:")):
             continue
 
         abs_url = urljoin(base_url, href)
@@ -206,6 +207,121 @@ def filter_child_urls(
     return result
 
 
+def extract_page_features(html: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    body = soup.body or soup
+    text = " ".join(body.stripped_strings)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    link_count = len(body.find_all("a", href=True))
+    text_length = len(text)
+
+    return {
+        "title": title,
+        "text": text,
+        "text_length": text_length,
+        "link_count": link_count,
+    }
+
+
+def judge_page(url: str, title: str, text: str, text_length: int, link_count: int) -> dict[str, Any]:
+    score = 0
+    reasons: list[str] = []
+
+    lower_url = url.lower()
+    lower_title = title.lower()
+    lower_text = text.lower()
+
+    faq_keywords = ["faq", "q&a", "qanda", "よくある質問", "質問", "回答"]
+    guide_keywords = ["手続き", "申請", "届出", "利用方法", "使い方", "必要書類", "準備", "案内", "方法"]
+    notice_keywords = ["お知らせ", "新着", "更新情報", "障害", "報道発表", "発生について", "掲載", "公表"]
+    list_keywords = ["一覧", "カテゴリ", "メニュー", "index", "list"]
+
+    if any(k in lower_url for k in ["faq", "qanda", "guide", "help", "manual"]):
+        score += 20
+        reasons.append("url_keyword")
+
+    if any(k in lower_title for k in faq_keywords):
+        score += 40
+        reasons.append("title_faq")
+
+    if any(k in title for k in guide_keywords):
+        score += 30
+        reasons.append("title_guide")
+
+    if any(k in title for k in notice_keywords):
+        score -= 40
+        reasons.append("title_notice")
+
+    if any(k in title for k in list_keywords):
+        score -= 25
+        reasons.append("title_list")
+
+    qa_pattern_count = 0
+    for pat in [r"\bq\s*[:：]", r"\ba\s*[:：]", r"質問", r"回答"]:
+        qa_pattern_count += len(re.findall(pat, lower_text if "q" in pat or "a" in pat else text))
+
+    if qa_pattern_count >= 2:
+        score += 35
+        reasons.append("qa_pattern")
+
+    if any(k in text for k in guide_keywords):
+        score += 20
+        reasons.append("body_guide")
+
+    if text_length >= 1200:
+        score += 20
+        reasons.append("long_text")
+    elif text_length >= 500:
+        score += 10
+        reasons.append("enough_text")
+    elif text_length < 200:
+        score -= 25
+        reasons.append("too_short")
+
+    if link_count >= 30 and text_length < 800:
+        score -= 25
+        reasons.append("link_heavy")
+
+    if "pdf" in lower_text and text_length < 400:
+        score -= 15
+        reasons.append("pdf_only_like")
+
+    page_type = "unknown"
+
+    if any(k in lower_title for k in faq_keywords) or qa_pattern_count >= 2:
+        page_type = "faq"
+    elif any(k in title for k in guide_keywords):
+        page_type = "guide"
+    elif any(k in title for k in notice_keywords):
+        page_type = "notice"
+    elif any(k in title for k in list_keywords) or (link_count >= 30 and text_length < 800):
+        page_type = "list"
+
+    score = max(0, min(100, score))
+
+    is_usable = 0
+    if page_type in ("faq", "guide") and score >= 40:
+        is_usable = 1
+    elif page_type == "unknown" and score >= 60 and text_length >= 500:
+        is_usable = 1
+
+    return {
+        "score": score,
+        "page_type": page_type,
+        "is_usable": is_usable,
+        "judge_reason": ",".join(reasons) if reasons else "no_rule_match",
+    }
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -240,6 +356,10 @@ def ensure_url_tables(conn: sqlite3.Connection) -> None:
           depth INTEGER NOT NULL,
           status TEXT NOT NULL,
           child_count INTEGER NOT NULL DEFAULT 0,
+          score INTEGER NOT NULL DEFAULT 0,
+          page_type TEXT NOT NULL DEFAULT 'unknown',
+          is_usable INTEGER NOT NULL DEFAULT 0,
+          judge_reason TEXT,
           created_at TEXT NOT NULL
         )
         """
@@ -305,39 +425,68 @@ def insert_url_root_if_not_exists(
     return root_id
 
 
-def find_page_id(
+def find_page_row(
     conn: sqlite3.Connection,
     root_id: str,
     page_url: str,
-) -> str | None:
+) -> sqlite3.Row | None:
     cur = conn.execute(
         """
-        SELECT page_id
+        SELECT *
         FROM url_pages
         WHERE root_id = ? AND page_url = ?
         """,
         (root_id, page_url),
     )
-    row = cur.fetchone()
-    return row["page_id"] if row else None
+    return cur.fetchone()
 
 
-def insert_url_page_if_not_exists(
+def upsert_url_page(
     conn: sqlite3.Connection,
-    page_id: str,
     root_id: str,
     parent_page_id: str | None,
     page_url: str,
     depth: int,
-    status: str = "new",
-    child_count: int = 0,
+    status: str,
+    child_count: int,
+    score: int,
+    page_type: str,
+    is_usable: int,
+    judge_reason: str | None,
 ) -> tuple[bool, str]:
     now = now_iso()
+    existing = find_page_row(conn, root_id, page_url)
 
-    existing_page_id = find_page_id(conn, root_id, page_url)
-    if existing_page_id:
-        return False, existing_page_id
+    if existing:
+        page_id = existing["page_id"]
+        conn.execute(
+            """
+            UPDATE url_pages
+               SET parent_page_id = ?,
+                   depth = ?,
+                   status = ?,
+                   child_count = ?,
+                   score = ?,
+                   page_type = ?,
+                   is_usable = ?,
+                   judge_reason = ?
+             WHERE page_id = ?
+            """,
+            (
+                parent_page_id,
+                depth,
+                "duplicate" if status == "new" else status,
+                child_count,
+                score,
+                page_type,
+                is_usable,
+                judge_reason,
+                page_id,
+            ),
+        )
+        return False, page_id
 
+    page_id = make_id()
     conn.execute(
         """
         INSERT INTO url_pages (
@@ -348,31 +497,33 @@ def insert_url_page_if_not_exists(
             depth,
             status,
             child_count,
+            score,
+            page_type,
+            is_usable,
+            judge_reason,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (page_id, root_id, parent_page_id, page_url, depth, status, child_count, now),
+        (
+            page_id,
+            root_id,
+            parent_page_id,
+            page_url,
+            depth,
+            status,
+            child_count,
+            score,
+            page_type,
+            is_usable,
+            judge_reason,
+            now,
+        ),
     )
     return True, page_id
 
 
-def update_page_child_count(
-    conn: sqlite3.Connection,
-    page_id: str,
-    child_count: int,
-) -> None:
-    conn.execute(
-        """
-        UPDATE url_pages
-        SET child_count = ?, status = ?
-        WHERE page_id = ?
-        """,
-        (child_count, "expanded", page_id),
-    )
-
-
-def crawl_tree(
+def build_page_results(
     target_url: str,
     request_conf: dict[str, Any],
     rule: CrawlRule,
@@ -381,56 +532,78 @@ def crawl_tree(
     root_links_all = extract_links(root_html, target_url)
 
     seen_urls: set[str] = set()
-    pages: list[dict[str, Any]] = []
-
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
 
     queue: list[CrawlNode] = [
-        CrawlNode(url=url, parent_page_id=None, depth=1)
+        CrawlNode(url=url, parent_url=None, depth=1)
         for url in level1_urls
     ]
 
+    page_results: list[dict[str, Any]] = []
     idx = 0
-    while idx < len(queue) and len(pages) < rule.max_pages:
+
+    while idx < len(queue) and len(page_results) < rule.max_pages:
         node = queue[idx]
         idx += 1
 
         page_info = {
+            "page_id": None,
             "page_url": node.url,
-            "parent_page_url": None,
-            "parent_page_id": node.parent_page_id,
+            "parent_url": node.parent_url,
+            "parent_page_id": None,
             "depth": node.depth,
             "status": "new",
             "child_count": 0,
+            "score": 0,
+            "page_type": "unknown",
+            "is_usable": 0,
+            "judge_reason": None,
+            "created_at": now_iso(),
         }
-        pages.append(page_info)
-
-        if node.depth >= rule.max_depth:
-            continue
 
         try:
             html = fetch_html(node.url, request_conf)
+            features = extract_page_features(html)
             child_urls_all = extract_links(html, node.url)
-            child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+
+            child_urls = []
+            if node.depth < rule.max_depth:
+                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+                for child_url in child_urls:
+                    if len(queue) >= rule.max_pages:
+                        break
+                    queue.append(
+                        CrawlNode(
+                            url=child_url,
+                            parent_url=node.url,
+                            depth=node.depth + 1,
+                        )
+                    )
+
+            page_info["child_count"] = len(child_urls)
+
+            judged = judge_page(
+                url=node.url,
+                title=features["title"],
+                text=features["text"],
+                text_length=features["text_length"],
+                link_count=features["link_count"],
+            )
+            page_info["score"] = judged["score"]
+            page_info["page_type"] = judged["page_type"]
+            page_info["is_usable"] = judged["is_usable"]
+            page_info["judge_reason"] = judged["judge_reason"]
+
         except HTTPException:
             page_info["status"] = "fetch_error"
-            continue
+            page_info["score"] = 0
+            page_info["page_type"] = "unknown"
+            page_info["is_usable"] = 0
+            page_info["judge_reason"] = "fetch_error"
 
-        page_info["child_count"] = len(child_urls)
+        page_results.append(page_info)
 
-        for child_url in child_urls:
-            if len(queue) >= rule.max_pages:
-                break
-
-            queue.append(
-                CrawlNode(
-                    url=child_url,
-                    parent_page_id=None,  # DB登録後に差し替える
-                    depth=node.depth + 1,
-                )
-            )
-
-    return pages
+    return page_results
 
 
 @router.post("/public-url/register")
@@ -438,6 +611,9 @@ async def public_url_register(
     req: PublicUrlRequest,
     authorization: str | None = Header(default=None),
 ):
+    # authorization は現時点では未使用だが、既存APIとの整合のため残す
+    _ = authorization
+
     config = load_source_config(req.source_key)
     request_conf, rule = load_crawl_rule(config)
 
@@ -453,61 +629,11 @@ async def public_url_register(
     result_pages: list[dict[str, Any]] = []
 
     try:
-        # 先にクロール
-        root_html = fetch_html(target_url, request_conf)
-        root_links_all = extract_links(root_html, target_url)
-
-        seen_urls: set[str] = set()
-        level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
-
-        crawl_nodes: list[CrawlNode] = [
-            CrawlNode(url=url, parent_page_id=None, depth=1)
-            for url in level1_urls
-        ]
-
-        page_results: list[dict[str, Any]] = []
-        idx = 0
-
-        while idx < len(crawl_nodes) and len(page_results) < rule.max_pages:
-            node = crawl_nodes[idx]
-            idx += 1
-
-            page_results.append(
-                {
-                    "page_id": None,
-                    "page_url": node.url,
-                    "parent_page_id": node.parent_page_id,
-                    "depth": node.depth,
-                    "status": "new",
-                    "child_count": 0,
-                    "created_at": now_iso(),
-                }
-            )
-
-            if node.depth >= rule.max_depth:
-                continue
-
-            try:
-                html = fetch_html(node.url, request_conf)
-                child_urls_all = extract_links(html, node.url)
-                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
-            except HTTPException:
-                page_results[-1]["status"] = "fetch_error"
-                continue
-
-            page_results[-1]["child_count"] = len(child_urls)
-
-            for child_url in child_urls:
-                if len(page_results) + len(crawl_nodes) - idx >= rule.max_pages:
-                    break
-
-                crawl_nodes.append(
-                    CrawlNode(
-                        url=child_url,
-                        parent_page_id=node.url,  # 一時的に親URLを入れる
-                        depth=node.depth + 1,
-                    )
-                )
+        page_results = build_page_results(
+            target_url=target_url,
+            request_conf=request_conf,
+            rule=rule,
+        )
 
         with get_conn() as conn:
             ensure_url_tables(conn)
@@ -523,26 +649,27 @@ async def public_url_register(
 
             for page in page_results:
                 parent_page_id = None
-                parent_url = page["parent_page_id"]
-                if isinstance(parent_url, str):
-                    parent_page_id = url_to_page_id.get(parent_url)
+                if page["parent_url"]:
+                    parent_page_id = url_to_page_id.get(page["parent_url"])
 
-                inserted, actual_page_id = insert_url_page_if_not_exists(
+                inserted, actual_page_id = upsert_url_page(
                     conn=conn,
-                    page_id=make_id(),
                     root_id=root_id,
                     parent_page_id=parent_page_id,
                     page_url=page["page_url"],
                     depth=page["depth"],
                     status=page["status"],
                     child_count=page["child_count"],
+                    score=page["score"],
+                    page_type=page["page_type"],
+                    is_usable=page["is_usable"],
+                    judge_reason=page["judge_reason"],
                 )
 
                 url_to_page_id[page["page_url"]] = actual_page_id
 
                 if inserted:
                     row_inserted += 1
-                    page["status"] = "new" if page["status"] == "new" else page["status"]
                 else:
                     row_skipped += 1
                     if page["status"] == "new":
@@ -558,6 +685,9 @@ async def public_url_register(
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    for page in result_pages:
+        page.pop("parent_url", None)
 
     return {
         "mode": "public_url_register",
