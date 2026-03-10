@@ -37,6 +37,10 @@ class PublicUrlRequest(BaseModel):
     source_key: str = Field(..., min_length=1)
 
 
+class PublicUrlDecomposeRequest(BaseModel):
+    page_url: str = Field(..., min_length=1)
+
+
 @dataclass
 class CrawlRule:
     same_domain_only: bool
@@ -243,7 +247,6 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
     faq_keywords = ["faq", "q&a", "qanda", "よくある質問", "質問", "回答"]
     guide_keywords = ["手続き", "申請", "届出", "利用方法", "使い方", "必要書類", "準備", "案内", "方法"]
     notice_keywords = ["お知らせ", "新着", "更新情報", "障害", "報道発表", "発生について", "掲載", "公表"]
-    list_keywords = ["一覧", "カテゴリ", "index", "list", "ヘルプ", "help", "ガイド"]
 
     if any(k in lower_url for k in ["faq", "qanda", "guide", "help", "manual"]):
         score += 20
@@ -295,10 +298,8 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
 
     page_type = "unknown"
 
-    # notice を優先
     if any(k in title for k in notice_keywords):
         page_type = "notice"
-    # 一覧 / メニュー / ヘルプ入口ページ
     elif (
         any(k in lower_title for k in ["一覧", "カテゴリ", "index", "list"])
         or (link_count >= 10 and text_length < 1500)
@@ -310,7 +311,6 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
     elif any(k in title for k in guide_keywords):
         page_type = "guide"
 
-    # list は高得点でも採用しない
     if page_type == "list":
         score = min(score, 60)
 
@@ -394,6 +394,47 @@ def ensure_url_tables(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS ix_url_pages_root_depth
         ON url_pages(root_id, depth)
+        """
+    )
+
+
+def ensure_row_data_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS row_data (
+            row_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_key TEXT,
+            source_item_id TEXT,
+            row_index INTEGER,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_row_data_file_id
+        ON row_data(file_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_row_data_source_type
+        ON row_data(source_type)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_row_data_source_key
+        ON row_data(source_key)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_row_data_file_row
+        ON row_data(file_id, row_index)
         """
     )
 
@@ -542,7 +583,6 @@ def build_page_results(
     seen_urls: set[str] = set()
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
 
-    # 深さ優先にするため stack を使う
     stack: list[CrawlNode] = [
         CrawlNode(url=url, parent_url=None, depth=1)
         for url in reversed(level1_urls)
@@ -591,7 +631,6 @@ def build_page_results(
             page_info["is_usable"] = judged["is_usable"]
             page_info["judge_reason"] = judged["judge_reason"]
 
-            # 深さ優先で子を積む
             if node.depth < rule.max_depth:
                 for child_url in reversed(child_urls):
                     if len(page_results) + len(stack) >= rule.max_pages:
@@ -614,6 +653,170 @@ def build_page_results(
         page_results.append(page_info)
 
     return page_results
+
+
+def extract_main_content_blocks(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    main = (
+        soup.find("main")
+        or soup.find("article")
+        or soup.find(id=re.compile("main|content|contents", re.I))
+        or soup.find(class_=re.compile("main|content|contents", re.I))
+        or soup.body
+        or soup
+    )
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+
+    for tag in main.find_all(["h1", "h2", "h3", "h4", "p", "li", "dt", "dd", "th", "td"]):
+        text = " ".join(tag.stripped_strings)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            continue
+        if len(text) < 8:
+            continue
+        if text in seen:
+            continue
+
+        seen.add(text)
+        blocks.append(text)
+
+    if blocks:
+        return blocks
+
+    fallback_text = main.get_text("\n", strip=True)
+    lines = [re.sub(r"\s+", " ", x).strip() for x in fallback_text.splitlines()]
+    lines = [x for x in lines if len(x) >= 8]
+
+    merged: list[str] = []
+    buffer = ""
+
+    for line in lines:
+        if not buffer:
+            buffer = line
+            continue
+
+        if len(buffer) + 1 + len(line) <= 400:
+            buffer += " " + line
+        else:
+            merged.append(buffer)
+            buffer = line
+
+    if buffer:
+        merged.append(buffer)
+
+    return merged
+
+
+def merge_blocks_for_row_data(blocks: list[str], min_len: int = 80, max_len: int = 500) -> list[str]:
+    rows: list[str] = []
+    buffer = ""
+
+    for block in blocks:
+        block = re.sub(r"\s+", " ", block).strip()
+        if not block:
+            continue
+
+        if not buffer:
+            buffer = block
+            continue
+
+        if len(buffer) < min_len and len(buffer) + 1 + len(block) <= max_len:
+            buffer += " " + block
+            continue
+
+        if len(buffer) + 1 + len(block) <= max_len:
+            buffer += " " + block
+            continue
+
+        rows.append(buffer)
+        buffer = block
+
+    if buffer:
+        rows.append(buffer)
+
+    cleaned = [x.strip() for x in rows if x and len(x.strip()) >= 20]
+    return cleaned
+
+
+def find_page_with_root(conn: sqlite3.Connection, page_url: str) -> sqlite3.Row | None:
+    cur = conn.execute(
+        """
+        SELECT
+            p.page_id,
+            p.root_id,
+            p.page_url,
+            p.depth,
+            p.status,
+            p.page_type,
+            p.is_usable,
+            r.source_type AS source_key,
+            r.root_url
+        FROM url_pages p
+        JOIN url_roots r
+          ON p.root_id = r.root_id
+        WHERE p.page_url = ?
+        ORDER BY p.created_at DESC
+        LIMIT 1
+        """,
+        (page_url,),
+    )
+    return cur.fetchone()
+
+
+def replace_row_data_for_public_url(
+    conn: sqlite3.Connection,
+    file_id: str,
+    source_key: str,
+    source_item_id: str,
+    contents: list[str],
+) -> tuple[int, int]:
+    conn.execute(
+        """
+        DELETE FROM row_data
+        WHERE file_id = ?
+          AND source_type = 'public_url'
+        """,
+        (file_id,),
+    )
+
+    inserted = 0
+
+    for idx, content in enumerate(contents, start=1):
+        conn.execute(
+            """
+            INSERT INTO row_data (
+                row_id,
+                file_id,
+                source_type,
+                source_key,
+                source_item_id,
+                row_index,
+                content,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                make_id(),
+                file_id,
+                "public_url",
+                source_key,
+                source_item_id,
+                idx,
+                content,
+                now_iso(),
+            ),
+        )
+        inserted += 1
+
+    return inserted, 0
 
 
 @router.post("/public-url/register")
@@ -711,3 +914,70 @@ async def public_url_register(
         "pages": result_pages,
         "message": f"{req.source_key} public url registered",
     }
+
+
+@router.post("/public-url/decompose")
+async def public_url_decompose(
+    req: PublicUrlDecomposeRequest,
+    authorization: str | None = Header(default=None),
+):
+    _ = authorization
+
+    page_url = normalize_url(req.page_url)
+
+    try:
+        with get_conn() as conn:
+            ensure_url_tables(conn)
+            ensure_row_data_table(conn)
+
+            page_row = find_page_with_root(conn, page_url)
+            if not page_row:
+                raise HTTPException(status_code=404, detail="page not found")
+
+            source_key = page_row["source_key"]
+            config = load_source_config(source_key)
+            request_conf, _ = load_crawl_rule(config)
+
+            html = fetch_html(page_url, request_conf)
+            raw_blocks = extract_main_content_blocks(html)
+            contents = merge_blocks_for_row_data(raw_blocks)
+
+            if not contents:
+                raise HTTPException(status_code=400, detail="no content extracted")
+
+            row_count, _ = replace_row_data_for_public_url(
+                conn=conn,
+                file_id=page_row["page_id"],
+                source_key=source_key,
+                source_item_id=page_url,
+                contents=contents,
+            )
+
+            conn.execute(
+                """
+                UPDATE url_pages
+                   SET status = 'done'
+                 WHERE page_id = ?
+                """,
+                (page_row["page_id"],),
+            )
+
+            conn.commit()
+
+        return {
+            "mode": "public_url_decompose",
+            "page_url": page_url,
+            "file_id": page_row["page_id"],
+            "source_key": source_key,
+            "row_count": row_count,
+            "qa_count": 0,
+            "text_count": row_count,
+            "message": "public url decomposed into row_data",
+        }
+
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
