@@ -5,9 +5,10 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,16 +16,17 @@ from fastapi import APIRouter, Header, HTTPException
 from google.cloud import storage
 from pydantic import BaseModel, Field
 
-try:
-    import ulid
-except ImportError:
-    ulid = None
+import firebase_admin
+from firebase_admin import auth as fb_auth
+
+import ulid
 
 
-router = APIRouter(tags=["public_url"])
+router = APIRouter(prefix="/public-url", tags=["public_url"])
 
-DB_PATH = "ank.db"
-BUCKET_NAME = os.getenv("BUCKET_NAME", "ank-bucket")
+JST = ZoneInfo("Asia/Tokyo")
+
+BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 TEMPLATE_PREFIX = os.getenv("TEMPLATE_PREFIX", "template")
 
 SOURCE_FILE_MAP = {
@@ -56,18 +58,47 @@ class CrawlNode:
     depth: int
 
 
+def user_db_path(uid: str) -> str:
+    return f"users/{uid}/ank.db"
+
+
+def ensure_firebase_initialized():
+    if firebase_admin._apps:
+        return
+    firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
+
+
+def get_uid_from_auth_header(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    ensure_firebase_initialized()
+    try:
+        decoded = fb_auth.verify_id_token(token)
+        uid = decoded.get("uid")
+        if not uid:
+            raise HTTPException(status_code=401, detail="uid not found in token")
+        return uid
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
+
+
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(tz=JST).isoformat()
 
 
 def make_id() -> str:
-    if ulid is not None:
-        return str(ulid.new())
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    return str(ulid.new())
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    parsed = urlparse((url or "").strip())
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
 
@@ -84,7 +115,7 @@ def same_domain(url1: str, url2: str) -> bool:
 
 
 def is_html_like_url(url: str) -> bool:
-    lower = url.lower()
+    lower = (url or "").lower()
     blocked_exts = (
         ".pdf", ".zip", ".xls", ".xlsx", ".csv", ".json",
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
@@ -158,7 +189,7 @@ def fetch_html(url: str, request_conf: dict[str, Any]) -> str:
         res.encoding = res.apparent_encoding or res.encoding
         return res.text
     except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"public url fetch error: {e}")
+        raise HTTPException(status_code=502, detail=f"public url fetch error: {e}")
 
 
 def extract_links(html: str, base_url: str) -> list[str]:
@@ -330,12 +361,6 @@ def judge_page(url: str, title: str, text: str, text_length: int, link_count: in
     }
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def ensure_url_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -398,45 +423,20 @@ def ensure_url_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def ensure_row_data_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
+def find_page_row(
+    conn: sqlite3.Connection,
+    root_id: str,
+    page_url: str,
+) -> sqlite3.Row | None:
+    cur = conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS row_data (
-            row_id TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_key TEXT,
-            source_item_id TEXT,
-            row_index INTEGER,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
+        SELECT *
+        FROM url_pages
+        WHERE root_id = ? AND page_url = ?
+        """,
+        (root_id, page_url),
     )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_row_data_file_id
-        ON row_data(file_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_row_data_source_type
-        ON row_data(source_type)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_row_data_source_key
-        ON row_data(source_key)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_row_data_file_row
-        ON row_data(file_id, row_index)
-        """
-    )
+    return cur.fetchone()
 
 
 def insert_url_root_if_not_exists(
@@ -474,22 +474,6 @@ def insert_url_root_if_not_exists(
     return root_id
 
 
-def find_page_row(
-    conn: sqlite3.Connection,
-    root_id: str,
-    page_url: str,
-) -> sqlite3.Row | None:
-    cur = conn.execute(
-        """
-        SELECT *
-        FROM url_pages
-        WHERE root_id = ? AND page_url = ?
-        """,
-        (root_id, page_url),
-    )
-    return cur.fetchone()
-
-
 def upsert_url_page(
     conn: sqlite3.Connection,
     root_id: str,
@@ -502,12 +486,21 @@ def upsert_url_page(
     page_type: str,
     is_usable: int,
     judge_reason: str | None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     now = now_iso()
     existing = find_page_row(conn, root_id, page_url)
 
     if existing:
         page_id = existing["page_id"]
+
+        current_status = str(existing["status"] or "new")
+        if current_status == "done":
+            next_status = "done"
+        elif status == "fetch_error":
+            next_status = "fetch_error"
+        else:
+            next_status = "new"
+
         conn.execute(
             """
             UPDATE url_pages
@@ -524,7 +517,7 @@ def upsert_url_page(
             (
                 parent_page_id,
                 depth,
-                "duplicate" if status == "new" else status,
+                next_status,
                 child_count,
                 score,
                 page_type,
@@ -533,7 +526,7 @@ def upsert_url_page(
                 page_id,
             ),
         )
-        return False, page_id
+        return False, page_id, next_status
 
     page_id = make_id()
     conn.execute(
@@ -569,7 +562,7 @@ def upsert_url_page(
             now,
         ),
     )
-    return True, page_id
+    return True, page_id, status
 
 
 def build_page_results(
@@ -694,24 +687,7 @@ def extract_main_content_blocks(html: str) -> list[str]:
     lines = [re.sub(r"\s+", " ", x).strip() for x in fallback_text.splitlines()]
     lines = [x for x in lines if len(x) >= 8]
 
-    merged: list[str] = []
-    buffer = ""
-
-    for line in lines:
-        if not buffer:
-            buffer = line
-            continue
-
-        if len(buffer) + 1 + len(line) <= 400:
-            buffer += " " + line
-        else:
-            merged.append(buffer)
-            buffer = line
-
-    if buffer:
-        merged.append(buffer)
-
-    return merged
+    return lines
 
 
 def merge_blocks_for_row_data(blocks: list[str], min_len: int = 80, max_len: int = 500) -> list[str]:
@@ -727,16 +703,16 @@ def merge_blocks_for_row_data(blocks: list[str], min_len: int = 80, max_len: int
             buffer = block
             continue
 
-        if len(buffer) < min_len and len(buffer) + 1 + len(block) <= max_len:
-            buffer += " " + block
-            continue
-
         if len(buffer) + 1 + len(block) <= max_len:
             buffer += " " + block
             continue
 
-        rows.append(buffer)
-        buffer = block
+        if len(buffer) >= min_len:
+            rows.append(buffer)
+            buffer = block
+        else:
+            rows.append(buffer)
+            buffer = block
 
     if buffer:
         rows.append(buffer)
@@ -787,20 +763,14 @@ def replace_row_data_for_public_url(
     )
 
     inserted = 0
+    skipped = 0
+    created_at = now_iso()
 
     for idx, content in enumerate(contents, start=1):
         conn.execute(
             """
-            INSERT INTO row_data (
-                row_id,
-                file_id,
-                source_type,
-                source_key,
-                source_item_id,
-                row_index,
-                content,
-                created_at
-            )
+            INSERT INTO row_data
+              (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -811,20 +781,20 @@ def replace_row_data_for_public_url(
                 source_item_id,
                 idx,
                 content,
-                now_iso(),
+                created_at,
             ),
         )
         inserted += 1
 
-    return inserted, 0
+    return inserted, skipped
 
 
-@router.post("/public-url/register")
+@router.post("/register")
 async def public_url_register(
     req: PublicUrlRequest,
     authorization: str | None = Header(default=None),
 ):
-    _ = authorization
+    uid = get_uid_from_auth_header(authorization)
 
     config = load_source_config(req.source_key)
     request_conf, rule = load_crawl_rule(config)
@@ -834,6 +804,20 @@ async def public_url_register(
         raise HTTPException(status_code=400, detail="request.url is required in template json")
 
     target_url = normalize_url(target_url)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_public_url.db"
+    db_blob.download_to_filename(local_db_path)
 
     root_id = make_id()
     row_inserted = 0
@@ -847,7 +831,9 @@ async def public_url_register(
             rule=rule,
         )
 
-        with get_conn() as conn:
+        conn = sqlite3.connect(local_db_path)
+        conn.row_factory = sqlite3.Row
+        try:
             ensure_url_tables(conn)
 
             root_id = insert_url_root_if_not_exists(
@@ -864,7 +850,7 @@ async def public_url_register(
                 if page["parent_url"]:
                     parent_page_id = url_to_page_id.get(page["parent_url"])
 
-                inserted, actual_page_id = upsert_url_page(
+                inserted, actual_page_id, actual_status = upsert_url_page(
                     conn=conn,
                     root_id=root_id,
                     parent_page_id=parent_page_id,
@@ -884,14 +870,17 @@ async def public_url_register(
                     row_inserted += 1
                 else:
                     row_skipped += 1
-                    if page["status"] == "new":
-                        page["status"] = "duplicate"
 
                 page["page_id"] = actual_page_id
                 page["parent_page_id"] = parent_page_id
+                page["status"] = actual_status
                 result_pages.append(page)
 
             conn.commit()
+        finally:
+            conn.close()
+
+        db_blob.upload_from_filename(local_db_path)
 
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
@@ -916,25 +905,39 @@ async def public_url_register(
     }
 
 
-@router.post("/public-url/decompose")
+@router.post("/decompose")
 async def public_url_decompose(
     req: PublicUrlDecomposeRequest,
     authorization: str | None = Header(default=None),
 ):
-    _ = authorization
-
+    uid = get_uid_from_auth_header(authorization)
     page_url = normalize_url(req.page_url)
 
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_public_url.db"
+    db_blob.download_to_filename(local_db_path)
+
     try:
-        with get_conn() as conn:
+        conn = sqlite3.connect(local_db_path)
+        conn.row_factory = sqlite3.Row
+        try:
             ensure_url_tables(conn)
-            ensure_row_data_table(conn)
 
             page_row = find_page_with_root(conn, page_url)
             if not page_row:
                 raise HTTPException(status_code=404, detail="page not found")
 
-            source_key = page_row["source_key"]
+            source_key = str(page_row["source_key"])
             config = load_source_config(source_key)
             request_conf, _ = load_crawl_rule(config)
 
@@ -945,9 +948,9 @@ async def public_url_decompose(
             if not contents:
                 raise HTTPException(status_code=400, detail="no content extracted")
 
-            row_count, _ = replace_row_data_for_public_url(
+            row_count, skipped_count = replace_row_data_for_public_url(
                 conn=conn,
-                file_id=page_row["page_id"],
+                file_id=str(page_row["page_id"]),
                 source_key=source_key,
                 source_item_id=page_url,
                 contents=contents,
@@ -959,19 +962,24 @@ async def public_url_decompose(
                    SET status = 'done'
                  WHERE page_id = ?
                 """,
-                (page_row["page_id"],),
+                (str(page_row["page_id"]),),
             )
 
             conn.commit()
+        finally:
+            conn.close()
+
+        db_blob.upload_from_filename(local_db_path)
 
         return {
             "mode": "public_url_decompose",
             "page_url": page_url,
-            "file_id": page_row["page_id"],
+            "file_id": str(page_row["page_id"]),
             "source_key": source_key,
             "row_count": row_count,
             "qa_count": 0,
             "text_count": row_count,
+            "skipped_count": skipped_count,
             "message": "public url decomposed into row_data",
         }
 
