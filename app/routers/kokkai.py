@@ -524,9 +524,6 @@ def kokkai_fetch_and_register(
 def kokkai_documents(
     authorization: str | None = Header(default=None),
 ):
-    """
-    kokkai_documents の親一覧を返す
-    """
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
@@ -534,6 +531,7 @@ def kokkai_documents(
 
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
+
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
@@ -545,25 +543,39 @@ def kokkai_documents(
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
+
     try:
         ensure_kokkai_documents_table(conn)
 
         cur = conn.execute(
             """
             SELECT
-              source_id,
-              status,
-              logical_name,
-              source_key,
-              name_of_house,
-              name_of_meeting,
-              row_count,
-              source_url,
-              created_at
-            FROM kokkai_documents
-            ORDER BY created_at DESC, name_of_house, name_of_meeting
+              d.source_id,
+              d.status,
+              d.logical_name,
+              d.source_key,
+              d.name_of_house,
+              d.name_of_meeting,
+              COUNT(r.row_id) AS row_count,
+              d.source_url,
+              d.created_at
+            FROM kokkai_documents d
+            LEFT JOIN row_data r
+              ON r.file_id = d.source_id
+             AND r.source_type = 'kokkai'
+            GROUP BY
+              d.source_id,
+              d.status,
+              d.logical_name,
+              d.source_key,
+              d.name_of_house,
+              d.name_of_meeting,
+              d.source_url,
+              d.created_at
+            ORDER BY d.created_at DESC
             """
         )
+
         rows = [dict(r) for r in cur.fetchall()]
 
     finally:
@@ -571,7 +583,7 @@ def kokkai_documents(
 
     return {
         "rows": rows,
-        "count": len(rows),
+        "count": len(rows)
     }
 
 @router.get("/rows")
