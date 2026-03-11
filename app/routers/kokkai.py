@@ -70,6 +70,14 @@ def load_kokkai_template() -> dict:
         raise HTTPException(status_code=500, detail=f"invalid template json: {e}")
 
 
+def now_iso() -> str:
+    return datetime.now(tz=JST).isoformat()
+
+
+def make_id() -> str:
+    return str(ulid.new())
+
+
 def _is_speech(url: str) -> bool:
     return "/api/speech" in (url or "").lower()
 
@@ -163,33 +171,223 @@ def fetch_records_from_template() -> Tuple[str, str, List[Dict[str, Any]]]:
 
 
 def speech_id_of(r: Dict[str, Any]) -> str:
-    return str(r.get("speechID") or r.get("speechId") or r.get("speech_id") or "")
+    return str(r.get("speechID") or r.get("speechId") or r.get("speech_id") or "").strip()
 
 
 def row_source_item_id_of(r: Dict[str, Any]) -> str:
-    """
-    row_data 側の一意識別子
-    国会議事録は speechID を使う
-    """
     sid = speech_id_of(r)
-    if sid:
-        return sid
-    return ""
+    return sid or ""
 
 
-def build_source_key(records: List[Dict[str, Any]]) -> str:
-    """
-    row_data.source_key に入れる取得条件の簡易表現
-    """
-    if not records:
-        return "kokkai"
+def house_of(r: Dict[str, Any]) -> str:
+    return str(r.get("nameOfHouse") or "").strip()
 
-    first = records[0]
-    house = str(first.get("nameOfHouse") or "")
-    meeting = str(first.get("nameOfMeeting") or "")
 
-    parts = [p for p in [house, meeting] if p]
-    return " / ".join(parts) if parts else "kokkai"
+def meeting_of(r: Dict[str, Any]) -> str:
+    return str(r.get("nameOfMeeting") or "").strip()
+
+
+def logical_name_of(house: str, meeting: str) -> str:
+    parts = [x for x in [house, meeting] if x]
+    return " / ".join(parts) if parts else "国会議事録"
+
+
+def build_parent_source_key(house: str, meeting: str) -> str:
+    return json.dumps(
+        {
+            "nameOfHouse": house,
+            "nameOfMeeting": meeting,
+        },
+        ensure_ascii=False,
+    )
+
+
+def group_records_by_house_meeting(records: List[Dict[str, Any]]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+    for r in records:
+        house = house_of(r)
+        meeting = meeting_of(r)
+        if not house or not meeting:
+            continue
+
+        key = (house, meeting)
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(r)
+
+    return grouped
+
+
+def ensure_kokkai_documents_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kokkai_documents (
+          source_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          logical_name TEXT NOT NULL,
+          source_key TEXT,
+          name_of_house TEXT NOT NULL,
+          name_of_meeting TEXT NOT NULL,
+          row_count INTEGER,
+          source_url TEXT,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_kokkai_documents_house_meeting
+        ON kokkai_documents(name_of_house, name_of_meeting)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_kokkai_documents_status
+        ON kokkai_documents(status)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_kokkai_documents_created_at
+        ON kokkai_documents(created_at)
+        """
+    )
+
+
+def upsert_kokkai_document(
+    conn: sqlite3.Connection,
+    house: str,
+    meeting: str,
+    requested_url: str,
+    row_count: int,
+) -> str:
+    logical_name = logical_name_of(house, meeting)
+    source_key = build_parent_source_key(house, meeting)
+    created_at = now_iso()
+
+    cur = conn.execute(
+        """
+        SELECT source_id
+        FROM kokkai_documents
+        WHERE name_of_house = ?
+          AND name_of_meeting = ?
+        LIMIT 1
+        """,
+        (house, meeting),
+    )
+    row = cur.fetchone()
+
+    if row:
+        source_id = row[0]
+        conn.execute(
+            """
+            UPDATE kokkai_documents
+               SET status = ?,
+                   logical_name = ?,
+                   source_key = ?,
+                   row_count = ?,
+                   source_url = ?,
+                   created_at = ?
+             WHERE source_id = ?
+            """,
+            (
+                "new",
+                logical_name,
+                source_key,
+                row_count,
+                requested_url,
+                created_at,
+                source_id,
+            ),
+        )
+        return str(source_id)
+
+    source_id = make_id()
+    conn.execute(
+        """
+        INSERT INTO kokkai_documents (
+          source_id,
+          status,
+          logical_name,
+          source_key,
+          name_of_house,
+          name_of_meeting,
+          row_count,
+          source_url,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_id,
+            "new",
+            logical_name,
+            source_key,
+            house,
+            meeting,
+            row_count,
+            requested_url,
+            created_at,
+        ),
+    )
+    return source_id
+
+
+def replace_row_data_for_kokkai(
+    conn: sqlite3.Connection,
+    file_id: str,
+    source_key: str,
+    records: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    conn.execute(
+        """
+        DELETE FROM row_data
+        WHERE file_id = ?
+          AND source_type = 'kokkai'
+        """,
+        (file_id,),
+    )
+
+    inserted = 0
+    skipped = 0
+    created_at = now_iso()
+
+    row_index = 1
+    for r in records:
+        item_id = row_source_item_id_of(r)
+        if not item_id:
+            skipped += 1
+            continue
+
+        row_id = make_id()
+        content = json.dumps(r, ensure_ascii=False)
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO row_data
+              (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                file_id,
+                "kokkai",
+                source_key,
+                item_id,
+                row_index,
+                content,
+                created_at,
+            ),
+        )
+
+        if conn.execute("SELECT changes()").fetchone()[0] == 1:
+            inserted += 1
+            row_index += 1
+        else:
+            skipped += 1
+
+    return inserted, skipped
 
 
 @router.post("/fetch_and_register")
@@ -197,11 +395,9 @@ def kokkai_fetch_and_register(
     authorization: str | None = Header(default=None),
 ):
     """
-    取得テスト + row_data登録
-    - template/kokkai.json の条件で取得
-    - source_documents は使わない
-    - row_data のみ登録
-    - source_item_id には speechID を入れる
+    template/kokkai.json の条件で speechRecord を取得し、
+    nameOfHouse + nameOfMeeting 単位で kokkai_documents に親登録したうえで、
+    row_data.file_id = kokkai_documents.source_id として入れ直す
     """
     uid = get_uid_from_auth_header(authorization)
 
@@ -219,8 +415,22 @@ def kokkai_fetch_and_register(
             "mode": "fetch_and_register",
             "requested_url": requested_url,
             "fetched": 0,
+            "count": 0,
+            "document_count": 0,
             "inserted": 0,
             "skipped": 0,
+        }
+
+    grouped = group_records_by_house_meeting(records)
+    if not grouped:
+        return {
+            "mode": "fetch_and_register",
+            "requested_url": requested_url,
+            "fetched": fetched,
+            "count": fetched,
+            "document_count": 0,
+            "inserted": 0,
+            "skipped": fetched,
         }
 
     client = storage.Client()
@@ -237,53 +447,49 @@ def kokkai_fetch_and_register(
     local_db_path = f"/tmp/ank_{uid}_kokkai.db"
     db_blob.download_to_filename(local_db_path)
 
-    file_id = str(ulid.new())
-    created_at = datetime.now(tz=JST).isoformat()
-    source_type = "kokkai"
-    source_key = build_source_key(records)
-
-    inserted = 0
-    skipped = 0
+    total_inserted = 0
+    total_skipped = 0
+    document_count = 0
+    source_ids: List[str] = []
 
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
 
-        row_index = 1
-        for r in records:
-            item_id = row_source_item_id_of(r)
-            if not item_id:
-                skipped += 1
-                row_index += 1
-                continue
+        ensure_kokkai_documents_table(conn)
 
-            row_id = str(ulid.new())
-            content = json.dumps(r, ensure_ascii=False)
+        for (house, meeting), group_records in grouped.items():
+            source_id = upsert_kokkai_document(
+                conn=conn,
+                house=house,
+                meeting=meeting,
+                requested_url=requested_url,
+                row_count=len(group_records),
+            )
+            source_ids.append(source_id)
+            document_count += 1
+
+            source_key = build_parent_source_key(house, meeting)
+
+            inserted, skipped = replace_row_data_for_kokkai(
+                conn=conn,
+                file_id=source_id,
+                source_key=source_key,
+                records=group_records,
+            )
+
+            total_inserted += inserted
+            total_skipped += skipped
 
             cur.execute(
                 """
-                INSERT OR IGNORE INTO row_data
-                  (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE kokkai_documents
+                   SET status = ?,
+                       row_count = ?
+                 WHERE source_id = ?
                 """,
-                (
-                    row_id,
-                    file_id,
-                    source_type,
-                    source_key,
-                    item_id,
-                    row_index,
-                    content,
-                    created_at,
-                ),
+                ("done", inserted, source_id),
             )
-
-            if cur.rowcount == 1:
-                inserted += 1
-            else:
-                skipped += 1
-
-            row_index += 1
 
         conn.commit()
 
@@ -295,10 +501,10 @@ def kokkai_fetch_and_register(
     return {
         "mode": "fetch_and_register",
         "requested_url": requested_url,
-        "file_id": file_id,
         "fetched": fetched,
         "count": fetched,
-        "inserted": inserted,
-        "skipped": skipped,
-        "source_key": source_key,
+        "document_count": document_count,
+        "inserted": total_inserted,
+        "skipped": total_skipped,
+        "source_ids": source_ids,
     }
