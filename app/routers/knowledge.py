@@ -13,6 +13,7 @@ from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
+import json
 
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -130,6 +131,69 @@ def ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
         ON knowledge_job_items(status)
         """
     )
+
+
+def insert_kokkai_contents(conn: sqlite3.Connection, job_item_id: str, source_id: str):
+
+    cur = conn.execute(
+        """
+        SELECT row_id, content
+        FROM row_data
+        WHERE source_type = 'kokkai'
+        AND file_id = ?
+        ORDER BY row_index
+        """,
+        (source_id,),
+    )
+
+    rows = cur.fetchall()
+
+    sort_no = 1
+    now = now_iso()
+
+    for row in rows:
+
+        try:
+            data = json.loads(row["content"])
+        except Exception:
+            continue
+
+        speech = data.get("speech")
+
+        if not speech:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO knowledge_contents (
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                row_id,
+                content_type,
+                content_text,
+                sort_no,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                None,
+                job_item_id,
+                "kokkai",
+                source_id,
+                row["row_id"],
+                "speech",
+                speech,
+                sort_no,
+                now,
+                now,
+            ),
+        )
+
+        sort_no += 1
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -283,6 +347,8 @@ def create_knowledge_job(
             )
 
             created_item_count += 1
+            if item.source_type == "kokkai":
+                insert_kokkai_contents(conn, job_item_id, item.parent_source_id)
 
         conn.commit()
         db_blob.upload_from_filename(local_db_path)
