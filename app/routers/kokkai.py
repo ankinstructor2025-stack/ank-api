@@ -508,3 +508,132 @@ def kokkai_fetch_and_register(
         "skipped": total_skipped,
         "source_ids": source_ids,
     }
+
+@router.get("/documents")
+def kokkai_documents(
+    authorization: str | None = Header(default=None),
+):
+    """
+    kokkai_documents の親一覧を返す
+    """
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_kokkai_documents.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_kokkai_documents_table(conn)
+
+        cur = conn.execute(
+            """
+            SELECT
+              source_id,
+              status,
+              logical_name,
+              source_key,
+              name_of_house,
+              name_of_meeting,
+              row_count,
+              source_url,
+              created_at
+            FROM kokkai_documents
+            ORDER BY created_at DESC, name_of_house, name_of_meeting
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    finally:
+        conn.close()
+
+    return {
+        "rows": rows,
+        "count": len(rows),
+    }
+
+@router.get("/rows")
+def kokkai_rows(
+    name_of_house: str,
+    name_of_meeting: str,
+    authorization: str | None = Header(default=None),
+):
+    """
+    name_of_house + name_of_meeting に対応する row_data を返す
+    """
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_kokkai_rows.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_kokkai_documents_table(conn)
+
+        cur = conn.execute(
+            """
+            SELECT source_id
+            FROM kokkai_documents
+            WHERE name_of_house = ?
+              AND name_of_meeting = ?
+            LIMIT 1
+            """,
+            (name_of_house, name_of_meeting),
+        )
+        doc = cur.fetchone()
+
+        if not doc:
+            return {"rows": [], "count": 0}
+
+        source_id = doc["source_id"]
+
+        cur = conn.execute(
+            """
+            SELECT
+              row_id,
+              file_id,
+              source_type,
+              source_key,
+              source_item_id,
+              row_index,
+              content,
+              created_at
+            FROM row_data
+            WHERE file_id = ?
+              AND source_type = 'kokkai'
+            ORDER BY row_index
+            """,
+            (source_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    finally:
+        conn.close()
+
+    return {
+        "rows": rows,
+        "count": len(rows),
+    }
