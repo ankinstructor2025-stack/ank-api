@@ -483,12 +483,23 @@ def kokkai_fetch_and_register(
 
             cur.execute(
                 """
+                SELECT COUNT(*)
+                FROM row_data
+                WHERE file_id = ?
+                  AND source_type = 'kokkai'
+                """,
+                (source_id,),
+            )
+            actual_row_count = cur.fetchone()[0]
+
+            cur.execute(
+                """
                 UPDATE kokkai_documents
                    SET status = ?,
                        row_count = ?
                  WHERE source_id = ?
                 """,
-                ("done", inserted, source_id),
+                ("done", actual_row_count, source_id),
             )
 
         conn.commit()
