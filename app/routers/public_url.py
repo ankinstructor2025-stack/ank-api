@@ -767,6 +767,8 @@ def replace_row_data_for_public_url(
     created_at = now_iso()
 
     for idx, content in enumerate(contents, start=1):
+        row_source_item_id = f"{source_item_id}:{idx}"
+
         conn.execute(
             """
             INSERT INTO row_data
@@ -778,7 +780,7 @@ def replace_row_data_for_public_url(
                 file_id,
                 "public_url",
                 source_key,
-                source_item_id,
+                row_source_item_id,
                 idx,
                 content,
                 created_at,
