@@ -14,7 +14,7 @@ from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
-
+from openai import OpenAI
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
@@ -89,6 +89,118 @@ def extract_speech_id(content_obj: dict) -> str | None:
 
 def extract_speaker(content_obj: dict) -> str:
     return normalize_text(content_obj.get("speaker"))
+
+
+def run_kokkai_qa_llm(prompt_text: str) -> dict:
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise Exception("OPENAI_API_KEY not set")
+
+    client = OpenAI(api_key=api_key)
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {"role": "user", "content": prompt_text}
+        ]
+    )
+
+    content = res.choices[0].message.content or ""
+    content = content.strip()
+
+    if content.startswith("```"):
+        content = content.split("```")[1]
+
+    try:
+        return json.loads(content)
+    except Exception:
+        raise Exception("LLM returned invalid JSON")
+
+
+def insert_qa_items_from_llm_result(
+    conn: sqlite3.Connection,
+    job_id: str,
+    job_item_id: str,
+    source_type: str,
+    source_id: str,
+    llm_result: dict,
+) -> int:
+
+    qa_list = llm_result.get("qa_list") or []
+
+    if not isinstance(qa_list, list):
+        raise Exception("qa_list is not list")
+
+    inserted_count = 0
+    now = now_iso()
+    sort_no = 200000
+
+    for qa in qa_list:
+
+        question = normalize_text(qa.get("question"))
+        answer = normalize_text(qa.get("answer"))
+
+        if not question or not answer:
+            continue
+
+        content = f"[Q]\n{question}\n\n[A]\n{answer}"
+
+        conn.execute(
+            """
+            INSERT INTO knowledge_items (
+                knowledge_id,
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                source_item_id,
+                row_id,
+                knowledge_type,
+                title,
+                question,
+                answer,
+                content,
+                summary,
+                keywords,
+                language,
+                sort_no,
+                status,
+                review_status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                None,
+                None,
+                "qa",
+                None,
+                question,
+                answer,
+                content,
+                None,
+                None,
+                "ja",
+                sort_no,
+                "active",
+                "new",
+                now,
+                now,
+            ),
+        )
+
+        inserted_count += 1
+        sort_no += 1
+
+    return inserted_count
 
 
 def load_template_text(path: str) -> str:
@@ -663,8 +775,17 @@ def create_knowledge_job(
                         )
                     )
 
-                    plain_count = 0
-                    qa_count = 0
+                    if not body.preview_only:
+                        llm_result = run_kokkai_qa_llm(prompt_text)
+
+                        qa_count = insert_qa_items_from_llm_result(
+                            conn=conn,
+                            job_id=job_id,
+                            job_item_id=job_item_id,
+                            source_type="kokkai",
+                            source_id=source_id,
+                            llm_result=llm_result,
+                        )
 
                     finished_at = now_iso()
 
@@ -679,7 +800,7 @@ def create_knowledge_job(
                         """,
                         (
                             "preview" if body.preview_only else "ready",
-                            0,
+                            qa_count,
                             finished_at,
                             job_item_id,
                         ),
