@@ -133,7 +133,7 @@ def ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def insert_kokkai_contents(conn: sqlite3.Connection, job_item_id: str, source_id: str):
+def insert_kokkai_contents(conn, job_id, job_item_id, source_id):
 
     cur = conn.execute(
         """
@@ -180,7 +180,7 @@ def insert_kokkai_contents(conn: sqlite3.Connection, job_item_id: str, source_id
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                None,
+                job_id,
                 job_item_id,
                 "kokkai",
                 source_id,
@@ -348,7 +348,7 @@ def create_knowledge_job(
 
             created_item_count += 1
             if item.source_type == "kokkai":
-                insert_kokkai_contents(conn, job_item_id, item.parent_source_id)
+                insert_kokkai_contents(conn, job_id, job_item_id, item.parent_source_id)
 
         conn.commit()
         db_blob.upload_from_filename(local_db_path)
