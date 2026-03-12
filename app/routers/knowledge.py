@@ -239,6 +239,158 @@ def extract_speech_id(content_obj: dict) -> str | None:
     return s or None
 
 
+def extract_speaker(content_obj: dict) -> str:
+    return normalize_text(content_obj.get("speaker"))
+
+
+def is_questioner(speaker: str) -> bool:
+    s = normalize_text(speaker)
+    if not s:
+        return False
+    return (
+        s.endswith("君")
+        and "委員長" not in s
+        and "議長" not in s
+        and "大臣" not in s
+        and "政府参考人" not in s
+        and "参考人" not in s
+    )
+
+
+def is_answerer(speaker: str) -> bool:
+    s = normalize_text(speaker)
+    if not s:
+        return False
+    return (
+        "政府参考人" in s
+        or "参考人" in s
+        or "大臣" in s
+        or "副大臣" in s
+        or "政務官" in s
+        or "長官" in s
+    )
+
+
+def insert_qa_candidate_items_from_row_data(
+    conn: sqlite3.Connection,
+    job_id: str,
+    job_item_id: str,
+    source_type: str,
+    source_id: str,
+) -> int:
+    cur = conn.execute(
+        """
+        SELECT row_id, row_index, content
+        FROM row_data
+        WHERE source_type = 'kokkai'
+          AND file_id = ?
+        ORDER BY row_index
+        """,
+        (source_id,),
+    )
+    rows = cur.fetchall()
+
+    speeches = []
+    for row in rows:
+        content_obj = load_json_safe(row["content"] or "")
+        speaker = extract_speaker(content_obj)
+        speech_text = extract_speech_text(content_obj)
+        source_item_id = extract_speech_id(content_obj)
+
+        if not speech_text:
+            continue
+
+        speeches.append(
+            {
+                "row_id": row["row_id"],
+                "row_index": row["row_index"],
+                "speaker": speaker,
+                "speech_text": speech_text,
+                "source_item_id": source_item_id,
+            }
+        )
+
+    inserted_count = 0
+    now = now_iso()
+    sort_no = 100000
+
+    for i in range(len(speeches) - 1):
+        q = speeches[i]
+        if not is_questioner(q["speaker"]):
+            continue
+
+        answer = None
+        for j in range(i + 1, len(speeches)):
+            cand = speeches[j]
+            if is_questioner(cand["speaker"]):
+                break
+            if is_answerer(cand["speaker"]):
+                answer = cand
+                break
+
+        if not answer:
+            continue
+
+        question_text = q["speech_text"]
+        answer_text = answer["speech_text"]
+        merged_text = f"[Q]\n{question_text}\n\n[A]\n{answer_text}"
+
+        conn.execute(
+            """
+            INSERT INTO knowledge_items (
+                knowledge_id,
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                source_item_id,
+                row_id,
+                knowledge_type,
+                title,
+                question,
+                answer,
+                content,
+                summary,
+                keywords,
+                language,
+                sort_no,
+                status,
+                review_status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                q["source_item_id"],
+                q["row_id"],
+                "qa",
+                None,
+                question_text,
+                answer_text,
+                merged_text,
+                None,
+                None,
+                "ja",
+                sort_no,
+                "active",
+                "new",
+                now,
+                now,
+            ),
+        )
+
+        inserted_count += 1
+        sort_no += 1
+
+    return inserted_count
+
+
 def insert_kokkai_contents(
     conn: sqlite3.Connection,
     job_id: str,
@@ -546,16 +698,27 @@ def create_knowledge_job(
             try:
                 contents_count = 0
                 plain_count = 0
+                qa_count = 0
 
                 if item.source_type == "kokkai":
                     source_id = item.parent_source_id or ""
+
                     contents_count = insert_kokkai_contents(
                         conn=conn,
                         job_id=job_id,
                         job_item_id=job_item_id,
                         source_id=source_id,
                     )
+
                     plain_count = insert_plain_items_from_contents(
+                        conn=conn,
+                        job_id=job_id,
+                        job_item_id=job_item_id,
+                        source_type="kokkai",
+                        source_id=source_id,
+                    )
+
+                    qa_count = insert_qa_candidate_items_from_row_data(
                         conn=conn,
                         job_id=job_id,
                         job_item_id=job_item_id,
@@ -581,7 +744,7 @@ def create_knowledge_job(
                     """,
                     (
                         "done",
-                        plain_count,
+                        plain_count + qa_count,
                         finished_at,
                         job_item_id,
                     ),
@@ -589,6 +752,7 @@ def create_knowledge_job(
 
                 created_item_count += 1
                 total_plain_count += plain_count
+                total_qa_count += qa_count
 
             except Exception as e:
                 finished_at = now_iso()
