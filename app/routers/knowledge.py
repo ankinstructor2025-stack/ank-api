@@ -127,7 +127,7 @@ def build_kokkai_prompt_text_from_contents(
     if not item:
         raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
 
-    prompt_template = load_template_text(KOKKAI_QA_PROMPT_PATH)
+    prompt_template = load_template_text(KOKKAI_QA_PROMPT_PATH).strip()
 
     cur = conn.execute(
         """
@@ -156,13 +156,11 @@ def build_kokkai_prompt_text_from_contents(
     if not input_text:
         raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
 
-    header = (
-        f"対象: {item['name_of_house'] or ''} / {item['name_of_meeting'] or ''}\n"
-        f"job_item_id: {item['job_item_id']}\n\n"
-    )
+    target_name = f"{item['name_of_house'] or ''} / {item['name_of_meeting'] or ''}"
 
     return (
-        f"{header}"
+        f"対象: {target_name}\n"
+        f"job_item_id: {item['job_item_id']}\n\n"
         f"{prompt_template}\n\n"
         f"【会議情報】\n"
         f"院: {item['name_of_house'] or ''}\n"
