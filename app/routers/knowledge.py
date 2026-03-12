@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
@@ -13,7 +14,6 @@ from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
-import json
 
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -132,36 +132,141 @@ def ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_contents (
+            job_id TEXT NOT NULL,
+            job_item_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            source_item_id TEXT,
+            row_id TEXT,
+            content_type TEXT NOT NULL,
+            content_text TEXT NOT NULL,
+            sort_no INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
 
-def insert_kokkai_contents(conn, job_id, job_item_id, source_id):
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_knowledge_contents_job_item
+        ON knowledge_contents(job_item_id)
+        """
+    )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_items (
+            knowledge_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            job_item_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            source_item_id TEXT,
+            row_id TEXT,
+            knowledge_type TEXT NOT NULL,
+            title TEXT,
+            question TEXT,
+            answer TEXT,
+            content TEXT,
+            summary TEXT,
+            keywords TEXT,
+            language TEXT DEFAULT 'ja',
+            sort_no INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            review_status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_knowledge_items_job_id
+        ON knowledge_items(job_id)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_knowledge_items_job_item_id
+        ON knowledge_items(job_item_id)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_knowledge_items_type
+        ON knowledge_items(knowledge_type)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_knowledge_items_source
+        ON knowledge_items(source_type, source_id)
+        """
+    )
+
+
+def load_json_safe(text: str) -> dict:
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return " ".join(str(text).split()).strip()
+
+
+def extract_speech_text(content_obj: dict) -> str:
+    return normalize_text(content_obj.get("speech"))
+
+
+def extract_speech_id(content_obj: dict) -> str | None:
+    v = content_obj.get("speechID")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def insert_kokkai_contents(
+    conn: sqlite3.Connection,
+    job_id: str,
+    job_item_id: str,
+    source_id: str,
+) -> int:
     cur = conn.execute(
         """
-        SELECT row_id, content
+        SELECT row_id, row_index, content
         FROM row_data
         WHERE source_type = 'kokkai'
-        AND file_id = ?
+          AND file_id = ?
         ORDER BY row_index
         """,
         (source_id,),
     )
-
     rows = cur.fetchall()
 
-    sort_no = 1
+    inserted_count = 0
     now = now_iso()
 
-    for row in rows:
-
-        try:
-            data = json.loads(row["content"])
-        except Exception:
+    for idx, row in enumerate(rows, start=1):
+        content_obj = load_json_safe(row["content"] or "")
+        speech_text = extract_speech_text(content_obj)
+        if not speech_text:
             continue
 
-        speech = data.get("speech")
-
-        if not speech:
-            continue
+        source_item_id = extract_speech_id(content_obj)
 
         conn.execute(
             """
@@ -170,6 +275,7 @@ def insert_kokkai_contents(conn, job_id, job_item_id, source_id):
                 job_item_id,
                 source_type,
                 source_id,
+                source_item_id,
                 row_id,
                 content_type,
                 content_text,
@@ -177,23 +283,110 @@ def insert_kokkai_contents(conn, job_id, job_item_id, source_id):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
                 job_item_id,
                 "kokkai",
                 source_id,
+                source_item_id,
                 row["row_id"],
                 "speech",
-                speech,
-                sort_no,
+                speech_text,
+                idx,
                 now,
                 now,
             ),
         )
+        inserted_count += 1
 
-        sort_no += 1
+    return inserted_count
+
+
+def insert_plain_items_from_contents(
+    conn: sqlite3.Connection,
+    job_id: str,
+    job_item_id: str,
+    source_type: str,
+    source_id: str,
+) -> int:
+    cur = conn.execute(
+        """
+        SELECT
+            source_item_id,
+            row_id,
+            content_type,
+            content_text,
+            sort_no
+        FROM knowledge_contents
+        WHERE job_id = ?
+          AND job_item_id = ?
+        ORDER BY sort_no
+        """,
+        (job_id, job_item_id),
+    )
+    rows = cur.fetchall()
+
+    inserted_count = 0
+    now = now_iso()
+
+    for row in rows:
+        if (row["content_type"] or "") != "speech":
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO knowledge_items (
+                knowledge_id,
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                source_item_id,
+                row_id,
+                knowledge_type,
+                title,
+                question,
+                answer,
+                content,
+                summary,
+                keywords,
+                language,
+                sort_no,
+                status,
+                review_status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                row["source_item_id"],
+                row["row_id"],
+                "plain",
+                None,
+                None,
+                None,
+                row["content_text"],
+                None,
+                None,
+                "ja",
+                row["sort_no"],
+                "active",
+                "new",
+                now,
+                now,
+            ),
+        )
+        inserted_count += 1
+
+    return inserted_count
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -301,13 +494,16 @@ def create_knowledge_job(
                 body.source_type,
                 body.source_name,
                 body.request_type,
-                "queued",
+                "running",
                 selected_count,
                 requested_at,
             ),
         )
 
         created_item_count = 0
+        total_plain_count = 0
+        total_qa_count = 0
+        total_error_count = 0
 
         for item in unique_items:
             job_item_id = new_id()
@@ -330,7 +526,7 @@ def create_knowledge_job(
                     started_at,
                     finished_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL)
                 """,
                 (
                     job_item_id,
@@ -341,14 +537,103 @@ def create_knowledge_job(
                     item.parent_key2,
                     item.parent_label,
                     item.row_count,
-                    "queued",
+                    "running",
+                    requested_at,
                     requested_at,
                 ),
             )
 
-            created_item_count += 1
-            if item.source_type == "kokkai":
-                insert_kokkai_contents(conn, job_id, job_item_id, item.parent_source_id)
+            try:
+                contents_count = 0
+                plain_count = 0
+
+                if item.source_type == "kokkai":
+                    source_id = item.parent_source_id or ""
+                    contents_count = insert_kokkai_contents(
+                        conn=conn,
+                        job_id=job_id,
+                        job_item_id=job_item_id,
+                        source_id=source_id,
+                    )
+                    plain_count = insert_plain_items_from_contents(
+                        conn=conn,
+                        job_id=job_id,
+                        job_item_id=job_item_id,
+                        source_type="kokkai",
+                        source_id=source_id,
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"unsupported item.source_type: {item.source_type}",
+                    )
+
+                finished_at = now_iso()
+
+                conn.execute(
+                    """
+                    UPDATE knowledge_job_items
+                    SET status = ?,
+                        knowledge_count = ?,
+                        finished_at = ?,
+                        error_message = NULL
+                    WHERE job_item_id = ?
+                    """,
+                    (
+                        "done",
+                        plain_count,
+                        finished_at,
+                        job_item_id,
+                    ),
+                )
+
+                created_item_count += 1
+                total_plain_count += plain_count
+
+            except Exception as e:
+                finished_at = now_iso()
+                total_error_count += 1
+
+                conn.execute(
+                    """
+                    UPDATE knowledge_job_items
+                    SET status = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE job_item_id = ?
+                    """,
+                    (
+                        "error",
+                        finished_at,
+                        str(e),
+                        job_item_id,
+                    ),
+                )
+
+        finished_at = now_iso()
+        final_status = "done" if total_error_count == 0 else "partial_error"
+
+        conn.execute(
+            """
+            UPDATE knowledge_jobs
+            SET status = ?,
+                qa_count = ?,
+                plain_count = ?,
+                error_count = ?,
+                started_at = COALESCE(started_at, ?),
+                finished_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                final_status,
+                total_qa_count,
+                total_plain_count,
+                total_error_count,
+                requested_at,
+                finished_at,
+                job_id,
+            ),
+        )
 
         conn.commit()
         db_blob.upload_from_filename(local_db_path)
@@ -357,7 +642,7 @@ def create_knowledge_job(
             job_id=job_id,
             selected_count=selected_count,
             created_item_count=created_item_count,
-            status="queued",
+            status=final_status,
         )
 
     except sqlite3.IntegrityError as e:
