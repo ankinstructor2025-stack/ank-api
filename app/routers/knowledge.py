@@ -99,7 +99,7 @@ def load_template_text(path: str) -> str:
     if not blob.exists():
         raise HTTPException(status_code=404, detail=f"{path} not found")
 
-    return blob.download_as_text(encoding="utf-8")
+    return blob.download_as_bytes().decode("utf-8")
 
 
 def build_kokkai_prompt_text_from_contents(
@@ -156,7 +156,13 @@ def build_kokkai_prompt_text_from_contents(
     if not input_text:
         raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
 
+    header = (
+        f"対象: {item['name_of_house'] or ''} / {item['name_of_meeting'] or ''}\n"
+        f"job_item_id: {item['job_item_id']}\n\n"
+    )
+
     return (
+        f"{header}"
         f"{prompt_template}\n\n"
         f"【会議情報】\n"
         f"院: {item['name_of_house'] or ''}\n"
