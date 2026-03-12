@@ -20,7 +20,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
-
+KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
 
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
@@ -61,158 +61,6 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
-def ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS knowledge_jobs (
-            job_id TEXT PRIMARY KEY,
-            source_type TEXT NOT NULL,
-            source_name TEXT,
-            request_type TEXT NOT NULL,
-            status TEXT NOT NULL,
-            selected_count INTEGER NOT NULL DEFAULT 0,
-            qa_count INTEGER NOT NULL DEFAULT 0,
-            plain_count INTEGER NOT NULL DEFAULT 0,
-            error_count INTEGER NOT NULL DEFAULT 0,
-            requested_at TEXT NOT NULL,
-            started_at TEXT,
-            finished_at TEXT,
-            error_message TEXT
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_jobs_status
-        ON knowledge_jobs(status)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_jobs_requested_at
-        ON knowledge_jobs(requested_at)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS knowledge_job_items (
-            job_item_id TEXT PRIMARY KEY,
-            job_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            parent_source_id TEXT,
-            parent_key1 TEXT,
-            parent_key2 TEXT,
-            parent_label TEXT,
-            row_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            knowledge_count INTEGER NOT NULL DEFAULT 0,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            started_at TEXT,
-            finished_at TEXT,
-            FOREIGN KEY (job_id) REFERENCES knowledge_jobs(job_id)
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_job_items_job_id
-        ON knowledge_job_items(job_id)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_job_items_status
-        ON knowledge_job_items(status)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS knowledge_contents (
-            job_id TEXT NOT NULL,
-            job_item_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_id TEXT,
-            source_item_id TEXT,
-            row_id TEXT,
-            content_type TEXT NOT NULL,
-            content_text TEXT NOT NULL,
-            sort_no INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_contents_job_item
-        ON knowledge_contents(job_item_id)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS knowledge_items (
-            knowledge_id TEXT PRIMARY KEY,
-            job_id TEXT NOT NULL,
-            job_item_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_id TEXT,
-            source_item_id TEXT,
-            row_id TEXT,
-            knowledge_type TEXT NOT NULL,
-            title TEXT,
-            question TEXT,
-            answer TEXT,
-            content TEXT,
-            summary TEXT,
-            keywords TEXT,
-            language TEXT DEFAULT 'ja',
-            sort_no INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active',
-            review_status TEXT NOT NULL DEFAULT 'new',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_items_job_id
-        ON knowledge_items(job_id)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_items_job_item_id
-        ON knowledge_items(job_item_id)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_items_type
-        ON knowledge_items(knowledge_type)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_knowledge_items_source
-        ON knowledge_items(source_type, source_id)
-        """
-    )
-
-
 def load_json_safe(text: str) -> dict:
     try:
         obj = json.loads(text)
@@ -241,6 +89,83 @@ def extract_speech_id(content_obj: dict) -> str | None:
 
 def extract_speaker(content_obj: dict) -> str:
     return normalize_text(content_obj.get("speaker"))
+
+
+def load_template_text(path: str) -> str:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(path)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"{path} not found")
+
+    return blob.download_as_text(encoding="utf-8")
+
+
+def build_kokkai_prompt_text_from_contents(
+    conn: sqlite3.Connection,
+    job_item_id: str,
+) -> str:
+    cur = conn.execute(
+        """
+        SELECT
+            ji.job_item_id,
+            ji.parent_source_id,
+            ji.parent_label,
+            d.name_of_house,
+            d.name_of_meeting,
+            d.logical_name
+        FROM knowledge_job_items ji
+        LEFT JOIN kokkai_documents d
+          ON d.source_id = ji.parent_source_id
+        WHERE ji.job_item_id = ?
+        LIMIT 1
+        """,
+        (job_item_id,),
+    )
+    item = cur.fetchone()
+    if not item:
+        raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
+
+    prompt_template = load_template_text(KOKKAI_QA_PROMPT_PATH)
+
+    cur = conn.execute(
+        """
+        SELECT
+            content_type,
+            content_text,
+            sort_no
+        FROM knowledge_contents
+        WHERE job_item_id = ?
+        ORDER BY sort_no
+        """,
+        (job_item_id,),
+    )
+    rows = cur.fetchall()
+
+    lines: List[str] = []
+    for row in rows:
+        if (row["content_type"] or "") != "speech":
+            continue
+        text = normalize_text(row["content_text"])
+        if not text:
+            continue
+        lines.append(f"[{row['sort_no']}] {text}")
+
+    input_text = "\n\n".join(lines).strip()
+    if not input_text:
+        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
+
+    return (
+        f"{prompt_template}\n\n"
+        f"【会議情報】\n"
+        f"院: {item['name_of_house'] or ''}\n"
+        f"会議名: {item['name_of_meeting'] or ''}\n"
+        f"名称: {item['logical_name'] or item['parent_label'] or ''}\n"
+        f"job_item_id: {item['job_item_id']}\n\n"
+        f"【発言一覧】\n"
+        f"{input_text}\n"
+    )
 
 
 def is_questioner(speaker: str) -> bool:
@@ -555,6 +480,14 @@ class KnowledgeJobCreateRequest(BaseModel):
     source_name: Optional[str] = None
     request_type: str = "extract_knowledge"
     items: List[KnowledgeTargetItem]
+    preview_only: bool = False
+
+
+class PromptPreviewItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    prompt_text: str
 
 
 class KnowledgeJobCreateResponse(BaseModel):
@@ -562,6 +495,7 @@ class KnowledgeJobCreateResponse(BaseModel):
     selected_count: int
     created_item_count: int
     status: str
+    prompt_previews: List[PromptPreviewItem] = []
 
 
 @router.post("/jobs", response_model=KnowledgeJobCreateResponse)
@@ -598,8 +532,6 @@ def create_knowledge_job(
     conn.row_factory = sqlite3.Row
 
     try:
-        ensure_knowledge_tables(conn)
-
         job_id = new_id()
         requested_at = now_iso()
 
@@ -646,7 +578,7 @@ def create_knowledge_job(
                 body.source_type,
                 body.source_name,
                 body.request_type,
-                "running",
+                "preview" if body.preview_only else "running",
                 selected_count,
                 requested_at,
             ),
@@ -656,6 +588,7 @@ def create_knowledge_job(
         total_plain_count = 0
         total_qa_count = 0
         total_error_count = 0
+        prompt_previews: List[PromptPreviewItem] = []
 
         for item in unique_items:
             job_item_id = new_id()
@@ -689,7 +622,7 @@ def create_knowledge_job(
                     item.parent_key2,
                     item.parent_label,
                     item.row_count,
-                    "running",
+                    "preview" if body.preview_only else "running",
                     requested_at,
                     requested_at,
                 ),
@@ -702,6 +635,8 @@ def create_knowledge_job(
 
                 if item.source_type == "kokkai":
                     source_id = item.parent_source_id or ""
+                    if not source_id:
+                        raise HTTPException(status_code=400, detail="parent_source_id is required")
 
                     contents_count = insert_kokkai_contents(
                         conn=conn,
@@ -710,20 +645,40 @@ def create_knowledge_job(
                         source_id=source_id,
                     )
 
-                    plain_count = insert_plain_items_from_contents(
+                    prompt_text = build_kokkai_prompt_text_from_contents(
                         conn=conn,
-                        job_id=job_id,
                         job_item_id=job_item_id,
-                        source_type="kokkai",
-                        source_id=source_id,
                     )
 
-                    qa_count = insert_qa_candidate_items_from_row_data(
-                        conn=conn,
-                        job_id=job_id,
-                        job_item_id=job_item_id,
-                        source_type="kokkai",
-                        source_id=source_id,
+                    prompt_previews.append(
+                        PromptPreviewItem(
+                            job_item_id=job_item_id,
+                            parent_source_id=item.parent_source_id,
+                            parent_label=item.parent_label,
+                            prompt_text=prompt_text,
+                        )
+                    )
+
+                    plain_count = 0
+                    qa_count = 0
+
+                    finished_at = now_iso()
+
+                    conn.execute(
+                        """
+                        UPDATE knowledge_job_items
+                        SET status = ?,
+                            knowledge_count = ?,
+                            finished_at = ?,
+                            error_message = NULL
+                        WHERE job_item_id = ?
+                        """,
+                        (
+                            "preview" if body.preview_only else "ready",
+                            0,
+                            finished_at,
+                            job_item_id,
+                        ),
                     )
                 else:
                     raise HTTPException(
@@ -731,24 +686,6 @@ def create_knowledge_job(
                         detail=f"unsupported item.source_type: {item.source_type}",
                     )
 
-                finished_at = now_iso()
-
-                conn.execute(
-                    """
-                    UPDATE knowledge_job_items
-                    SET status = ?,
-                        knowledge_count = ?,
-                        finished_at = ?,
-                        error_message = NULL
-                    WHERE job_item_id = ?
-                    """,
-                    (
-                        "done",
-                        plain_count + qa_count,
-                        finished_at,
-                        job_item_id,
-                    ),
-                )
 
                 created_item_count += 1
                 total_plain_count += plain_count
@@ -775,7 +712,11 @@ def create_knowledge_job(
                 )
 
         finished_at = now_iso()
-        final_status = "done" if total_error_count == 0 else "partial_error"
+        final_status = (
+            "partial_error"
+            if total_error_count > 0
+            else ("preview" if body.preview_only else "ready")
+        )
 
         conn.execute(
             """
@@ -807,6 +748,7 @@ def create_knowledge_job(
             selected_count=selected_count,
             created_item_count=created_item_count,
             status=final_status,
+            prompt_previews=prompt_previews,
         )
 
     except sqlite3.IntegrityError as e:
