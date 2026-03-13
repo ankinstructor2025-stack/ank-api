@@ -4,9 +4,10 @@ import json
 import os
 import sqlite3
 import uuid
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ import firebase_admin
 from firebase_admin import auth as fb_auth
 from openai import OpenAI
 
-import logging
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
+
 
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
@@ -95,7 +97,6 @@ def extract_speaker(content_obj: dict) -> str:
 
 
 def run_kokkai_qa_llm(prompt_text: str) -> dict:
-
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise Exception("OPENAI_API_KEY not set")
@@ -103,26 +104,34 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
     client = OpenAI(api_key=api_key)
 
     try:
-
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
-            messages=[{"role": "user", "content": prompt_text}]
+            messages=[
+                {"role": "user", "content": prompt_text}
+            ],
         )
 
         content = res.choices[0].message.content or ""
         content = content.strip()
 
+        # ```json ... ``` の除去
         if content.startswith("```"):
-            parts = content.split("```")
-            if len(parts) >= 2:
-                content = parts[1]
+            lines = content.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
 
-        content = content.replace("json", "", 1).strip()
+        if content.lower().startswith("json"):
+            content = content[4:].strip()
+
+        logger.info("LLM raw response (head 2000 chars): %s", content[:2000])
 
         return json.loads(content)
 
-    except Exception as e:
+    except Exception:
         logger.exception("LLM QA generation failed")
         raise
 
@@ -135,7 +144,6 @@ def insert_qa_items_from_llm_result(
     source_id: str,
     llm_result: dict,
 ) -> int:
-
     qa_list = llm_result.get("qa_list") or []
 
     if not isinstance(qa_list, list):
@@ -146,6 +154,8 @@ def insert_qa_items_from_llm_result(
     sort_no = 200000
 
     for qa in qa_list:
+        if not isinstance(qa, dict):
+            continue
 
         question = normalize_text(qa.get("question"))
         answer = normalize_text(qa.get("answer"))
@@ -208,6 +218,7 @@ def insert_qa_items_from_llm_result(
         inserted_count += 1
         sort_no += 1
 
+    logger.info("insert_qa_items_from_llm_result: job_item_id=%s qa_count=%s", job_item_id, inserted_count)
     return inserted_count
 
 
@@ -614,12 +625,22 @@ class PromptPreviewItem(BaseModel):
     prompt_text: str
 
 
+class KnowledgeDebugItem(BaseModel):
+    job_item_id: str
+    parent_label: Optional[str] = None
+    status: str
+    qa_count: int = 0
+    error_message: Optional[str] = None
+    llm_result: Optional[Any] = None
+
+
 class KnowledgeJobCreateResponse(BaseModel):
     job_id: str
     selected_count: int
     created_item_count: int
     status: str
     prompt_previews: List[PromptPreviewItem] = []
+    debug_items: List[KnowledgeDebugItem] = []
 
 
 @router.post("/jobs", response_model=KnowledgeJobCreateResponse)
@@ -713,6 +734,7 @@ def create_knowledge_job(
         total_qa_count = 0
         total_error_count = 0
         prompt_previews: List[PromptPreviewItem] = []
+        debug_items: List[KnowledgeDebugItem] = []
 
         for item in unique_items:
             job_item_id = new_id()
@@ -753,16 +775,15 @@ def create_knowledge_job(
             )
 
             try:
-                contents_count = 0
-                plain_count = 0
                 qa_count = 0
+                llm_result_for_debug: Optional[dict] = None
 
                 if item.source_type == "kokkai":
                     source_id = item.parent_source_id or ""
                     if not source_id:
                         raise HTTPException(status_code=400, detail="parent_source_id is required")
 
-                    contents_count = insert_kokkai_contents(
+                    insert_kokkai_contents(
                         conn=conn,
                         job_id=job_id,
                         job_item_id=job_item_id,
@@ -785,6 +806,10 @@ def create_knowledge_job(
 
                     if not body.preview_only:
                         llm_result = run_kokkai_qa_llm(prompt_text)
+                        llm_result_for_debug = llm_result
+
+                        if llm_result.get("job_item_id") not in (None, "", job_item_id):
+                            raise Exception("job_item_id mismatch")
 
                         qa_count = insert_qa_items_from_llm_result(
                             conn=conn,
@@ -796,6 +821,7 @@ def create_knowledge_job(
                         )
 
                     finished_at = now_iso()
+                    item_status = "preview" if body.preview_only else "ready"
 
                     conn.execute(
                         """
@@ -807,11 +833,22 @@ def create_knowledge_job(
                         WHERE job_item_id = ?
                         """,
                         (
-                            "preview" if body.preview_only else "ready",
+                            item_status,
                             qa_count,
                             finished_at,
                             job_item_id,
                         ),
+                    )
+
+                    debug_items.append(
+                        KnowledgeDebugItem(
+                            job_item_id=job_item_id,
+                            parent_label=item.parent_label,
+                            status=item_status,
+                            qa_count=qa_count,
+                            error_message=None,
+                            llm_result=llm_result_for_debug,
+                        )
                     )
                 else:
                     raise HTTPException(
@@ -819,18 +856,15 @@ def create_knowledge_job(
                         detail=f"unsupported item.source_type: {item.source_type}",
                     )
 
-
                 created_item_count += 1
-                total_plain_count += plain_count
                 total_qa_count += qa_count
 
             except Exception as e:
-
                 logger.exception(
                     "knowledge job item failed",
                     extra={
                         "job_id": job_id,
-                        "job_item_id": job_item_id
+                        "job_item_id": job_item_id,
                     }
                 )
 
@@ -851,6 +885,17 @@ def create_knowledge_job(
                         str(e),
                         job_item_id,
                     ),
+                )
+
+                debug_items.append(
+                    KnowledgeDebugItem(
+                        job_item_id=job_item_id,
+                        parent_label=item.parent_label,
+                        status="error",
+                        qa_count=0,
+                        error_message=str(e),
+                        llm_result=None,
+                    )
                 )
 
         finished_at = now_iso()
@@ -891,6 +936,7 @@ def create_knowledge_job(
             created_item_count=created_item_count,
             status=final_status,
             prompt_previews=prompt_previews,
+            debug_items=debug_items,
         )
 
     except sqlite3.IntegrityError as e:
@@ -899,6 +945,7 @@ def create_knowledge_job(
 
     except Exception as e:
         conn.rollback()
+        logger.exception("create_knowledge_job failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
