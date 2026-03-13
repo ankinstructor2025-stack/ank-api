@@ -110,13 +110,13 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
     content = res.choices[0].message.content or ""
     content = content.strip()
 
+    # コードフェンス除去
     if content.startswith("```"):
         content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
 
-    try:
-        return json.loads(content)
-    except Exception:
-        raise Exception("LLM returned invalid JSON")
+    return json.loads(content)
 
 
 def insert_qa_items_from_llm_result(
