@@ -172,13 +172,17 @@ def insert_qa_items_from_llm_result(
         if not isinstance(qa, dict):
             continue
 
-        question = normalize_text(qa.get("question"))
-        answer = normalize_text(qa.get("answer"))
+        question_raw = normalize_text(qa.get("question"))
+        answer_raw = normalize_text(qa.get("answer"))
 
-        if not question or not answer:
+        if not question_raw or not answer_raw:
             continue
 
-        content = f"[Q]\n{question}\n\n[A]\n{answer}"
+        content_raw = f"[Q]\n{question_raw}\n\n[A]\n{answer_raw}"
+
+        question_normalize = normalize_text(question_raw)
+        answer_normalize = normalize_text(answer_raw)
+        content_normalize = normalize_text(content_raw)
 
         conn.execute(
             """
@@ -195,6 +199,9 @@ def insert_qa_items_from_llm_result(
                 question,
                 answer,
                 content,
+                question_normalize,
+                answer_normalize,
+                content_normalize,
                 summary,
                 keywords,
                 language,
@@ -204,7 +211,7 @@ def insert_qa_items_from_llm_result(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -216,9 +223,12 @@ def insert_qa_items_from_llm_result(
                 None,
                 "qa",
                 None,
-                question,
-                answer,
-                content,
+                question_raw,
+                answer_raw,
+                content_raw,
+                question_normalize,
+                answer_normalize,
+                content_normalize,
                 None,
                 None,
                 "ja",
@@ -258,9 +268,11 @@ def insert_plain_items_from_llm_result(
         if not isinstance(item, dict):
             continue
 
-        content = normalize_text(item.get("content"))
-        if not content:
+        content_raw = normalize_text(item.get("content"))
+        if not content_raw:
             continue
+
+        content_normalize = normalize_text(content_raw)
 
         conn.execute(
             """
@@ -277,6 +289,9 @@ def insert_plain_items_from_llm_result(
                 question,
                 answer,
                 content,
+                question_normalize,
+                answer_normalize,
+                content_normalize,
                 summary,
                 keywords,
                 language,
@@ -286,7 +301,7 @@ def insert_plain_items_from_llm_result(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -300,7 +315,10 @@ def insert_plain_items_from_llm_result(
                 None,
                 None,
                 None,
-                content,
+                content_raw,
+                None,
+                None,
+                content_normalize,
                 None,
                 None,
                 "ja",
@@ -489,9 +507,13 @@ def insert_qa_candidate_items_from_row_data(
         if not answer:
             continue
 
-        question_text = q["speech_text"]
-        answer_text = answer["speech_text"]
-        merged_text = f"[Q]\n{question_text}\n\n[A]\n{answer_text}"
+        question_raw = q["speech_text"]
+        answer_raw = answer["speech_text"]
+        content_raw = f"[Q]\n{question_raw}\n\n[A]\n{answer_raw}"
+
+        question_normalize = normalize_text(question_raw)
+        answer_normalize = normalize_text(answer_raw)
+        content_normalize = normalize_text(content_raw)
 
         conn.execute(
             """
@@ -508,6 +530,9 @@ def insert_qa_candidate_items_from_row_data(
                 question,
                 answer,
                 content,
+                question_normalize,
+                answer_normalize,
+                content_normalize,
                 summary,
                 keywords,
                 language,
@@ -517,7 +542,7 @@ def insert_qa_candidate_items_from_row_data(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -529,9 +554,12 @@ def insert_qa_candidate_items_from_row_data(
                 q["row_id"],
                 "qa",
                 None,
-                question_text,
-                answer_text,
-                merged_text,
+                question_raw,
+                answer_raw,
+                content_raw,
+                question_normalize,
+                answer_normalize,
+                content_normalize,
                 None,
                 None,
                 "ja",
