@@ -26,6 +26,7 @@ JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
 KOKKAI_PLAIN_PROMPT_PATH = "template/kokkai_plain_prompt.txt"
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 def now_iso() -> str:
@@ -97,12 +98,69 @@ def extract_speaker(content_obj: dict) -> str:
     return normalize_text(content_obj.get("speaker"))
 
 
-def run_kokkai_llm(prompt_text: str, log_prefix: str) -> dict:
+def get_openai_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise Exception("OPENAI_API_KEY not set")
+    return OpenAI(api_key=api_key)
 
-    client = OpenAI(api_key=api_key)
+
+def embed_normalized_fields(
+    question_normalize: Optional[str],
+    answer_normalize: Optional[str],
+    content_normalize: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    question_normalize / answer_normalize / content_normalize をまとめて OpenAI Embedding に渡し、
+    JSON文字列で返す。
+    空文字はベクトル化しない。
+    """
+    targets = [
+        ("question", normalize_text(question_normalize)),
+        ("answer", normalize_text(answer_normalize)),
+        ("content", normalize_text(content_normalize)),
+    ]
+
+    inputs: list[str] = []
+    keys: list[str] = []
+
+    for key, text in targets:
+        if text:
+            keys.append(key)
+            inputs.append(text)
+
+    if not inputs:
+        return None, None, None
+
+    client = get_openai_client()
+
+    logger.info("EMBED request start: model=%s fields=%s", EMBEDDING_MODEL, ",".join(keys))
+
+    try:
+        res = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=inputs,
+            encoding_format="float",
+        )
+    except Exception:
+        logger.exception("EMBED generation failed")
+        raise
+
+    logger.info("EMBED response received: count=%s", len(res.data))
+
+    vector_map: dict[str, str] = {}
+    for key, item in zip(keys, res.data):
+        vector_map[key] = json.dumps(item.embedding, ensure_ascii=False)
+
+    return (
+        vector_map.get("question"),
+        vector_map.get("answer"),
+        vector_map.get("content"),
+    )
+
+
+def run_kokkai_llm(prompt_text: str, log_prefix: str) -> dict:
+    client = get_openai_client()
 
     try:
         logger.info("%s request start", log_prefix)
@@ -184,6 +242,12 @@ def insert_qa_items_from_llm_result(
         answer_normalize = normalize_text(answer_raw)
         content_normalize = normalize_text(content_raw)
 
+        question_vector, answer_vector, content_vector = embed_normalized_fields(
+            question_normalize=question_normalize,
+            answer_normalize=answer_normalize,
+            content_normalize=content_normalize,
+        )
+
         conn.execute(
             """
             INSERT INTO knowledge_items (
@@ -202,6 +266,9 @@ def insert_qa_items_from_llm_result(
                 question_normalize,
                 answer_normalize,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 summary,
                 keywords,
                 language,
@@ -211,7 +278,7 @@ def insert_qa_items_from_llm_result(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -229,6 +296,9 @@ def insert_qa_items_from_llm_result(
                 question_normalize,
                 answer_normalize,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 None,
                 None,
                 "ja",
@@ -274,6 +344,12 @@ def insert_plain_items_from_llm_result(
 
         content_normalize = normalize_text(content_raw)
 
+        question_vector, answer_vector, content_vector = embed_normalized_fields(
+            question_normalize=None,
+            answer_normalize=None,
+            content_normalize=content_normalize,
+        )
+
         conn.execute(
             """
             INSERT INTO knowledge_items (
@@ -292,6 +368,9 @@ def insert_plain_items_from_llm_result(
                 question_normalize,
                 answer_normalize,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 summary,
                 keywords,
                 language,
@@ -301,7 +380,7 @@ def insert_plain_items_from_llm_result(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -319,6 +398,9 @@ def insert_plain_items_from_llm_result(
                 None,
                 None,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 None,
                 None,
                 "ja",
@@ -515,6 +597,12 @@ def insert_qa_candidate_items_from_row_data(
         answer_normalize = normalize_text(answer_raw)
         content_normalize = normalize_text(content_raw)
 
+        question_vector, answer_vector, content_vector = embed_normalized_fields(
+            question_normalize=question_normalize,
+            answer_normalize=answer_normalize,
+            content_normalize=content_normalize,
+        )
+
         conn.execute(
             """
             INSERT INTO knowledge_items (
@@ -533,6 +621,9 @@ def insert_qa_candidate_items_from_row_data(
                 question_normalize,
                 answer_normalize,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 summary,
                 keywords,
                 language,
@@ -542,7 +633,7 @@ def insert_qa_candidate_items_from_row_data(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id(),
@@ -560,6 +651,9 @@ def insert_qa_candidate_items_from_row_data(
                 question_normalize,
                 answer_normalize,
                 content_normalize,
+                question_vector,
+                answer_vector,
+                content_vector,
                 None,
                 None,
                 "ja",
