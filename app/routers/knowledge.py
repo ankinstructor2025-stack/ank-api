@@ -16,6 +16,9 @@ import firebase_admin
 from firebase_admin import auth as fb_auth
 from openai import OpenAI
 
+import logging
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -99,24 +102,29 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
 
     client = OpenAI(api_key=api_key)
 
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        messages=[
-            {"role": "user", "content": prompt_text}
-        ]
-    )
+    try:
 
-    content = res.choices[0].message.content or ""
-    content = content.strip()
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[{"role": "user", "content": prompt_text}]
+        )
 
-    # コードフェンス除去
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
+        content = res.choices[0].message.content or ""
+        content = content.strip()
 
-    return json.loads(content)
+        if content.startswith("```"):
+            parts = content.split("```")
+            if len(parts) >= 2:
+                content = parts[1]
+
+        content = content.replace("json", "", 1).strip()
+
+        return json.loads(content)
+
+    except Exception as e:
+        logger.exception("LLM QA generation failed")
+        raise
 
 
 def insert_qa_items_from_llm_result(
@@ -817,6 +825,15 @@ def create_knowledge_job(
                 total_qa_count += qa_count
 
             except Exception as e:
+
+                logger.exception(
+                    "knowledge job item failed",
+                    extra={
+                        "job_id": job_id,
+                        "job_item_id": job_item_id
+                    }
+                )
+
                 finished_at = now_iso()
                 total_error_count += 1
 
