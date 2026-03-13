@@ -104,6 +104,8 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
     client = OpenAI(api_key=api_key)
 
     try:
+        logger.info("LLM request start")
+
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
@@ -112,10 +114,13 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
             ],
         )
 
+        logger.info("LLM response received")
+
         content = res.choices[0].message.content or ""
         content = content.strip()
 
-        # ```json ... ``` の除去
+        logger.info("LLM raw content: %s", content[:2000])
+
         if content.startswith("```"):
             lines = content.splitlines()
             if lines and lines[0].startswith("```"):
@@ -127,9 +132,10 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
         if content.lower().startswith("json"):
             content = content[4:].strip()
 
-        logger.info("LLM raw response (head 2000 chars): %s", content[:2000])
+        result = json.loads(content)
 
-        return json.loads(content)
+        logger.info("LLM JSON parse success")
+        return result
 
     except Exception:
         logger.exception("LLM QA generation failed")
@@ -860,16 +866,9 @@ def create_knowledge_job(
                 total_qa_count += qa_count
 
             except Exception as e:
-                logger.exception(
-                    "knowledge job item failed",
-                    extra={
-                        "job_id": job_id,
-                        "job_item_id": job_item_id,
-                    }
-                )
+                logger.exception("knowledge job item failed: job_id=%s job_item_id=%s", job_id, job_item_id)
 
                 finished_at = now_iso()
-                total_error_count += 1
 
                 conn.execute(
                     """
@@ -887,16 +886,7 @@ def create_knowledge_job(
                     ),
                 )
 
-                debug_items.append(
-                    KnowledgeDebugItem(
-                        job_item_id=job_item_id,
-                        parent_label=item.parent_label,
-                        status="error",
-                        qa_count=0,
-                        error_message=str(e),
-                        llm_result=None,
-                    )
-                )
+                raise
 
         finished_at = now_iso()
         final_status = (
