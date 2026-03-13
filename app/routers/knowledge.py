@@ -25,6 +25,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
+KOKKAI_PLAIN_PROMPT_PATH = "template/kokkai_plain_prompt.txt"
 
 
 def now_iso() -> str:
@@ -96,7 +97,7 @@ def extract_speaker(content_obj: dict) -> str:
     return normalize_text(content_obj.get("speaker"))
 
 
-def run_kokkai_qa_llm(prompt_text: str) -> dict:
+def run_kokkai_llm(prompt_text: str, log_prefix: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise Exception("OPENAI_API_KEY not set")
@@ -104,7 +105,7 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
     client = OpenAI(api_key=api_key)
 
     try:
-        logger.info("LLM request start")
+        logger.info("%s request start", log_prefix)
 
         res = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -114,12 +115,12 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
             ],
         )
 
-        logger.info("LLM response received")
+        logger.info("%s response received", log_prefix)
 
         content = res.choices[0].message.content or ""
         content = content.strip()
 
-        logger.info("LLM raw content: %s", content[:2000])
+        logger.info("%s raw content: %s", log_prefix, content[:2000])
 
         if content.startswith("```"):
             lines = content.splitlines()
@@ -134,12 +135,20 @@ def run_kokkai_qa_llm(prompt_text: str) -> dict:
 
         result = json.loads(content)
 
-        logger.info("LLM JSON parse success")
+        logger.info("%s JSON parse success", log_prefix)
         return result
 
     except Exception:
-        logger.exception("LLM QA generation failed")
+        logger.exception("%s generation failed", log_prefix)
         raise
+
+
+def run_kokkai_qa_llm(prompt_text: str) -> dict:
+    return run_kokkai_llm(prompt_text, "LLM QA")
+
+
+def run_kokkai_plain_llm(prompt_text: str) -> dict:
+    return run_kokkai_llm(prompt_text, "LLM PLAIN")
 
 
 def insert_qa_items_from_llm_result(
@@ -228,6 +237,88 @@ def insert_qa_items_from_llm_result(
     return inserted_count
 
 
+def insert_plain_items_from_llm_result(
+    conn: sqlite3.Connection,
+    job_id: str,
+    job_item_id: str,
+    source_type: str,
+    source_id: str,
+    llm_result: dict,
+) -> int:
+    plain_list = llm_result.get("plain_list") or []
+
+    if not isinstance(plain_list, list):
+        raise Exception("plain_list is not list")
+
+    inserted_count = 0
+    now = now_iso()
+    sort_no = 300000
+
+    for item in plain_list:
+        if not isinstance(item, dict):
+            continue
+
+        content = normalize_text(item.get("content"))
+        if not content:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO knowledge_items (
+                knowledge_id,
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                source_item_id,
+                row_id,
+                knowledge_type,
+                title,
+                question,
+                answer,
+                content,
+                summary,
+                keywords,
+                language,
+                sort_no,
+                status,
+                review_status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                job_id,
+                job_item_id,
+                source_type,
+                source_id,
+                None,
+                None,
+                "plain",
+                None,
+                None,
+                None,
+                content,
+                None,
+                None,
+                "ja",
+                sort_no,
+                "active",
+                "new",
+                now,
+                now,
+            ),
+        )
+
+        inserted_count += 1
+        sort_no += 1
+
+    logger.info("insert_plain_items_from_llm_result: job_item_id=%s plain_count=%s", job_item_id, inserted_count)
+    return inserted_count
+
+
 def load_template_text(path: str) -> str:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -242,6 +333,7 @@ def load_template_text(path: str) -> str:
 def build_kokkai_prompt_text_from_contents(
     conn: sqlite3.Connection,
     job_item_id: str,
+    template_path: str,
 ) -> str:
     cur = conn.execute(
         """
@@ -264,7 +356,7 @@ def build_kokkai_prompt_text_from_contents(
     if not item:
         raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
 
-    prompt_template = load_template_text(KOKKAI_QA_PROMPT_PATH).strip()
+    prompt_template = load_template_text(template_path).strip()
 
     cur = conn.execute(
         """
@@ -522,91 +614,6 @@ def insert_kokkai_contents(
     return inserted_count
 
 
-def insert_plain_items_from_contents(
-    conn: sqlite3.Connection,
-    job_id: str,
-    job_item_id: str,
-    source_type: str,
-    source_id: str,
-) -> int:
-    cur = conn.execute(
-        """
-        SELECT
-            source_item_id,
-            row_id,
-            content_type,
-            content_text,
-            sort_no
-        FROM knowledge_contents
-        WHERE job_id = ?
-          AND job_item_id = ?
-        ORDER BY sort_no
-        """,
-        (job_id, job_item_id),
-    )
-    rows = cur.fetchall()
-
-    inserted_count = 0
-    now = now_iso()
-
-    for row in rows:
-        if (row["content_type"] or "") != "speech":
-            continue
-
-        conn.execute(
-            """
-            INSERT INTO knowledge_items (
-                knowledge_id,
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                knowledge_type,
-                title,
-                question,
-                answer,
-                content,
-                summary,
-                keywords,
-                language,
-                sort_no,
-                status,
-                review_status,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                new_id(),
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                row["source_item_id"],
-                row["row_id"],
-                "plain",
-                None,
-                None,
-                None,
-                row["content_text"],
-                None,
-                None,
-                "ja",
-                row["sort_no"],
-                "active",
-                "new",
-                now,
-                now,
-            ),
-        )
-        inserted_count += 1
-
-    return inserted_count
-
-
 class KnowledgeTargetItem(BaseModel):
     source_type: str = Field(..., description="kokkai / opendata / public_url / upload")
     parent_source_id: Optional[str] = None
@@ -628,6 +635,7 @@ class PromptPreviewItem(BaseModel):
     job_item_id: str
     parent_source_id: Optional[str] = None
     parent_label: Optional[str] = None
+    prompt_type: str
     prompt_text: str
 
 
@@ -636,6 +644,7 @@ class KnowledgeDebugItem(BaseModel):
     parent_label: Optional[str] = None
     status: str
     qa_count: int = 0
+    plain_count: int = 0
     error_message: Optional[str] = None
     llm_result: Optional[Any] = None
 
@@ -782,7 +791,9 @@ def create_knowledge_job(
 
             try:
                 qa_count = 0
-                llm_result_for_debug: Optional[dict] = None
+                plain_count = 0
+                qa_llm_result_for_debug: Optional[dict] = None
+                plain_llm_result_for_debug: Optional[dict] = None
 
                 if item.source_type == "kokkai":
                     source_id = item.parent_source_id or ""
@@ -796,9 +807,16 @@ def create_knowledge_job(
                         source_id=source_id,
                     )
 
-                    prompt_text = build_kokkai_prompt_text_from_contents(
+                    qa_prompt_text = build_kokkai_prompt_text_from_contents(
                         conn=conn,
                         job_item_id=job_item_id,
+                        template_path=KOKKAI_QA_PROMPT_PATH,
+                    )
+
+                    plain_prompt_text = build_kokkai_prompt_text_from_contents(
+                        conn=conn,
+                        job_item_id=job_item_id,
+                        template_path=KOKKAI_PLAIN_PROMPT_PATH,
                     )
 
                     prompt_previews.append(
@@ -806,16 +824,27 @@ def create_knowledge_job(
                             job_item_id=job_item_id,
                             parent_source_id=item.parent_source_id,
                             parent_label=item.parent_label,
-                            prompt_text=prompt_text,
+                            prompt_type="qa",
+                            prompt_text=qa_prompt_text,
+                        )
+                    )
+
+                    prompt_previews.append(
+                        PromptPreviewItem(
+                            job_item_id=job_item_id,
+                            parent_source_id=item.parent_source_id,
+                            parent_label=item.parent_label,
+                            prompt_type="plain",
+                            prompt_text=plain_prompt_text,
                         )
                     )
 
                     if not body.preview_only:
-                        llm_result = run_kokkai_qa_llm(prompt_text)
-                        llm_result_for_debug = llm_result
+                        qa_llm_result = run_kokkai_qa_llm(qa_prompt_text)
+                        qa_llm_result_for_debug = qa_llm_result
 
-                        if llm_result.get("job_item_id") not in (None, "", job_item_id):
-                            raise Exception("job_item_id mismatch")
+                        if qa_llm_result.get("job_item_id") not in (None, "", job_item_id):
+                            raise Exception("qa job_item_id mismatch")
 
                         qa_count = insert_qa_items_from_llm_result(
                             conn=conn,
@@ -823,7 +852,22 @@ def create_knowledge_job(
                             job_item_id=job_item_id,
                             source_type="kokkai",
                             source_id=source_id,
-                            llm_result=llm_result,
+                            llm_result=qa_llm_result,
+                        )
+
+                        plain_llm_result = run_kokkai_plain_llm(plain_prompt_text)
+                        plain_llm_result_for_debug = plain_llm_result
+
+                        if plain_llm_result.get("job_item_id") not in (None, "", job_item_id):
+                            raise Exception("plain job_item_id mismatch")
+
+                        plain_count = insert_plain_items_from_llm_result(
+                            conn=conn,
+                            job_id=job_id,
+                            job_item_id=job_item_id,
+                            source_type="kokkai",
+                            source_id=source_id,
+                            llm_result=plain_llm_result,
                         )
 
                     finished_at = now_iso()
@@ -840,7 +884,7 @@ def create_knowledge_job(
                         """,
                         (
                             item_status,
-                            qa_count,
+                            qa_count + plain_count,
                             finished_at,
                             job_item_id,
                         ),
@@ -852,8 +896,12 @@ def create_knowledge_job(
                             parent_label=item.parent_label,
                             status=item_status,
                             qa_count=qa_count,
+                            plain_count=plain_count,
                             error_message=None,
-                            llm_result=llm_result_for_debug,
+                            llm_result={
+                                "qa": qa_llm_result_for_debug,
+                                "plain": plain_llm_result_for_debug,
+                            },
                         )
                     )
                 else:
@@ -864,6 +912,7 @@ def create_knowledge_job(
 
                 created_item_count += 1
                 total_qa_count += qa_count
+                total_plain_count += plain_count
 
             except Exception as e:
                 logger.exception("knowledge job item failed: job_id=%s job_item_id=%s", job_id, job_item_id)
