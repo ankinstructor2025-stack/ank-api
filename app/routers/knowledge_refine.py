@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import logging
 from typing import Optional, List
@@ -10,6 +11,7 @@ from datetime import datetime
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 from google.cloud import storage
+from openai import OpenAI
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -21,6 +23,7 @@ router = APIRouter(prefix="/knowledge/refine", tags=["knowledge_refine"])
 
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 def user_db_path(uid: str) -> str:
@@ -57,6 +60,68 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         return uid
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
+
+
+def normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return " ".join(str(text).split()).strip()
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+    return OpenAI(api_key=api_key)
+
+
+def embed_normalized_fields(
+    question_normalize: Optional[str],
+    answer_normalize: Optional[str],
+    content_normalize: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    targets = [
+        ("question", normalize_text(question_normalize)),
+        ("answer", normalize_text(answer_normalize)),
+        ("content", normalize_text(content_normalize)),
+    ]
+
+    inputs: list[str] = []
+    keys: list[str] = []
+
+    for key, text in targets:
+        if text:
+            keys.append(key)
+            inputs.append(text)
+
+    if not inputs:
+        return None, None, None
+
+    client = get_openai_client()
+
+    logger.info("EMBED request start: model=%s fields=%s", EMBEDDING_MODEL, ",".join(keys))
+
+    try:
+        res = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=inputs,
+            encoding_format="float",
+        )
+    except Exception:
+        logger.exception("EMBED generation failed")
+        raise
+
+    logger.info("EMBED response received: count=%s", len(res.data))
+
+    vector_map: dict[str, str] = {}
+    for key, item in zip(keys, res.data):
+        vector_map[key] = json.dumps(item.embedding, ensure_ascii=False)
+
+    return (
+        vector_map.get("question"),
+        vector_map.get("answer"),
+        vector_map.get("content"),
+    )
 
 
 class RefineJobRow(BaseModel):
@@ -252,6 +317,90 @@ def update_item_statuses_for_job(
 
     cur = conn.execute(sql, params)
     return cur.rowcount or 0
+
+
+def vectorize_knowledge_items_for_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+) -> int:
+    table_name = get_existing_table_name(conn, ["knowledge_items"])
+    if not table_name:
+        raise HTTPException(status_code=404, detail="knowledge_items table not found")
+
+    columns = get_table_columns(conn, table_name)
+    required_columns = {
+        "knowledge_id",
+        "job_id",
+        "question_normalize",
+        "answer_normalize",
+        "content_normalize",
+        "question_vector",
+        "answer_vector",
+        "content_vector",
+    }
+    missing = [c for c in required_columns if c not in columns]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"knowledge_items missing columns: {', '.join(missing)}",
+        )
+
+    update_sets = []
+    if "updated_at" in columns:
+        update_sets.append("updated_at = ?")
+    if "review_status" in columns:
+        update_sets.append("review_status = COALESCE(review_status, 'new')")
+
+    updated_count = 0
+
+    cur = conn.execute(
+        """
+        SELECT
+            knowledge_id,
+            question_normalize,
+            answer_normalize,
+            content_normalize
+        FROM knowledge_items
+        WHERE job_id = ?
+        ORDER BY sort_no ASC, knowledge_id ASC
+        """,
+        (job_id,),
+    )
+    rows = cur.fetchall()
+
+    for row in rows:
+        question_vector, answer_vector, content_vector = embed_normalized_fields(
+            question_normalize=row["question_normalize"],
+            answer_normalize=row["answer_normalize"],
+            content_normalize=row["content_normalize"],
+        )
+
+        params: list[object] = [
+            question_vector,
+            answer_vector,
+            content_vector,
+        ]
+
+        sql = """
+            UPDATE knowledge_items
+            SET
+                question_vector = ?,
+                answer_vector = ?,
+                content_vector = ?
+        """
+
+        if update_sets:
+            sql += ", " + ", ".join(update_sets)
+            if "updated_at" in columns:
+                params.append(now_jst_iso())
+
+        sql += " WHERE knowledge_id = ?"
+        params.append(row["knowledge_id"])
+
+        conn.execute(sql, params)
+        updated_count += 1
+
+    return updated_count
 
 
 @router.get("/jobs", response_model=RefineJobListResponse)
@@ -552,6 +701,60 @@ def normalize_refine_job(
     except Exception as e:
         conn.rollback()
         logger.exception("normalize_refine_job failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        conn.close()
+
+
+@router.post("/jobs/{job_id}/vectorize", response_model=RefineActionResponse)
+def vectorize_refine_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+    local_db_path = download_user_db(uid)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        job_row = ensure_job_exists(conn, job_id)
+
+        current_status = str(job_row["status"] or "").lower()
+        if current_status not in {"normalized", "normalize_done"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"vectorize is not allowed for status={job_row['status']}",
+            )
+
+        vectorized_count = vectorize_knowledge_items_for_job(conn, job_id)
+
+        update_job_status(conn, job_id, "vectorized")
+        update_item_statuses_for_job(conn, job_id, "vectorized")
+
+        conn.commit()
+        upload_user_db(uid, local_db_path)
+
+        return RefineActionResponse(
+            ok=True,
+            job_id=job_id,
+            action="vectorize",
+            status="vectorized",
+            message=f"vectorized: {vectorized_count}",
+        )
+
+    except HTTPException:
+        raise
+
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.exception("vectorize_refine_job sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("vectorize_refine_job failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
