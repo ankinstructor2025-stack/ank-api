@@ -5,6 +5,7 @@ import sqlite3
 import logging
 from typing import Optional, List
 from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
@@ -24,6 +25,10 @@ BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
+
+
+def now_jst_iso() -> str:
+    return datetime.now(JST).isoformat(timespec="seconds")
 
 
 def ensure_firebase_initialized():
@@ -97,6 +102,14 @@ class RefineJobItemListResponse(BaseModel):
     total_count: int
 
 
+class RefineActionResponse(BaseModel):
+    ok: bool
+    job_id: str
+    action: str
+    status: str
+    message: str
+
+
 def download_user_db(uid: str) -> str:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -114,6 +127,15 @@ def download_user_db(uid: str) -> str:
     return local_db_path
 
 
+def upload_user_db(uid: str, local_db_path: str) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    blob = bucket.blob(db_gcs_path)
+    blob.upload_from_filename(local_db_path, content_type="application/octet-stream")
+
+
 def get_existing_table_name(conn: sqlite3.Connection, candidates: list[str]) -> Optional[str]:
     for table_name in candidates:
         cur = conn.execute(
@@ -129,6 +151,107 @@ def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     cur = conn.execute(f"PRAGMA table_info({table_name})")
     rows = cur.fetchall()
     return {row["name"] for row in rows}
+
+
+def ensure_job_exists(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row:
+    cur = conn.execute(
+        """
+        SELECT
+            job_id,
+            source_type,
+            source_name,
+            request_type,
+            status,
+            selected_count,
+            qa_count,
+            plain_count,
+            error_count,
+            requested_at,
+            started_at,
+            finished_at,
+            error_message
+        FROM knowledge_jobs
+        WHERE job_id = ?
+        """,
+        (job_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+    return row
+
+
+def update_job_status(
+    conn: sqlite3.Connection,
+    job_id: str,
+    new_status: str,
+) -> None:
+    columns = get_table_columns(conn, "knowledge_jobs")
+    now_text = now_jst_iso()
+
+    sets: list[str] = ["status = ?"]
+    params: list[object] = [new_status]
+
+    if "started_at" in columns:
+        sets.append("started_at = COALESCE(started_at, ?)")
+        params.append(now_text)
+
+    if "finished_at" in columns:
+        sets.append("finished_at = ?")
+        params.append(now_text)
+
+    if "error_message" in columns:
+        sets.append("error_message = NULL")
+
+    sql = f"""
+        UPDATE knowledge_jobs
+        SET {", ".join(sets)}
+        WHERE job_id = ?
+    """
+    params.append(job_id)
+    conn.execute(sql, params)
+
+
+def update_item_statuses_for_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+    new_status: str,
+) -> int:
+    table_name = get_existing_table_name(
+        conn,
+        ["knowledge_job_items", "job_items", "knowledge_items"],
+    )
+    if not table_name:
+        return 0
+
+    columns = get_table_columns(conn, table_name)
+    if "job_id" not in columns or "status" not in columns:
+        return 0
+
+    now_text = now_jst_iso()
+    sets: list[str] = ["status = ?"]
+    params: list[object] = [new_status]
+
+    if "started_at" in columns:
+        sets.append("started_at = COALESCE(started_at, ?)")
+        params.append(now_text)
+
+    if "finished_at" in columns:
+        sets.append("finished_at = ?")
+        params.append(now_text)
+
+    if "error_message" in columns:
+        sets.append("error_message = NULL")
+
+    sql = f"""
+        UPDATE {table_name}
+        SET {", ".join(sets)}
+        WHERE job_id = ?
+    """
+    params.append(job_id)
+
+    cur = conn.execute(sql, params)
+    return cur.rowcount or 0
 
 
 @router.get("/jobs", response_model=RefineJobListResponse)
@@ -377,6 +500,58 @@ def list_refine_job_items(
 
     except Exception as e:
         logger.exception("list_refine_job_items failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        conn.close()
+
+
+@router.post("/jobs/{job_id}/normalize", response_model=RefineActionResponse)
+def normalize_refine_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+    local_db_path = download_user_db(uid)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        job_row = ensure_job_exists(conn, job_id)
+
+        current_status = str(job_row["status"] or "").lower()
+        if current_status not in {"new", "ready"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"normalize is not allowed for status={job_row['status']}",
+            )
+
+        update_job_status(conn, job_id, "normalized")
+        update_item_statuses_for_job(conn, job_id, "normalized")
+
+        conn.commit()
+        upload_user_db(uid, local_db_path)
+
+        return RefineActionResponse(
+            ok=True,
+            job_id=job_id,
+            action="normalize",
+            status="normalized",
+            message="normalized",
+        )
+
+    except HTTPException:
+        raise
+
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.exception("normalize_refine_job sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("normalize_refine_job failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
