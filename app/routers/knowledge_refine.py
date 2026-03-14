@@ -205,6 +205,333 @@ def upload_user_db(uid: str, local_db_path: str) -> None:
     blob.upload_from_filename(local_db_path, content_type="application/octet-stream")
 
 
+def knowledge_template_db_path() -> str:
+    return "template/knowledge_template.sqlite"
+
+
+def build_knowledge_db_filename() -> str:
+    return f"knowledge_{datetime.now(JST).strftime('%Y%m%d%H%M%S')}.sqlite"
+
+
+def knowledge_db_path(uid: str, filename: str) -> str:
+    return f"users/{uid}/{filename}"
+
+
+def download_knowledge_template_db(local_path: str) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    blob = bucket.blob(knowledge_template_db_path())
+    if not blob.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"knowledge template not found: {knowledge_template_db_path()}",
+        )
+
+    blob.download_to_filename(local_path)
+
+
+def upload_knowledge_db(uid: str, local_path: str, filename: str) -> str:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    gcs_path = knowledge_db_path(uid, filename)
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path, content_type="application/octet-stream")
+    return gcs_path
+
+
+def embed_search_text(search_text: str | None) -> Optional[str]:
+    text = normalize_text(search_text)
+    if not text:
+        return None
+
+    client = get_openai_client()
+
+    try:
+        res = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=[text],
+            encoding_format="float",
+        )
+    except Exception:
+        logger.exception("embed_search_text failed")
+        raise
+
+    if not res.data:
+        return None
+
+    return json.dumps(res.data[0].embedding, ensure_ascii=False)
+
+
+def build_search_text_from_row(row: sqlite3.Row) -> str:
+    parts: list[str] = []
+
+    title = normalize_text(row["title"] if "title" in row.keys() else None)
+    question = normalize_text(row["question"] if "question" in row.keys() else None)
+    answer = normalize_text(row["answer"] if "answer" in row.keys() else None)
+    content = normalize_text(row["content"] if "content" in row.keys() else None)
+
+    if title:
+        parts.append(title)
+    if question:
+        parts.append(question)
+    if answer:
+        parts.append(answer)
+    if content:
+        parts.append(content)
+
+    return "\n".join(parts).strip()
+
+
+def build_entry_title(row: sqlite3.Row) -> str:
+    candidates = [
+        row["title"] if "title" in row.keys() else None,
+        row["question"] if "question" in row.keys() else None,
+        row["content"] if "content" in row.keys() else None,
+        row["source_item_id"] if "source_item_id" in row.keys() else None,
+    ]
+
+    for value in candidates:
+        text = normalize_text(value)
+        if text:
+            return text[:120]
+
+    return ""
+
+
+def build_entry_embedding_json(row: sqlite3.Row, search_text: str) -> Optional[str]:
+    knowledge_type = str(row["knowledge_type"] or "").lower()
+
+    if knowledge_type == "qa":
+        merged = mean_vectors([
+            parse_vector(row["question_vector"]),
+            parse_vector(row["answer_vector"]),
+        ])
+        if merged:
+            return json.dumps(merged, ensure_ascii=False)
+
+    if knowledge_type == "plain":
+        content_vec = parse_vector(row["content_vector"])
+        if content_vec:
+            return json.dumps(content_vec, ensure_ascii=False)
+
+    return embed_search_text(search_text)
+
+
+def upsert_knowledge_meta(
+    conn: sqlite3.Connection,
+    meta_key: str,
+    meta_value: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO knowledge_meta(meta_key, meta_value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(meta_key)
+        DO UPDATE SET
+            meta_value = excluded.meta_value,
+            updated_at = excluded.updated_at
+        """,
+        (meta_key, meta_value, now_jst_iso()),
+    )
+
+
+def build_knowledge_db_for_job(
+    conn: sqlite3.Connection,
+    uid: str,
+    job_id: str,
+) -> dict[str, object]:
+    columns = get_table_columns(conn, "knowledge_items")
+    required_columns = {
+        "knowledge_id",
+        "job_id",
+        "knowledge_type",
+        "title",
+        "question",
+        "answer",
+        "content",
+        "question_vector",
+        "answer_vector",
+        "content_vector",
+        "source_type",
+        "source_item_id",
+        "language",
+        "sort_no",
+        "status",
+        "is_duplicate",
+    }
+    missing = [c for c in required_columns if c not in columns]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"knowledge_items missing columns: {', '.join(missing)}",
+        )
+
+    cur = conn.execute(
+        """
+        SELECT
+            knowledge_id,
+            job_id,
+            knowledge_type,
+            title,
+            question,
+            answer,
+            content,
+            question_vector,
+            answer_vector,
+            content_vector,
+            source_type,
+            source_item_id,
+            language,
+            sort_no
+        FROM knowledge_items
+        WHERE job_id = ?
+          AND status = 'active'
+          AND COALESCE(is_duplicate, 0) = 0
+        ORDER BY sort_no ASC, knowledge_id ASC
+        """,
+        (job_id,),
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=409,
+            detail="build target not found. no active representative knowledge_items",
+        )
+
+    filename = build_knowledge_db_filename()
+    local_knowledge_db_path = f"/tmp/{filename}"
+
+    download_knowledge_template_db(local_knowledge_db_path)
+
+    kconn = sqlite3.connect(local_knowledge_db_path)
+    kconn.row_factory = sqlite3.Row
+
+    try:
+        entry_columns = get_table_columns(kconn, "knowledge_entries")
+        required_entry_columns = {
+            "entry_id",
+            "job_id",
+            "knowledge_id",
+            "knowledge_type",
+            "title",
+            "question",
+            "answer",
+            "content",
+            "search_text",
+            "embedding",
+            "source_type",
+            "source_item_id",
+            "source_label",
+            "language",
+            "sort_no",
+            "created_at",
+            "updated_at",
+        }
+        missing_entry_columns = [c for c in required_entry_columns if c not in entry_columns]
+        if missing_entry_columns:
+            raise HTTPException(
+                status_code=500,
+                detail=f"knowledge_entries missing columns: {', '.join(missing_entry_columns)}",
+            )
+
+        kconn.execute("DELETE FROM knowledge_entries")
+
+        entry_count = 0
+        qa_count = 0
+        plain_count = 0
+
+        for row in rows:
+            knowledge_type = str(row["knowledge_type"] or "").lower()
+            title = build_entry_title(row)
+            search_text = build_search_text_from_row(row)
+            embedding_json = build_entry_embedding_json(row, search_text)
+
+            source_label = title or normalize_text(row["source_item_id"])
+
+            kconn.execute(
+                """
+                INSERT INTO knowledge_entries (
+                    entry_id,
+                    job_id,
+                    knowledge_id,
+                    knowledge_type,
+                    title,
+                    question,
+                    answer,
+                    content,
+                    search_text,
+                    embedding,
+                    source_type,
+                    source_item_id,
+                    source_label,
+                    language,
+                    sort_no,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["knowledge_id"]),
+                    job_id,
+                    str(row["knowledge_id"]),
+                    knowledge_type,
+                    title or None,
+                    row["question"],
+                    row["answer"],
+                    row["content"],
+                    search_text,
+                    embedding_json,
+                    row["source_type"],
+                    row["source_item_id"],
+                    source_label or None,
+                    row["language"],
+                    row["sort_no"],
+                    now_jst_iso(),
+                    now_jst_iso(),
+                ),
+            )
+
+            entry_count += 1
+            if knowledge_type == "qa":
+                qa_count += 1
+            elif knowledge_type == "plain":
+                plain_count += 1
+
+        if get_existing_table_name(kconn, ["knowledge_fts"]):
+            kconn.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')")
+
+        if get_existing_table_name(kconn, ["knowledge_meta"]):
+            upsert_knowledge_meta(kconn, "db_version", "1")
+            upsert_knowledge_meta(kconn, "built_at", now_jst_iso())
+            upsert_knowledge_meta(kconn, "source_job_id", job_id)
+            upsert_knowledge_meta(kconn, "entry_count", str(entry_count))
+            upsert_knowledge_meta(kconn, "qa_count", str(qa_count))
+            upsert_knowledge_meta(kconn, "plain_count", str(plain_count))
+
+        kconn.commit()
+
+    except Exception:
+        kconn.rollback()
+        raise
+
+    finally:
+        kconn.close()
+
+    gcs_path = upload_knowledge_db(uid, local_knowledge_db_path, filename)
+
+    return {
+        "filename": filename,
+        "gcs_path": gcs_path,
+        "entry_count": entry_count,
+        "qa_count": qa_count,
+        "plain_count": plain_count,
+    }
+
+
 def get_existing_table_name(conn: sqlite3.Connection, candidates: list[str]) -> Optional[str]:
     for table_name in candidates:
         cur = conn.execute(
@@ -1383,3 +1710,61 @@ def deduplicate_refine_job(
 
     finally:
         conn.close()
+
+@router.post("/jobs/{job_id}/build-knowledge-db", response_model=RefineActionResponse)
+def build_knowledge_db_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+    local_db_path = download_user_db(uid)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        job_row = ensure_job_exists(conn, job_id)
+
+        current_status = str(job_row["status"] or "").lower()
+        if current_status not in {"deduplicated", "knowledge_db_created"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"build-knowledge-db is not allowed for status={job_row['status']}",
+            )
+
+        result = build_knowledge_db_for_job(conn, uid, job_id)
+
+        update_job_status(conn, job_id, "knowledge_db_created")
+
+        conn.commit()
+        upload_user_db(uid, local_db_path)
+
+        return RefineActionResponse(
+            ok=True,
+            job_id=job_id,
+            action="build-knowledge-db",
+            status="knowledge_db_created",
+            message=(
+                f"knowledge db created: {result['filename']} / "
+                f"entries={result['entry_count']} / "
+                f"qa={result['qa_count']} / "
+                f"plain={result['plain_count']}"
+            ),
+        )
+
+    except HTTPException:
+        raise
+
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.exception("build_knowledge_db_job sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("build_knowledge_db_job failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        conn.close()
+
