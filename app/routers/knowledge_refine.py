@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import sqlite3
 import logging
 from typing import Optional, List
@@ -24,6 +25,9 @@ router = APIRouter(prefix="/knowledge/refine", tags=["knowledge_refine"])
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+QA_DEDUP_THRESHOLD = float(os.getenv("KNOWLEDGE_QA_DEDUP_THRESHOLD", "0.85"))
+PLAIN_DEDUP_THRESHOLD = float(os.getenv("KNOWLEDGE_PLAIN_DEDUP_THRESHOLD", "0.95"))
 
 
 def user_db_path(uid: str) -> str:
@@ -403,6 +407,486 @@ def vectorize_knowledge_items_for_job(
     return updated_count
 
 
+def parse_vector(value: Optional[str]) -> Optional[list[float]]:
+    if not value:
+        return None
+
+    try:
+        data = json.loads(value)
+    except Exception:
+        return None
+
+    if not isinstance(data, list) or not data:
+        return None
+
+    try:
+        return [float(x) for x in data]
+    except Exception:
+        return None
+
+
+def mean_vectors(vectors: list[Optional[list[float]]]) -> Optional[list[float]]:
+    valid = [v for v in vectors if v]
+    if not valid:
+        return None
+
+    dim = len(valid[0])
+    if any(len(v) != dim for v in valid):
+        return None
+
+    result = [0.0] * dim
+    for vec in valid:
+        for i, x in enumerate(vec):
+            result[i] += x
+
+    size = float(len(valid))
+    return [x / size for x in result]
+
+
+def cosine_similarity(vec1: Optional[list[float]], vec2: Optional[list[float]]) -> float:
+    if not vec1 or not vec2:
+        return -1.0
+    if len(vec1) != len(vec2):
+        return -1.0
+
+    dot = 0.0
+    norm1 = 0.0
+    norm2 = 0.0
+
+    for a, b in zip(vec1, vec2):
+        dot += a * b
+        norm1 += a * a
+        norm2 += b * b
+
+    if norm1 <= 0.0 or norm2 <= 0.0:
+        return -1.0
+
+    return dot / (math.sqrt(norm1) * math.sqrt(norm2))
+
+
+def build_qa_vector(row: sqlite3.Row) -> Optional[list[float]]:
+    qv = parse_vector(row["question_vector"])
+    av = parse_vector(row["answer_vector"])
+    return mean_vectors([qv, av])
+
+
+def build_plain_vector(row: sqlite3.Row) -> Optional[list[float]]:
+    return parse_vector(row["content_vector"])
+
+
+def choose_representative(rows: list[sqlite3.Row]) -> sqlite3.Row:
+    def score(row: sqlite3.Row) -> tuple[int, int, int, str]:
+        question = normalize_text(row["question"] if "question" in row.keys() else "")
+        answer = normalize_text(row["answer"] if "answer" in row.keys() else "")
+        content = normalize_text(row["content"] if "content" in row.keys() else "")
+        total_len = len(question) + len(answer) + len(content)
+        has_answer = 1 if answer else 0
+        sort_no = int(row["sort_no"] or 0)
+        knowledge_id = str(row["knowledge_id"])
+        return (has_answer, total_len, -sort_no, knowledge_id)
+
+    return max(rows, key=score)
+
+
+def build_group_id(job_id: str, knowledge_type: str, seq_no: int) -> str:
+    prefix = "QG" if knowledge_type == "qa" else "PG"
+    return f"{job_id}_{prefix}_{seq_no:04d}"
+
+
+def cluster_rows_by_similarity(
+    rows: list[sqlite3.Row],
+    vector_builder,
+    threshold: float,
+) -> list[list[sqlite3.Row]]:
+    if not rows:
+        return []
+
+    parent: dict[str, str] = {str(row["knowledge_id"]): str(row["knowledge_id"]) for row in rows}
+    vectors: dict[str, Optional[list[float]]] = {
+        str(row["knowledge_id"]): vector_builder(row) for row in rows
+    }
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    n = len(rows)
+    for i in range(n):
+        row_i = rows[i]
+        id_i = str(row_i["knowledge_id"])
+        vec_i = vectors[id_i]
+        if not vec_i:
+            continue
+
+        for j in range(i + 1, n):
+            row_j = rows[j]
+            id_j = str(row_j["knowledge_id"])
+            vec_j = vectors[id_j]
+            if not vec_j:
+                continue
+
+            sim = cosine_similarity(vec_i, vec_j)
+            if sim >= threshold:
+                union(id_i, id_j)
+
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        root = find(str(row["knowledge_id"]))
+        grouped.setdefault(root, []).append(row)
+
+    return list(grouped.values())
+
+
+def mark_single_item(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    dedup_version: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE knowledge_items
+        SET
+            status = 'active',
+            review_status = 'single',
+            dedup_group_id = NULL,
+            representative_knowledge_id = knowledge_id,
+            is_representative = 1,
+            is_duplicate = 0,
+            dedup_method = NULL,
+            dedup_score = NULL,
+            dedup_key = NULL,
+            dedup_version = ?,
+            dedup_at = ?,
+            updated_at = ?
+        WHERE knowledge_id = ?
+        """,
+        (
+            dedup_version,
+            now_jst_iso(),
+            now_jst_iso(),
+            row["knowledge_id"],
+        ),
+    )
+
+
+def mark_group_item(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    status: str,
+    review_status: str,
+    dedup_group_id: str,
+    representative_knowledge_id: str,
+    is_representative: int,
+    is_duplicate: int,
+    dedup_method: str,
+    dedup_score: Optional[float],
+    dedup_key: Optional[str],
+    dedup_version: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE knowledge_items
+        SET
+            status = ?,
+            review_status = ?,
+            dedup_group_id = ?,
+            representative_knowledge_id = ?,
+            is_representative = ?,
+            is_duplicate = ?,
+            dedup_method = ?,
+            dedup_score = ?,
+            dedup_key = ?,
+            dedup_version = ?,
+            dedup_at = ?,
+            updated_at = ?
+        WHERE knowledge_id = ?
+        """,
+        (
+            status,
+            review_status,
+            dedup_group_id,
+            representative_knowledge_id,
+            is_representative,
+            is_duplicate,
+            dedup_method,
+            dedup_score,
+            dedup_key,
+            dedup_version,
+            now_jst_iso(),
+            now_jst_iso(),
+            row["knowledge_id"],
+        ),
+    )
+
+
+def get_next_dedup_version(conn: sqlite3.Connection, job_id: str) -> int:
+    cur = conn.execute(
+        """
+        SELECT COALESCE(MAX(dedup_version), 0) AS max_ver
+        FROM knowledge_items
+        WHERE job_id = ?
+        """,
+        (job_id,),
+    )
+    row = cur.fetchone()
+    max_ver = int(row["max_ver"] or 0)
+    return max_ver + 1
+
+
+def deduplicate_knowledge_items_for_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+    qa_threshold: float = QA_DEDUP_THRESHOLD,
+    plain_threshold: float = PLAIN_DEDUP_THRESHOLD,
+) -> dict[str, int]:
+    columns = get_table_columns(conn, "knowledge_items")
+    required_columns = {
+        "knowledge_id",
+        "job_id",
+        "job_item_id",
+        "knowledge_type",
+        "question",
+        "answer",
+        "content",
+        "question_vector",
+        "answer_vector",
+        "content_vector",
+        "sort_no",
+        "status",
+        "review_status",
+        "dedup_group_id",
+        "representative_knowledge_id",
+        "is_representative",
+        "is_duplicate",
+        "dedup_method",
+        "dedup_score",
+        "dedup_key",
+        "dedup_version",
+        "dedup_at",
+        "updated_at",
+    }
+    missing = [c for c in required_columns if c not in columns]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"knowledge_items missing columns: {', '.join(missing)}",
+        )
+
+    cur = conn.execute(
+        """
+        SELECT
+            knowledge_id,
+            job_id,
+            job_item_id,
+            source_type,
+            source_id,
+            source_item_id,
+            row_id,
+            knowledge_type,
+            title,
+            question,
+            answer,
+            content,
+            question_normalize,
+            answer_normalize,
+            content_normalize,
+            question_vector,
+            answer_vector,
+            content_vector,
+            summary,
+            keywords,
+            language,
+            sort_no,
+            status,
+            review_status,
+            dedup_group_id,
+            representative_knowledge_id,
+            is_representative,
+            is_duplicate,
+            dedup_method,
+            dedup_score,
+            dedup_key,
+            dedup_version,
+            dedup_at,
+            created_at,
+            updated_at
+        FROM knowledge_items
+        WHERE job_id = ?
+        ORDER BY sort_no ASC, knowledge_id ASC
+        """,
+        (job_id,),
+    )
+    rows = cur.fetchall()
+
+    qa_rows = [row for row in rows if str(row["knowledge_type"] or "") == "qa"]
+    plain_rows = [row for row in rows if str(row["knowledge_type"] or "") == "plain"]
+
+    qa_groups = cluster_rows_by_similarity(
+        qa_rows,
+        vector_builder=build_qa_vector,
+        threshold=qa_threshold,
+    )
+    plain_groups = cluster_rows_by_similarity(
+        plain_rows,
+        vector_builder=build_plain_vector,
+        threshold=plain_threshold,
+    )
+
+    dedup_version = get_next_dedup_version(conn, job_id)
+
+    group_seq = 0
+    group_count = 0
+    representative_count = 0
+    duplicate_count = 0
+    qa_count = 0
+    plain_count = 0
+
+    for group in qa_groups:
+        if not group:
+            continue
+
+        if len(group) == 1:
+            mark_single_item(conn, group[0], dedup_version=dedup_version)
+            representative_count += 1
+            qa_count += 1
+            continue
+
+        group_seq += 1
+        group_count += 1
+
+        representative = choose_representative(group)
+        representative_id = str(representative["knowledge_id"])
+        group_id = build_group_id(job_id, "qa", group_seq)
+        rep_vector = build_qa_vector(representative)
+
+        for row in group:
+            row_vector = build_qa_vector(row)
+            sim = cosine_similarity(rep_vector, row_vector)
+            is_rep = 1 if str(row["knowledge_id"]) == representative_id else 0
+
+            if is_rep:
+                mark_group_item(
+                    conn,
+                    row,
+                    status="active",
+                    review_status="representative",
+                    dedup_group_id=group_id,
+                    representative_knowledge_id=representative_id,
+                    is_representative=1,
+                    is_duplicate=0,
+                    dedup_method="qa_vector",
+                    dedup_score=1.0 if sim < 0 else sim,
+                    dedup_key=None,
+                    dedup_version=dedup_version,
+                )
+                representative_count += 1
+                qa_count += 1
+            else:
+                mark_group_item(
+                    conn,
+                    row,
+                    status="inactive",
+                    review_status="duplicate",
+                    dedup_group_id=group_id,
+                    representative_knowledge_id=representative_id,
+                    is_representative=0,
+                    is_duplicate=1,
+                    dedup_method="qa_vector",
+                    dedup_score=None if sim < 0 else sim,
+                    dedup_key=None,
+                    dedup_version=dedup_version,
+                )
+                duplicate_count += 1
+
+    for group in plain_groups:
+        if not group:
+            continue
+
+        if len(group) == 1:
+            mark_single_item(conn, group[0], dedup_version=dedup_version)
+            representative_count += 1
+            plain_count += 1
+            continue
+
+        group_seq += 1
+        group_count += 1
+
+        representative = choose_representative(group)
+        representative_id = str(representative["knowledge_id"])
+        group_id = build_group_id(job_id, "plain", group_seq)
+        rep_vector = build_plain_vector(representative)
+
+        for row in group:
+            row_vector = build_plain_vector(row)
+            sim = cosine_similarity(rep_vector, row_vector)
+            dedup_key = normalize_text(row["content_normalize"]) if "content_normalize" in row.keys() else None
+            is_rep = 1 if str(row["knowledge_id"]) == representative_id else 0
+
+            if is_rep:
+                mark_group_item(
+                    conn,
+                    row,
+                    status="active",
+                    review_status="representative",
+                    dedup_group_id=group_id,
+                    representative_knowledge_id=representative_id,
+                    is_representative=1,
+                    is_duplicate=0,
+                    dedup_method="plain_vector",
+                    dedup_score=1.0 if sim < 0 else sim,
+                    dedup_key=dedup_key,
+                    dedup_version=dedup_version,
+                )
+                representative_count += 1
+                plain_count += 1
+            else:
+                mark_group_item(
+                    conn,
+                    row,
+                    status="inactive",
+                    review_status="duplicate",
+                    dedup_group_id=group_id,
+                    representative_knowledge_id=representative_id,
+                    is_representative=0,
+                    is_duplicate=1,
+                    dedup_method="plain_vector",
+                    dedup_score=None if sim < 0 else sim,
+                    dedup_key=dedup_key,
+                    dedup_version=dedup_version,
+                )
+                duplicate_count += 1
+
+    conn.execute(
+        """
+        UPDATE knowledge_jobs
+        SET
+            qa_count = ?,
+            plain_count = ?
+        WHERE job_id = ?
+        """,
+        (qa_count, plain_count, job_id),
+    )
+
+    return {
+        "group_count": group_count,
+        "representative_count": representative_count,
+        "duplicate_count": duplicate_count,
+        "qa_count": qa_count,
+        "plain_count": plain_count,
+        "dedup_version": dedup_version,
+    }
+
+
 @router.get("/jobs", response_model=RefineJobListResponse)
 def list_refine_jobs(
     authorization: str | None = Header(default=None),
@@ -755,6 +1239,73 @@ def vectorize_refine_job(
     except Exception as e:
         conn.rollback()
         logger.exception("vectorize_refine_job failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        conn.close()
+
+
+@router.post("/jobs/{job_id}/deduplicate", response_model=RefineActionResponse)
+def deduplicate_refine_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+    local_db_path = download_user_db(uid)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        job_row = ensure_job_exists(conn, job_id)
+
+        current_status = str(job_row["status"] or "").lower()
+        if current_status not in {"vectorized", "vectorize_done"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"deduplicate is not allowed for status={job_row['status']}",
+            )
+
+        result = deduplicate_knowledge_items_for_job(
+            conn=conn,
+            job_id=job_id,
+            qa_threshold=QA_DEDUP_THRESHOLD,
+            plain_threshold=PLAIN_DEDUP_THRESHOLD,
+        )
+
+        update_job_status(conn, job_id, "deduplicated")
+        update_item_statuses_for_job(conn, job_id, "deduplicated")
+
+        conn.commit()
+        upload_user_db(uid, local_db_path)
+
+        return RefineActionResponse(
+            ok=True,
+            job_id=job_id,
+            action="deduplicate",
+            status="deduplicated",
+            message=(
+                "deduplicated: "
+                f"groups={result['group_count']}, "
+                f"representatives={result['representative_count']}, "
+                f"duplicates={result['duplicate_count']}, "
+                f"qa={result['qa_count']}, "
+                f"plain={result['plain_count']}, "
+                f"version={result['dedup_version']}"
+            ),
+        )
+
+    except HTTPException:
+        raise
+
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.exception("deduplicate_refine_job sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    except Exception as e:
+        conn.rollback()
+        logger.exception("deduplicate_refine_job failed")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
