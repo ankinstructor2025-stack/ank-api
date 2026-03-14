@@ -288,7 +288,7 @@ def update_item_statuses_for_job(
 ) -> int:
     table_name = get_existing_table_name(
         conn,
-        ["knowledge_job_items", "job_items", "knowledge_items"],
+        ["knowledge_items", "knowledge_job_items", "job_items"],
     )
     if not table_name:
         return 0
@@ -402,6 +402,77 @@ def vectorize_knowledge_items_for_job(
         params.append(row["knowledge_id"])
 
         conn.execute(sql, params)
+        updated_count += 1
+
+    return updated_count
+
+
+def normalize_knowledge_items_for_job(
+    conn: sqlite3.Connection,
+    job_id: str,
+) -> int:
+    table_name = get_existing_table_name(conn, ["knowledge_items"])
+    if not table_name:
+      raise HTTPException(status_code=404, detail="knowledge_items table not found")
+
+    columns = get_table_columns(conn, table_name)
+    required_columns = {
+        "knowledge_id",
+        "job_id",
+        "question",
+        "answer",
+        "content",
+        "question_normalize",
+        "answer_normalize",
+        "content_normalize",
+    }
+    missing = [c for c in required_columns if c not in columns]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"knowledge_items missing columns: {', '.join(missing)}",
+        )
+
+    updated_count = 0
+
+    cur = conn.execute(
+        """
+        SELECT
+            knowledge_id,
+            question,
+            answer,
+            content
+        FROM knowledge_items
+        WHERE job_id = ?
+        ORDER BY sort_no ASC, knowledge_id ASC
+        """,
+        (job_id,),
+    )
+    rows = cur.fetchall()
+
+    for row in rows:
+        question_normalize = normalize_text(row["question"])
+        answer_normalize = normalize_text(row["answer"])
+        content_normalize = normalize_text(row["content"])
+
+        conn.execute(
+            """
+            UPDATE knowledge_items
+            SET
+                question_normalize = ?,
+                answer_normalize = ?,
+                content_normalize = ?,
+                updated_at = ?
+            WHERE knowledge_id = ?
+            """,
+            (
+                question_normalize or None,
+                answer_normalize or None,
+                content_normalize or None,
+                now_jst_iso(),
+                row["knowledge_id"],
+            ),
+        )
         updated_count += 1
 
     return updated_count
@@ -1160,6 +1231,8 @@ def normalize_refine_job(
                 detail=f"normalize is not allowed for status={job_row['status']}",
             )
 
+        normalized_count = normalize_knowledge_items_for_job(conn, job_id)
+
         update_job_status(conn, job_id, "normalized")
         update_item_statuses_for_job(conn, job_id, "normalized")
 
@@ -1171,7 +1244,7 @@ def normalize_refine_job(
             job_id=job_id,
             action="normalize",
             status="normalized",
-            message="normalized",
+            message=f"normalized: {normalized_count}",
         )
 
     except HTTPException:
