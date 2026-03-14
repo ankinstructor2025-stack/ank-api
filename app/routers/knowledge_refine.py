@@ -387,7 +387,6 @@ def build_knowledge_db_for_job(
             sort_no
         FROM knowledge_items
         WHERE job_id = ?
-          AND status = 'active'
           AND COALESCE(is_duplicate, 0) = 0
         ORDER BY sort_no ASC, knowledge_id ASC
         """,
@@ -953,7 +952,6 @@ def mark_single_item(
         """
         UPDATE knowledge_items
         SET
-            status = 'active',
             review_status = 'single',
             dedup_group_id = NULL,
             representative_knowledge_id = knowledge_id,
@@ -980,7 +978,6 @@ def mark_group_item(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     *,
-    status: str,
     review_status: str,
     dedup_group_id: str,
     representative_knowledge_id: str,
@@ -995,7 +992,6 @@ def mark_group_item(
         """
         UPDATE knowledge_items
         SET
-            status = ?,
             review_status = ?,
             dedup_group_id = ?,
             representative_knowledge_id = ?,
@@ -1010,7 +1006,6 @@ def mark_group_item(
         WHERE knowledge_id = ?
         """,
         (
-            status,
             review_status,
             dedup_group_id,
             representative_knowledge_id,
@@ -1176,7 +1171,6 @@ def deduplicate_knowledge_items_for_job(
                 mark_group_item(
                     conn,
                     row,
-                    status="active",
                     review_status="representative",
                     dedup_group_id=group_id,
                     representative_knowledge_id=representative_id,
@@ -1193,7 +1187,6 @@ def deduplicate_knowledge_items_for_job(
                 mark_group_item(
                     conn,
                     row,
-                    status="inactive",
                     review_status="duplicate",
                     dedup_group_id=group_id,
                     representative_knowledge_id=representative_id,
@@ -1234,7 +1227,6 @@ def deduplicate_knowledge_items_for_job(
                 mark_group_item(
                     conn,
                     row,
-                    status="active",
                     review_status="representative",
                     dedup_group_id=group_id,
                     representative_knowledge_id=representative_id,
@@ -1251,7 +1243,6 @@ def deduplicate_knowledge_items_for_job(
                 mark_group_item(
                     conn,
                     row,
-                    status="inactive",
                     review_status="duplicate",
                     dedup_group_id=group_id,
                     representative_knowledge_id=representative_id,
@@ -1674,7 +1665,6 @@ def deduplicate_refine_job(
         )
 
         update_job_status(conn, job_id, "deduplicated")
-        update_item_statuses_for_job(conn, job_id, "deduplicated")
 
         conn.commit()
         upload_user_db(uid, local_db_path)
