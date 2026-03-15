@@ -236,7 +236,7 @@ def list_knowledge_dbs(
             "updated": blob.updated.isoformat() if blob.updated else None
         })
 
-    items.sort(key=lambda x: x["name"], reverse=True)
+    items.sort(key=lambda x: x["db_name"], reverse=True)
 
     return {
         "ok": True,
