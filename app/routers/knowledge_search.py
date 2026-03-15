@@ -22,6 +22,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge_search"])
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 
 _TOKENIZER = Tokenizer()
 
@@ -371,6 +372,44 @@ def _search_hybrid(conn: sqlite3.Connection, query: str) -> dict:
     }
 
 
+def _generate_ai_answer(query: str) -> dict:
+    prompt = (query or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    client = _get_openai_client()
+
+    system_message = (
+        "あなたは日本語で回答するアシスタントです。"
+        "質問に対して簡潔かつ自然な日本語で回答してください。"
+        "不明な点は断定せず、その旨を明確にしてください。"
+    )
+
+    response = client.responses.create(
+        model=CHAT_MODEL,
+        input=[
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    answer_text = ""
+    if hasattr(response, "output_text") and response.output_text:
+        answer_text = response.output_text.strip()
+
+    if not answer_text:
+        answer_text = "回答を生成できませんでした。"
+
+    return {
+        "title": "AI回答",
+        "answer": answer_text,
+        "content_preview": answer_text[:1000],
+        "source_type": "openai",
+        "source_label": CHAT_MODEL,
+        "result_kind": "ai_answer",
+    }
+
+
 @router.post("/search")
 def search_knowledge(
     req: SearchRequest,
@@ -433,13 +472,14 @@ def search_knowledge(
             }
 
         elif mode == "ai_answer":
+            item = _generate_ai_answer(query)
             return {
                 "ok": True,
                 "mode": mode,
                 "db_name": req.db_name,
                 "query": req.query,
-                "count": 0,
-                "items": [],
+                "count": 1,
+                "items": [item],
             }
 
         else:
