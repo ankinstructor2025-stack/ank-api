@@ -23,6 +23,7 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge_search"])
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+HYBRID_AI_PROMPT_FILE = os.getenv("HYBRID_AI_PROMPT_FILE", "knowledge_hybrid_ai_prompt.txt")
 
 _TOKENIZER = Tokenizer()
 
@@ -372,6 +373,121 @@ def _search_hybrid(conn: sqlite3.Connection, query: str) -> dict:
     }
 
 
+def _load_text_prompt_from_gcs(filename: str) -> str:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    candidate_paths = [
+        f"template/{filename}",
+        filename,
+    ]
+
+    for path in candidate_paths:
+        blob = bucket.blob(path)
+        if blob.exists():
+            text = blob.download_as_text(encoding="utf-8").strip()
+            if not text:
+                raise HTTPException(status_code=500, detail=f"prompt is empty: {path}")
+            return text
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"prompt not found in GCS: {filename}",
+    )
+
+
+def _build_hybrid_context(items: list[dict], max_chars_per_item: int = 1200) -> str:
+    blocks: list[str] = []
+
+    for idx, item in enumerate(items, start=1):
+        result_kind = (item.get("result_kind") or "").strip()
+        question = (item.get("question") or "").strip()
+        answer = (item.get("answer") or "").strip()
+        content = (item.get("content_preview") or item.get("content") or "").strip()
+        source_type = (item.get("source_type") or "").strip()
+        source_label = (item.get("source_label") or "").strip()
+        score = item.get("score")
+
+        body = answer or content
+        if max_chars_per_item and len(body) > max_chars_per_item:
+            body = body[:max_chars_per_item]
+
+        lines = [f"[候補{idx}]"]
+
+        if result_kind:
+            lines.append(f"種別: {result_kind}")
+        if question:
+            lines.append(f"質問: {question}")
+        if body:
+            lines.append(f"本文: {body}")
+        if source_type or source_label:
+            lines.append(f"情報源: {source_type} / {source_label}")
+        if score is not None:
+            try:
+                lines.append(f"類似度: {float(score):.4f}")
+            except Exception:
+                lines.append(f"類似度: {score}")
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str) -> dict:
+    prompt_text = _load_text_prompt_from_gcs(HYBRID_AI_PROMPT_FILE)
+
+    hybrid_result = _search_hybrid(conn, query)
+    items = hybrid_result.get("items", [])[:8]
+
+    if not items:
+        no_answer = "検索結果が見つからなかったため、回答を整形できませんでした。"
+        return {
+            "title": "AI回答",
+            "answer": no_answer,
+            "content_preview": no_answer,
+            "source_type": "openai",
+            "source_label": CHAT_MODEL,
+            "result_kind": "hybrid_ai_answer",
+            "grounded_items": [],
+        }
+
+    context = _build_hybrid_context(items, max_chars_per_item=1200)
+
+    user_prompt = f"""ユーザー質問:
+{query}
+
+ハイブリッド検索結果:
+{context}
+
+上記だけを根拠に、意味を変えず、読みやすい回答文を作成してください。"""
+
+    client = _get_openai_client()
+    response = client.responses.create(
+        model=CHAT_MODEL,
+        input=[
+            {"role": "system", "content": prompt_text},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    answer_text = ""
+    if hasattr(response, "output_text") and response.output_text:
+        answer_text = response.output_text.strip()
+
+    if not answer_text:
+        answer_text = "検索結果をもとに回答を整形できませんでした。"
+
+    return {
+        "title": "AI回答",
+        "answer": answer_text,
+        "content_preview": answer_text[:1000],
+        "source_type": "openai",
+        "source_label": CHAT_MODEL,
+        "result_kind": "hybrid_ai_answer",
+        "grounded_items": items,
+    }
+
+
 def _generate_ai_answer(query: str) -> dict:
     prompt = (query or "").strip()
     if not prompt:
@@ -461,14 +577,16 @@ def search_knowledge(
             }
 
         elif mode == "hybrid_ai":
-            items = _search_plain_fts(conn, query, limit=10)
+            item = _generate_hybrid_ai_answer(conn, query)
             return {
                 "ok": True,
                 "mode": mode,
                 "db_name": req.db_name,
                 "query": req.query,
-                "count": len(items),
-                "items": items,
+                "count": 1,
+                "items": [item],
+                "grounded_count": len(item.get("grounded_items", [])),
+                "grounded_items": item.get("grounded_items", []),
             }
 
         elif mode == "ai_answer":
