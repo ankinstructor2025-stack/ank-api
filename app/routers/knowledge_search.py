@@ -23,7 +23,6 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge_search"])
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
-# janome は毎回生成せず、グローバルで 1 回だけ作る
 _TOKENIZER = Tokenizer()
 
 
@@ -185,10 +184,6 @@ def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
 
 
 def _tokenize_for_fts(text: str) -> list[str]:
-    """
-    検索文字列を janome で分かち書きし、FTS 用のトークン配列にする。
-    ノイズになりやすい助詞・助動詞・記号は除外する。
-    """
     src = (text or "").strip()
     if not src:
         return []
@@ -228,10 +223,6 @@ def _tokenize_for_fts(text: str) -> list[str]:
 
 
 def _normalize_fts_query(query: str) -> str:
-    """
-    入力文を分かち書きして、FTS MATCH 用のスペース連結文字列に変換する。
-    SQLite FTS5 ではスペース区切りで候補を広く拾い、bm25() で関連度順に並べる。
-    """
     lines = [
         line.strip()
         for line in (query or "").splitlines()
@@ -296,6 +287,7 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
         content = (item.get("content") or "").strip()
         item["content_preview"] = content[:300]
         item["fts_query"] = fts_query
+        item["result_kind"] = "plain"
         items.append(item)
 
     return items
@@ -356,10 +348,27 @@ def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) 
             "source_label": item.get("source_label"),
             "score": similarity,
             "content_preview": answer[:300] if answer else content[:300],
+            "result_kind": "qa",
         })
 
     scored_items.sort(key=lambda x: x["score"], reverse=True)
     return scored_items[:limit]
+
+
+def _search_hybrid(conn: sqlite3.Connection, query: str) -> dict:
+    qa_items = _search_qa_similarity(conn, query, limit=5)
+    plain_items = _search_plain_fts(conn, query, limit=5)
+
+    combined_items = []
+    combined_items.extend(qa_items)
+    combined_items.extend(plain_items)
+
+    return {
+        "qa_items": qa_items,
+        "plain_items": plain_items,
+        "items": combined_items,
+        "count": len(combined_items),
+    }
 
 
 @router.post("/search")
@@ -379,30 +388,62 @@ def search_knowledge(
 
         if mode == "plain_fts":
             items = _search_plain_fts(conn, query, limit=20)
+            return {
+                "ok": True,
+                "mode": mode,
+                "db_name": req.db_name,
+                "query": req.query,
+                "count": len(items),
+                "items": items,
+            }
 
         elif mode == "qa":
             items = _search_qa_similarity(conn, query, limit=5)
+            return {
+                "ok": True,
+                "mode": mode,
+                "db_name": req.db_name,
+                "query": req.query,
+                "count": len(items),
+                "items": items,
+            }
 
         elif mode == "hybrid":
-            items = _search_plain_fts(conn, query, limit=20)
+            hybrid_result = _search_hybrid(conn, query)
+            return {
+                "ok": True,
+                "mode": mode,
+                "db_name": req.db_name,
+                "query": req.query,
+                "count": hybrid_result["count"],
+                "items": hybrid_result["items"],
+                "qa_items": hybrid_result["qa_items"],
+                "plain_items": hybrid_result["plain_items"],
+            }
 
         elif mode == "hybrid_ai":
             items = _search_plain_fts(conn, query, limit=10)
+            return {
+                "ok": True,
+                "mode": mode,
+                "db_name": req.db_name,
+                "query": req.query,
+                "count": len(items),
+                "items": items,
+            }
 
         elif mode == "ai_answer":
-            items = []
+            return {
+                "ok": True,
+                "mode": mode,
+                "db_name": req.db_name,
+                "query": req.query,
+                "count": 0,
+                "items": [],
+            }
 
         else:
             raise HTTPException(status_code=400, detail="invalid mode")
-
-        return {
-            "ok": True,
-            "mode": mode,
-            "db_name": req.db_name,
-            "query": req.query,
-            "count": len(items),
-            "items": items,
-        }
 
     except sqlite3.Error as e:
         logger.exception("search_knowledge sqlite error")
