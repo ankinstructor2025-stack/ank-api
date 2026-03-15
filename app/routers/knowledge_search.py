@@ -138,7 +138,6 @@ def _parse_embedding(raw_value) -> list[float] | None:
         if not src:
             return None
 
-        # JSON配列
         if src.startswith("[") and src.endswith("]"):
             try:
                 arr = json.loads(src)
@@ -146,7 +145,6 @@ def _parse_embedding(raw_value) -> list[float] | None:
             except Exception:
                 return None
 
-        # カンマ区切り
         if "," in src:
             try:
                 return [float(x.strip()) for x in src.split(",") if x.strip()]
@@ -186,34 +184,6 @@ def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
     return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
 
-def _get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
-    rows = cur.fetchall()
-    return {row["name"] for row in rows}
-
-
-def _detect_question_embedding_column(conn: sqlite3.Connection) -> str:
-    cols = _get_table_columns(conn, "knowledge_entries")
-
-    candidates = [
-        "question_embedding",
-        "question_vector",
-        "embedding_question",
-        "question_embedding_json",
-        "question_vec",
-    ]
-
-    for name in candidates:
-        if name in cols:
-            return name
-
-    raise HTTPException(
-        status_code=500,
-        detail="question embedding column not found in knowledge_entries"
-    )
-
-
 def _tokenize_for_fts(text: str) -> list[str]:
     """
     検索文字列を janome で分かち書きし、FTS 用のトークン配列にする。
@@ -239,14 +209,12 @@ def _tokenize_for_fts(text: str) -> list[str]:
         if not base_form or base_form == "*":
             base_form = surface
 
-        # 1文字ノイズを少し抑制。ただし数字は残す
         if len(base_form) == 1 and not base_form.isdigit():
             if pos not in {"名詞"}:
                 continue
 
         tokens.append(base_form)
 
-    # 重複を除去しつつ順序維持
     unique_tokens: list[str] = []
     seen: set[str] = set()
 
@@ -279,7 +247,6 @@ def _normalize_fts_query(query: str) -> str:
     for line in lines:
         terms = _tokenize_for_fts(line)
 
-        # janome で何も取れなかった時だけ生文を fallback
         if not terms:
             terms = [line]
 
@@ -336,9 +303,8 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
 
 def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) -> list[dict]:
     query_embedding = _embed_text(query)
-    embedding_col = _detect_question_embedding_column(conn)
 
-    sql = f"""
+    sql = """
     SELECT
         entry_id,
         knowledge_type,
@@ -349,13 +315,13 @@ def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) 
         source_type,
         source_item_id,
         source_label,
-        {embedding_col} AS question_embedding_raw
+        embedding
     FROM knowledge_entries
     WHERE knowledge_type = 'qa'
       AND question IS NOT NULL
       AND TRIM(question) <> ''
-      AND {embedding_col} IS NOT NULL
-      AND TRIM({embedding_col}) <> ''
+      AND embedding IS NOT NULL
+      AND TRIM(embedding) <> ''
     """
 
     cur = conn.cursor()
@@ -367,11 +333,11 @@ def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) 
     for row in rows:
         item = dict(row)
 
-        question_embedding = _parse_embedding(item.get("question_embedding_raw"))
-        if not question_embedding:
+        qa_embedding = _parse_embedding(item.get("embedding"))
+        if not qa_embedding:
             continue
 
-        similarity = _cosine_similarity(query_embedding, question_embedding)
+        similarity = _cosine_similarity(query_embedding, qa_embedding)
         if similarity < -0.5:
             continue
 
