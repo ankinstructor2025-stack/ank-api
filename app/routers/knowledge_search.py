@@ -149,10 +149,8 @@ def _tokenize_for_fts(text: str) -> list[str]:
 
 def _normalize_fts_query(query: str) -> str:
     """
-    入力文を分かち書きして、FTS MATCH 用の AND 連結文字列に変換する。
-    例:
-      戦略分野における民間投資の予見可能性を向上させることを目指す
-      -> 戦略分野 AND 民間投資 AND 予見可能性 AND 向上 AND 目指す
+    入力文を分かち書きして、FTS MATCH 用のスペース連結文字列に変換する。
+    SQLite FTS5 ではスペース区切りで候補を広く拾い、bm25() で関連度順に並べる。
     """
     lines = [
         line.strip()
@@ -182,7 +180,7 @@ def _normalize_fts_query(query: str) -> str:
     if not all_terms:
         raise HTTPException(status_code=400, detail="query is required")
 
-    return " AND ".join(all_terms)
+    return " ".join(all_terms)
 
 
 def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
