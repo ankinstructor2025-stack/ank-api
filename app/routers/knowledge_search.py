@@ -205,3 +205,41 @@ def search_knowledge(
 
     finally:
         conn.close()
+
+@router.get("/dbs")
+def list_knowledge_dbs(
+    authorization: str | None = Header(default=None)
+):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    prefix = f"users/{uid}/"
+
+    blobs = client.list_blobs(bucket, prefix=prefix)
+
+    items = []
+
+    for blob in blobs:
+        name = blob.name.replace(prefix, "")
+
+        if not name.endswith(".sqlite"):
+            continue
+
+        if not name.startswith("knowledge_"):
+            continue
+
+        items.append({
+            "name": name,
+            "size": blob.size,
+            "updated": blob.updated.isoformat() if blob.updated else None
+        })
+
+    items.sort(key=lambda x: x["name"], reverse=True)
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items
+    }
