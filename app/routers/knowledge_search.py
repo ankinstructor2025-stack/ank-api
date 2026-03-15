@@ -231,7 +231,7 @@ def list_knowledge_dbs(
             continue
 
         items.append({
-            "name": name,
+            "db_name": name,
             "size": blob.size,
             "updated": blob.updated.isoformat() if blob.updated else None
         })
