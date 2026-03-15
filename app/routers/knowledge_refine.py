@@ -6,6 +6,11 @@ import math
 import sqlite3
 import logging
 from typing import Optional, List
+
+try:
+    from janome.tokenizer import Tokenizer
+except ImportError:
+    Tokenizer = None
 from zoneinfo import ZoneInfo
 from datetime import datetime
 
@@ -71,6 +76,56 @@ def normalize_text(text: str | None) -> str:
         return ""
     return " ".join(str(text).split()).strip()
 
+
+
+
+_janome_tokenizer: Optional[Tokenizer] = None
+
+
+def get_janome_tokenizer() -> Tokenizer:
+    global _janome_tokenizer
+
+    if Tokenizer is None:
+        raise HTTPException(status_code=500, detail="janome not installed. pip install janome")
+
+    if _janome_tokenizer is None:
+        _janome_tokenizer = Tokenizer()
+
+    return _janome_tokenizer
+
+
+def tokenize_text_for_fts(text: str | None) -> list[str]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+
+    tokenizer = get_janome_tokenizer()
+    tokens: list[str] = []
+
+    for token in tokenizer.tokenize(normalized):
+        surface = normalize_text(token.surface)
+        if not surface:
+            continue
+
+        parts = token.part_of_speech.split(",")
+        pos_major = parts[0] if parts else ""
+
+        if pos_major not in {"名詞", "動詞", "形容詞"}:
+            continue
+
+        base = getattr(token, "base_form", None) or surface
+        if base == "*":
+            base = surface
+        base = normalize_text(base)
+        if not base:
+            continue
+
+        if pos_major == "名詞":
+            tokens.append(surface)
+        else:
+            tokens.append(base)
+
+    return tokens
 
 def get_openai_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -265,23 +320,18 @@ def embed_search_text(search_text: str | None) -> Optional[str]:
 
 
 def build_search_text_from_row(row: sqlite3.Row) -> str:
-    parts: list[str] = []
+    fields = [
+        row["title"] if "title" in row.keys() else None,
+        row["question"] if "question" in row.keys() else None,
+        row["answer"] if "answer" in row.keys() else None,
+        row["content"] if "content" in row.keys() else None,
+    ]
 
-    title = normalize_text(row["title"] if "title" in row.keys() else None)
-    question = normalize_text(row["question"] if "question" in row.keys() else None)
-    answer = normalize_text(row["answer"] if "answer" in row.keys() else None)
-    content = normalize_text(row["content"] if "content" in row.keys() else None)
+    tokens: list[str] = []
+    for value in fields:
+        tokens.extend(tokenize_text_for_fts(value))
 
-    if title:
-        parts.append(title)
-    if question:
-        parts.append(question)
-    if answer:
-        parts.append(answer)
-    if content:
-        parts.append(content)
-
-    return "\n".join(parts).strip()
+    return " ".join(tokens).strip()
 
 
 def build_entry_title(row: sqlite3.Row) -> str:
