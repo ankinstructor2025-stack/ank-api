@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import logging
-from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -11,6 +10,7 @@ from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
+from janome.tokenizer import Tokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/knowledge", tags=["knowledge_search"])
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
+
+# janome は毎回生成せず、グローバルで 1 回だけ作る
+_TOKENIZER = Tokenizer()
 
 
 class SearchRequest(BaseModel):
@@ -99,7 +102,58 @@ def _open_knowledge_db(uid: str, db_name: str) -> sqlite3.Connection:
     return conn
 
 
+def _tokenize_for_fts(text: str) -> list[str]:
+    """
+    検索文字列を janome で分かち書きし、FTS 用のトークン配列にする。
+    ノイズになりやすい助詞・助動詞・記号は除外する。
+    """
+    src = (text or "").strip()
+    if not src:
+        return []
+
+    tokens: list[str] = []
+
+    for token in _TOKENIZER.tokenize(src):
+        surface = (token.surface or "").strip()
+        if not surface:
+            continue
+
+        pos = token.part_of_speech.split(",")[0]
+        if pos in {"助詞", "助動詞", "記号"}:
+            continue
+
+        base_form = getattr(token, "base_form", None) or surface
+        base_form = base_form.strip()
+        if not base_form or base_form == "*":
+            base_form = surface
+
+        # 1文字ノイズを少し抑制。ただし数字は残す
+        if len(base_form) == 1 and not base_form.isdigit():
+            if pos not in {"名詞"}:
+                continue
+
+        tokens.append(base_form)
+
+    # 重複を除去しつつ順序維持
+    unique_tokens: list[str] = []
+    seen: set[str] = set()
+
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        unique_tokens.append(t)
+
+    return unique_tokens
+
+
 def _normalize_fts_query(query: str) -> str:
+    """
+    入力文を分かち書きして、FTS MATCH 用の AND 連結文字列に変換する。
+    例:
+      戦略分野における民間投資の予見可能性を向上させることを目指す
+      -> 戦略分野 AND 民間投資 AND 予見可能性 AND 向上 AND 目指す
+    """
     lines = [
         line.strip()
         for line in (query or "").splitlines()
@@ -109,7 +163,26 @@ def _normalize_fts_query(query: str) -> str:
     if not lines:
         raise HTTPException(status_code=400, detail="query is required")
 
-    return " AND ".join(lines)
+    all_terms: list[str] = []
+    seen: set[str] = set()
+
+    for line in lines:
+        terms = _tokenize_for_fts(line)
+
+        # janome で何も取れなかった時だけ生文を fallback
+        if not terms:
+            terms = [line]
+
+        for term in terms:
+            if term in seen:
+                continue
+            seen.add(term)
+            all_terms.append(term)
+
+    if not all_terms:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    return " AND ".join(all_terms)
 
 
 def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
@@ -145,6 +218,7 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
         item = dict(row)
         content = (item.get("content") or "").strip()
         item["content_preview"] = content[:300]
+        item["fts_query"] = fts_query
         items.append(item)
 
     return items
@@ -205,6 +279,7 @@ def search_knowledge(
 
     finally:
         conn.close()
+
 
 @router.get("/dbs")
 def list_knowledge_dbs(
