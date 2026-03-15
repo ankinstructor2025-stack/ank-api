@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 import sqlite3
 import logging
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 from google.cloud import storage
+from openai import OpenAI
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -18,6 +21,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/knowledge", tags=["knowledge_search"])
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 # janome は毎回生成せず、グローバルで 1 回だけ作る
 _TOKENIZER = Tokenizer()
@@ -100,6 +104,114 @@ def _open_knowledge_db(uid: str, db_name: str) -> sqlite3.Connection:
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    return OpenAI(api_key=api_key)
+
+
+def _embed_text(text: str) -> list[float]:
+    src = (text or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    client = _get_openai_client()
+    res = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=src
+    )
+    return list(res.data[0].embedding)
+
+
+def _parse_embedding(raw_value) -> list[float] | None:
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8", errors="ignore")
+
+    if isinstance(raw_value, str):
+        src = raw_value.strip()
+        if not src:
+            return None
+
+        # JSON配列
+        if src.startswith("[") and src.endswith("]"):
+            try:
+                arr = json.loads(src)
+                return [float(x) for x in arr]
+            except Exception:
+                return None
+
+        # カンマ区切り
+        if "," in src:
+            try:
+                return [float(x.strip()) for x in src.split(",") if x.strip()]
+            except Exception:
+                return None
+
+        return None
+
+    if isinstance(raw_value, (list, tuple)):
+        try:
+            return [float(x) for x in raw_value]
+        except Exception:
+            return None
+
+    return None
+
+
+def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    if not vec1 or not vec2:
+        return -1.0
+
+    if len(vec1) != len(vec2):
+        return -1.0
+
+    dot = 0.0
+    norm1 = 0.0
+    norm2 = 0.0
+
+    for a, b in zip(vec1, vec2):
+        dot += a * b
+        norm1 += a * a
+        norm2 += b * b
+
+    if norm1 == 0.0 or norm2 == 0.0:
+        return -1.0
+
+    return dot / (math.sqrt(norm1) * math.sqrt(norm2))
+
+
+def _get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    rows = cur.fetchall()
+    return {row["name"] for row in rows}
+
+
+def _detect_question_embedding_column(conn: sqlite3.Connection) -> str:
+    cols = _get_table_columns(conn, "knowledge_entries")
+
+    candidates = [
+        "question_embedding",
+        "question_vector",
+        "embedding_question",
+        "question_embedding_json",
+        "question_vec",
+    ]
+
+    for name in candidates:
+        if name in cols:
+            return name
+
+    raise HTTPException(
+        status_code=500,
+        detail="question embedding column not found in knowledge_entries"
+    )
 
 
 def _tokenize_for_fts(text: str) -> list[str]:
@@ -222,6 +334,68 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
     return items
 
 
+def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) -> list[dict]:
+    query_embedding = _embed_text(query)
+    embedding_col = _detect_question_embedding_column(conn)
+
+    sql = f"""
+    SELECT
+        entry_id,
+        knowledge_type,
+        title,
+        question,
+        answer,
+        content,
+        source_type,
+        source_item_id,
+        source_label,
+        {embedding_col} AS question_embedding_raw
+    FROM knowledge_entries
+    WHERE knowledge_type = 'qa'
+      AND question IS NOT NULL
+      AND TRIM(question) <> ''
+      AND {embedding_col} IS NOT NULL
+      AND TRIM({embedding_col}) <> ''
+    """
+
+    cur = conn.cursor()
+    cur.execute(sql)
+    rows = cur.fetchall()
+
+    scored_items: list[dict] = []
+
+    for row in rows:
+        item = dict(row)
+
+        question_embedding = _parse_embedding(item.get("question_embedding_raw"))
+        if not question_embedding:
+            continue
+
+        similarity = _cosine_similarity(query_embedding, question_embedding)
+        if similarity < -0.5:
+            continue
+
+        answer = (item.get("answer") or "").strip()
+        content = (item.get("content") or "").strip()
+
+        scored_items.append({
+            "entry_id": item.get("entry_id"),
+            "knowledge_type": item.get("knowledge_type"),
+            "title": item.get("title"),
+            "question": item.get("question"),
+            "answer": answer,
+            "content": content,
+            "source_type": item.get("source_type"),
+            "source_item_id": item.get("source_item_id"),
+            "source_label": item.get("source_label"),
+            "score": similarity,
+            "content_preview": answer[:300] if answer else content[:300],
+        })
+
+    scored_items.sort(key=lambda x: x["score"], reverse=True)
+    return scored_items[:limit]
+
+
 @router.post("/search")
 def search_knowledge(
     req: SearchRequest,
@@ -241,7 +415,7 @@ def search_knowledge(
             items = _search_plain_fts(conn, query, limit=20)
 
         elif mode == "qa":
-            items = []
+            items = _search_qa_similarity(conn, query, limit=5)
 
         elif mode == "hybrid":
             items = _search_plain_fts(conn, query, limit=20)
