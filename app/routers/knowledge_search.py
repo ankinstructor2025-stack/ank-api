@@ -28,11 +28,14 @@ SEARCH_CONFIG_FILE = os.getenv("SEARCH_CONFIG_FILE", "search_config.json")
 
 DEFAULT_SEARCH_CONFIG = {
     "qa_similarity": {
-        "threshold": 0.45,
+        "strong_threshold": 0.8,
+        "weak_threshold": 0.4,
         "top_k": 5,
     },
     "fts": {
-        "top_k": 20,
+        "strong_bm25_max": -4.5,
+        "weak_bm25_max": -2.0,
+        "top_k": 10,
     },
     "hybrid": {
         "qa_top_k": 5,
@@ -47,7 +50,7 @@ _TOKENIZER = Tokenizer()
 class SearchRequest(BaseModel):
     db_name: str
     query: str
-    mode: str = "plain_fts"   # qa / plain_fts / hybrid / hybrid_ai / ai_answer
+    mode: str = "plain_fts"
 
 
 def ensure_firebase_initialized():
@@ -82,13 +85,10 @@ def _sanitize_db_name(db_name: str) -> str:
     name = (db_name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="db_name is required")
-
     if "/" in name or "\\" in name:
         raise HTTPException(status_code=400, detail="invalid db_name")
-
     if not name.endswith(".sqlite"):
         raise HTTPException(status_code=400, detail="db_name must end with .sqlite")
-
     return name
 
 
@@ -104,10 +104,7 @@ def download_knowledge_db(uid: str, filename: str) -> str:
     blob = bucket.blob(gcs_path)
 
     if not blob.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"knowledge db not found: {gcs_path}",
-        )
+        raise HTTPException(status_code=404, detail=f"knowledge db not found: {gcs_path}")
 
     local_path = f"/tmp/knowledge_search_{uid}_{filename}"
     blob.download_to_filename(local_path)
@@ -117,7 +114,6 @@ def download_knowledge_db(uid: str, filename: str) -> str:
 def _open_knowledge_db(uid: str, db_name: str) -> sqlite3.Connection:
     safe_db_name = _sanitize_db_name(db_name)
     local_db_path = download_knowledge_db(uid, safe_db_name)
-
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
     return conn
@@ -134,46 +130,33 @@ def _load_json_from_gcs(filename: str) -> dict:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    candidate_paths = [
-        f"template/{filename}",
-        filename,
-    ]
-
-    for path in candidate_paths:
+    for path in [f"template/{filename}", filename]:
         blob = bucket.blob(path)
         if not blob.exists():
             continue
-
         try:
             text = blob.download_as_text(encoding="utf-8").strip()
             if not text:
                 raise HTTPException(status_code=500, detail=f"config is empty: {path}")
-
             data = json.loads(text)
             if not isinstance(data, dict):
                 raise HTTPException(status_code=500, detail=f"config is not object: {path}")
-
             return data
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"failed to load config from GCS: {path}: {e}")
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"config not found in GCS: {filename}",
-    )
+    raise HTTPException(status_code=500, detail=f"config not found in GCS: {filename}")
 
 
 def _deep_merge_dict(base: dict, override: dict) -> dict:
     result = dict(base)
-
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _deep_merge_dict(result[key], value)
         else:
             result[key] = value
-
     return result
 
 
@@ -200,18 +183,29 @@ def _load_search_config() -> dict:
     hybrid_cfg = config.get("hybrid", {})
 
     config["qa_similarity"] = {
-        "threshold": _to_float(qa_cfg.get("threshold"), 0.45),
+        "strong_threshold": _to_float(qa_cfg.get("strong_threshold"), 0.8),
+        "weak_threshold": _to_float(qa_cfg.get("weak_threshold"), 0.4),
         "top_k": _to_int(qa_cfg.get("top_k"), 5),
     }
+    if config["qa_similarity"]["weak_threshold"] > config["qa_similarity"]["strong_threshold"]:
+        config["qa_similarity"]["weak_threshold"] = config["qa_similarity"]["strong_threshold"]
+
     config["fts"] = {
-        "top_k": _to_int(fts_cfg.get("top_k"), 20),
+        "strong_bm25_max": _to_float(fts_cfg.get("strong_bm25_max"), -4.5),
+        "weak_bm25_max": _to_float(fts_cfg.get("weak_bm25_max"), -2.0),
+        "top_k": _to_int(fts_cfg.get("top_k"), 10),
     }
+    if config["fts"]["strong_bm25_max"] > config["fts"]["weak_bm25_max"]:
+        strong = config["fts"]["strong_bm25_max"]
+        weak = config["fts"]["weak_bm25_max"]
+        config["fts"]["strong_bm25_max"] = weak
+        config["fts"]["weak_bm25_max"] = strong
+
     config["hybrid"] = {
         "qa_top_k": _to_int(hybrid_cfg.get("qa_top_k"), 5),
         "fts_top_k": _to_int(hybrid_cfg.get("fts_top_k"), 5),
         "top_k": _to_int(hybrid_cfg.get("top_k"), 10),
     }
-
     return config
 
 
@@ -219,70 +213,55 @@ def _embed_text(text: str) -> list[float]:
     src = (text or "").strip()
     if not src:
         raise HTTPException(status_code=400, detail="query is required")
-
     client = _get_openai_client()
-    res = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=src
-    )
+    res = client.embeddings.create(model=EMBEDDING_MODEL, input=src)
     return list(res.data[0].embedding)
 
 
 def _parse_embedding(raw_value) -> list[float] | None:
     if raw_value is None:
         return None
-
     if isinstance(raw_value, bytes):
         raw_value = raw_value.decode("utf-8", errors="ignore")
-
     if isinstance(raw_value, str):
         src = raw_value.strip()
         if not src:
             return None
-
         if src.startswith("[") and src.endswith("]"):
             try:
                 arr = json.loads(src)
                 return [float(x) for x in arr]
             except Exception:
                 return None
-
         if "," in src:
             try:
                 return [float(x.strip()) for x in src.split(",") if x.strip()]
             except Exception:
                 return None
-
         return None
-
     if isinstance(raw_value, (list, tuple)):
         try:
             return [float(x) for x in raw_value]
         except Exception:
             return None
-
     return None
 
 
 def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
     if not vec1 or not vec2:
         return -1.0
-
     if len(vec1) != len(vec2):
         return -1.0
 
     dot = 0.0
     norm1 = 0.0
     norm2 = 0.0
-
     for a, b in zip(vec1, vec2):
         dot += a * b
         norm1 += a * a
         norm2 += b * b
-
     if norm1 == 0.0 or norm2 == 0.0:
         return -1.0
-
     return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
 
@@ -292,7 +271,6 @@ def _tokenize_for_fts(text: str) -> list[str]:
         return []
 
     tokens: list[str] = []
-
     for token in _TOKENIZER.tokenize(src):
         surface = (token.surface or "").strip()
         if not surface:
@@ -315,35 +293,25 @@ def _tokenize_for_fts(text: str) -> list[str]:
 
     unique_tokens: list[str] = []
     seen: set[str] = set()
-
     for t in tokens:
         if t in seen:
             continue
         seen.add(t)
         unique_tokens.append(t)
-
     return unique_tokens
 
 
 def _normalize_fts_query(query: str) -> str:
-    lines = [
-        line.strip()
-        for line in (query or "").splitlines()
-        if line.strip()
-    ]
-
+    lines = [line.strip() for line in (query or "").splitlines() if line.strip()]
     if not lines:
         raise HTTPException(status_code=400, detail="query is required")
 
     all_terms: list[str] = []
     seen: set[str] = set()
-
     for line in lines:
         terms = _tokenize_for_fts(line)
-
         if not terms:
             terms = [line]
-
         for term in terms:
             if term in seen:
                 continue
@@ -352,15 +320,42 @@ def _normalize_fts_query(query: str) -> str:
 
     if not all_terms:
         raise HTTPException(status_code=400, detail="query is required")
-
-    # Recall重視: OR検索
     if len(all_terms) == 1:
         return all_terms[0]
-
     return " OR ".join(all_terms)
 
 
-def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
+def _classify_qa_items(items: list[dict], strong_threshold: float, weak_threshold: float, limit: int) -> list[dict]:
+    strong_items = [item for item in items if float(item.get("score", -1.0)) >= strong_threshold]
+    if strong_items:
+        return strong_items[:limit]
+
+    weak_items = [
+        item for item in items
+        if weak_threshold <= float(item.get("score", -1.0)) < strong_threshold
+    ]
+    if weak_items:
+        return weak_items[:limit]
+
+    return []
+
+
+def _classify_fts_items(items: list[dict], strong_bm25_max: float, weak_bm25_max: float, limit: int) -> list[dict]:
+    strong_items = [item for item in items if float(item.get("score", 999999.0)) <= strong_bm25_max]
+    if strong_items:
+        return strong_items[:limit]
+
+    weak_items = [
+        item for item in items
+        if strong_bm25_max < float(item.get("score", 999999.0)) <= weak_bm25_max
+    ]
+    if weak_items:
+        return weak_items[:limit]
+
+    return []
+
+
+def _search_plain_fts_raw(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
     fts_query = _normalize_fts_query(query)
 
     sql = f"""
@@ -396,16 +391,20 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
         item["fts_query"] = fts_query
         item["result_kind"] = "plain"
         items.append(item)
-
     return items
 
 
-def _search_qa_similarity(
-    conn: sqlite3.Connection,
-    query: str,
-    limit: int = 5,
-    threshold: float = 0.45,
-) -> list[dict]:
+def _search_plain_fts(conn: sqlite3.Connection, query: str, config: dict) -> list[dict]:
+    raw_items = _search_plain_fts_raw(conn, query, limit=config["fts"]["top_k"])
+    return _classify_fts_items(
+        raw_items,
+        strong_bm25_max=config["fts"]["strong_bm25_max"],
+        weak_bm25_max=config["fts"]["weak_bm25_max"],
+        limit=config["fts"]["top_k"],
+    )
+
+
+def _search_qa_similarity_raw(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[dict]:
     query_embedding = _embed_text(query)
 
     sql = """
@@ -433,21 +432,18 @@ def _search_qa_similarity(
     rows = cur.fetchall()
 
     scored_items: list[dict] = []
-
     for row in rows:
         item = dict(row)
-
         qa_embedding = _parse_embedding(item.get("embedding"))
         if not qa_embedding:
             continue
 
         similarity = _cosine_similarity(query_embedding, qa_embedding)
-        if similarity < threshold:
+        if similarity < 0.0:
             continue
 
         answer = (item.get("answer") or "").strip()
         content = (item.get("content") or "").strip()
-
         scored_items.append({
             "entry_id": item.get("entry_id"),
             "knowledge_type": item.get("knowledge_type"),
@@ -467,27 +463,46 @@ def _search_qa_similarity(
     return scored_items[:limit]
 
 
+def _search_qa_similarity(conn: sqlite3.Connection, query: str, config: dict) -> list[dict]:
+    raw_items = _search_qa_similarity_raw(conn, query, limit=max(config["qa_similarity"]["top_k"], 10))
+    return _classify_qa_items(
+        raw_items,
+        strong_threshold=config["qa_similarity"]["strong_threshold"],
+        weak_threshold=config["qa_similarity"]["weak_threshold"],
+        limit=config["qa_similarity"]["top_k"],
+    )
+
+
 def _search_hybrid(conn: sqlite3.Connection, query: str, config: dict) -> dict:
-    qa_cfg = config.get("qa_similarity", {})
-    hybrid_cfg = config.get("hybrid", {})
-
-    qa_items = _search_qa_similarity(
+    raw_qa_items = _search_qa_similarity_raw(
         conn,
         query,
-        limit=hybrid_cfg.get("qa_top_k", qa_cfg.get("top_k", 5)),
-        threshold=qa_cfg.get("threshold", 0.45),
+        limit=max(config["hybrid"]["qa_top_k"], config["qa_similarity"]["top_k"], 10),
     )
-    plain_items = _search_plain_fts(
+    raw_plain_items = _search_plain_fts_raw(
         conn,
         query,
-        limit=hybrid_cfg.get("fts_top_k", config.get("fts", {}).get("top_k", 5)),
+        limit=max(config["hybrid"]["fts_top_k"], config["fts"]["top_k"]),
     )
 
-    combined_items = []
+    qa_items = _classify_qa_items(
+        raw_qa_items,
+        strong_threshold=config["qa_similarity"]["strong_threshold"],
+        weak_threshold=config["qa_similarity"]["weak_threshold"],
+        limit=config["hybrid"]["qa_top_k"],
+    )
+    plain_items = _classify_fts_items(
+        raw_plain_items,
+        strong_bm25_max=config["fts"]["strong_bm25_max"],
+        weak_bm25_max=config["fts"]["weak_bm25_max"],
+        limit=config["hybrid"]["fts_top_k"],
+    )
+
+    combined_items: list[dict] = []
     combined_items.extend(qa_items)
     combined_items.extend(plain_items)
 
-    top_k = int(hybrid_cfg.get("top_k", len(combined_items)))
+    top_k = int(config["hybrid"]["top_k"])
     if top_k > 0:
         combined_items = combined_items[:top_k]
 
@@ -503,12 +518,7 @@ def _load_text_prompt_from_gcs(filename: str) -> str:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    candidate_paths = [
-        f"template/{filename}",
-        filename,
-    ]
-
-    for path in candidate_paths:
+    for path in [f"template/{filename}", filename]:
         blob = bucket.blob(path)
         if blob.exists():
             text = blob.download_as_text(encoding="utf-8").strip()
@@ -516,15 +526,11 @@ def _load_text_prompt_from_gcs(filename: str) -> str:
                 raise HTTPException(status_code=500, detail=f"prompt is empty: {path}")
             return text
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"prompt not found in GCS: {filename}",
-    )
+    raise HTTPException(status_code=500, detail=f"prompt not found in GCS: {filename}")
 
 
 def _build_hybrid_context(items: list[dict], max_chars_per_item: int = 1200) -> str:
     blocks: list[str] = []
-
     for idx, item in enumerate(items, start=1):
         result_kind = (item.get("result_kind") or "").strip()
         question = (item.get("question") or "").strip()
@@ -539,7 +545,6 @@ def _build_hybrid_context(items: list[dict], max_chars_per_item: int = 1200) -> 
             body = body[:max_chars_per_item]
 
         lines = [f"[候補{idx}]"]
-
         if result_kind:
             lines.append(f"種別: {result_kind}")
         if question:
@@ -550,18 +555,19 @@ def _build_hybrid_context(items: list[dict], max_chars_per_item: int = 1200) -> 
             lines.append(f"情報源: {source_type} / {source_label}")
         if score is not None:
             try:
-                lines.append(f"類似度: {float(score):.4f}")
+                if result_kind == "qa":
+                    lines.append(f"類似度: {float(score):.4f}")
+                else:
+                    lines.append(f"bm25: {float(score):.6f}")
             except Exception:
-                lines.append(f"類似度: {score}")
+                lines.append(f"score: {score}")
 
         blocks.append("\n".join(lines))
-
     return "\n\n".join(blocks)
 
 
 def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str, config: dict) -> dict:
     prompt_text = _load_text_prompt_from_gcs(HYBRID_AI_PROMPT_FILE)
-
     hybrid_result = _search_hybrid(conn, query, config)
     items = hybrid_result.get("items", [])[:8]
 
@@ -578,7 +584,6 @@ def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str, config: dic
         }
 
     context = _build_hybrid_context(items, max_chars_per_item=1200)
-
     user_prompt = f"""ユーザー質問:
 {query}
 
@@ -599,7 +604,6 @@ def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str, config: dic
     answer_text = ""
     if hasattr(response, "output_text") and response.output_text:
         answer_text = response.output_text.strip()
-
     if not answer_text:
         answer_text = "検索結果をもとに回答を整形できませんでした。"
 
@@ -620,7 +624,6 @@ def _generate_ai_answer(query: str) -> dict:
         raise HTTPException(status_code=400, detail="query is required")
 
     client = _get_openai_client()
-
     system_message = (
         "あなたは日本語で回答するアシスタントです。"
         "質問に対して簡潔かつ自然な日本語で回答してください。"
@@ -638,7 +641,6 @@ def _generate_ai_answer(query: str) -> dict:
     answer_text = ""
     if hasattr(response, "output_text") and response.output_text:
         answer_text = response.output_text.strip()
-
     if not answer_text:
         answer_text = "回答を生成できませんでした。"
 
@@ -653,10 +655,7 @@ def _generate_ai_answer(query: str) -> dict:
 
 
 @router.post("/search")
-def search_knowledge(
-    req: SearchRequest,
-    authorization: str | None = Header(default=None)
-):
+def search_knowledge(req: SearchRequest, authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
     conn = _open_knowledge_db(uid, req.db_name)
 
@@ -670,7 +669,7 @@ def search_knowledge(
         mode = (req.mode or "").strip()
 
         if mode == "plain_fts":
-            items = _search_plain_fts(conn, query, limit=config["fts"]["top_k"])
+            items = _search_plain_fts(conn, query, config)
             return {
                 "ok": True,
                 "mode": mode,
@@ -681,13 +680,8 @@ def search_knowledge(
                 "search_config": config,
             }
 
-        elif mode == "qa":
-            items = _search_qa_similarity(
-                conn,
-                query,
-                limit=config["qa_similarity"]["top_k"],
-                threshold=config["qa_similarity"]["threshold"],
-            )
+        if mode == "qa":
+            items = _search_qa_similarity(conn, query, config)
             return {
                 "ok": True,
                 "mode": mode,
@@ -698,7 +692,7 @@ def search_knowledge(
                 "search_config": config,
             }
 
-        elif mode == "hybrid":
+        if mode == "hybrid":
             hybrid_result = _search_hybrid(conn, query, config)
             return {
                 "ok": True,
@@ -712,7 +706,7 @@ def search_knowledge(
                 "search_config": config,
             }
 
-        elif mode == "hybrid_ai":
+        if mode == "hybrid_ai":
             item = _generate_hybrid_ai_answer(conn, query, config)
             return {
                 "ok": True,
@@ -726,7 +720,7 @@ def search_knowledge(
                 "search_config": config,
             }
 
-        elif mode == "ai_answer":
+        if mode == "ai_answer":
             item = _generate_ai_answer(query)
             return {
                 "ok": True,
@@ -738,8 +732,7 @@ def search_knowledge(
                 "search_config": config,
             }
 
-        else:
-            raise HTTPException(status_code=400, detail="invalid mode")
+        raise HTTPException(status_code=400, detail="invalid mode")
 
     except sqlite3.Error as e:
         logger.exception("search_knowledge sqlite error")
@@ -757,29 +750,21 @@ def search_knowledge(
 
 
 @router.get("/dbs")
-def list_knowledge_dbs(
-    authorization: str | None = Header(default=None)
-):
+def list_knowledge_dbs(authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
-
     prefix = f"users/{uid}/"
-
     blobs = client.list_blobs(bucket, prefix=prefix)
 
     items = []
-
     for blob in blobs:
         name = blob.name.replace(prefix, "")
-
         if not name.endswith(".sqlite"):
             continue
-
         if not name.startswith("knowledge_"):
             continue
-
         items.append({
             "db_name": name,
             "size": blob.size,
