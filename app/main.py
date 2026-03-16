@@ -11,6 +11,7 @@ from app.routers.upload_and_register import router as upload_and_register
 from app.routers.row_data_ingest import router as row_data_ingest
 from app.routers.row_data import router as row_data_router
 from app.routers.knowledge_generate_kokkai import router as knowledge_generate_kokkai_router
+from app.routers.knowledge_opendata_kokkai import router as knowledge_opendata_kokkai_router
 from app.routers.knowledge_refine import router as knowledge_refine_router
 from app.routers.knowledge_search import router as knowledge_search_router
 
@@ -29,6 +30,7 @@ def create_app() -> FastAPI:
     app.include_router(row_data_ingest, prefix="/v1")
     app.include_router(row_data_router, prefix="/v1")
     app.include_router(knowledge_generate_kokkai_router, prefix="/v1")
+    app.include_router(knowledge_generate_opendata_router, prefix="/v1")
     app.include_router(knowledge_refine_router, prefix="/v1")
     app.include_router(knowledge_search_router, prefix="/v1")
     return app
