@@ -24,6 +24,22 @@ BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 HYBRID_AI_PROMPT_FILE = os.getenv("HYBRID_AI_PROMPT_FILE", "knowledge_hybrid_ai_prompt.txt")
+SEARCH_CONFIG_FILE = os.getenv("SEARCH_CONFIG_FILE", "search_config.json")
+
+DEFAULT_SEARCH_CONFIG = {
+    "qa_similarity": {
+        "threshold": 0.45,
+        "top_k": 5,
+    },
+    "fts": {
+        "top_k": 20,
+    },
+    "hybrid": {
+        "qa_top_k": 5,
+        "fts_top_k": 5,
+        "top_k": 10,
+    },
+}
 
 _TOKENIZER = Tokenizer()
 
@@ -112,6 +128,91 @@ def _get_openai_client() -> OpenAI:
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
     return OpenAI(api_key=api_key)
+
+
+def _load_json_from_gcs(filename: str) -> dict:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    candidate_paths = [
+        f"template/{filename}",
+        filename,
+    ]
+
+    for path in candidate_paths:
+        blob = bucket.blob(path)
+        if not blob.exists():
+            continue
+
+        try:
+            text = blob.download_as_text(encoding="utf-8").strip()
+            if not text:
+                raise HTTPException(status_code=500, detail=f"config is empty: {path}")
+
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=500, detail=f"config is not object: {path}")
+
+            return data
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to load config from GCS: {path}: {e}")
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"config not found in GCS: {filename}",
+    )
+
+
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    result = dict(base)
+
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+
+    return result
+
+
+def _to_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _load_search_config() -> dict:
+    loaded = _load_json_from_gcs(SEARCH_CONFIG_FILE)
+    config = _deep_merge_dict(DEFAULT_SEARCH_CONFIG, loaded)
+
+    qa_cfg = config.get("qa_similarity", {})
+    fts_cfg = config.get("fts", {})
+    hybrid_cfg = config.get("hybrid", {})
+
+    config["qa_similarity"] = {
+        "threshold": _to_float(qa_cfg.get("threshold"), 0.45),
+        "top_k": _to_int(qa_cfg.get("top_k"), 5),
+    }
+    config["fts"] = {
+        "top_k": _to_int(fts_cfg.get("top_k"), 20),
+    }
+    config["hybrid"] = {
+        "qa_top_k": _to_int(hybrid_cfg.get("qa_top_k"), 5),
+        "fts_top_k": _to_int(hybrid_cfg.get("fts_top_k"), 5),
+        "top_k": _to_int(hybrid_cfg.get("top_k"), 10),
+    }
+
+    return config
 
 
 def _embed_text(text: str) -> list[float]:
@@ -252,7 +353,11 @@ def _normalize_fts_query(query: str) -> str:
     if not all_terms:
         raise HTTPException(status_code=400, detail="query is required")
 
-    return " ".join(all_terms)
+    # Recall重視: OR検索
+    if len(all_terms) == 1:
+        return all_terms[0]
+
+    return " OR ".join(all_terms)
 
 
 def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
@@ -295,7 +400,12 @@ def _search_plain_fts(conn: sqlite3.Connection, query: str, limit: int = 20) -> 
     return items
 
 
-def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) -> list[dict]:
+def _search_qa_similarity(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 5,
+    threshold: float = 0.45,
+) -> list[dict]:
     query_embedding = _embed_text(query)
 
     sql = """
@@ -332,7 +442,7 @@ def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) 
             continue
 
         similarity = _cosine_similarity(query_embedding, qa_embedding)
-        if similarity < -0.5:
+        if similarity < threshold:
             continue
 
         answer = (item.get("answer") or "").strip()
@@ -357,13 +467,29 @@ def _search_qa_similarity(conn: sqlite3.Connection, query: str, limit: int = 5) 
     return scored_items[:limit]
 
 
-def _search_hybrid(conn: sqlite3.Connection, query: str) -> dict:
-    qa_items = _search_qa_similarity(conn, query, limit=5)
-    plain_items = _search_plain_fts(conn, query, limit=5)
+def _search_hybrid(conn: sqlite3.Connection, query: str, config: dict) -> dict:
+    qa_cfg = config.get("qa_similarity", {})
+    hybrid_cfg = config.get("hybrid", {})
+
+    qa_items = _search_qa_similarity(
+        conn,
+        query,
+        limit=hybrid_cfg.get("qa_top_k", qa_cfg.get("top_k", 5)),
+        threshold=qa_cfg.get("threshold", 0.45),
+    )
+    plain_items = _search_plain_fts(
+        conn,
+        query,
+        limit=hybrid_cfg.get("fts_top_k", config.get("fts", {}).get("top_k", 5)),
+    )
 
     combined_items = []
     combined_items.extend(qa_items)
     combined_items.extend(plain_items)
+
+    top_k = int(hybrid_cfg.get("top_k", len(combined_items)))
+    if top_k > 0:
+        combined_items = combined_items[:top_k]
 
     return {
         "qa_items": qa_items,
@@ -433,10 +559,10 @@ def _build_hybrid_context(items: list[dict], max_chars_per_item: int = 1200) -> 
     return "\n\n".join(blocks)
 
 
-def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str) -> dict:
+def _generate_hybrid_ai_answer(conn: sqlite3.Connection, query: str, config: dict) -> dict:
     prompt_text = _load_text_prompt_from_gcs(HYBRID_AI_PROMPT_FILE)
 
-    hybrid_result = _search_hybrid(conn, query)
+    hybrid_result = _search_hybrid(conn, query, config)
     items = hybrid_result.get("items", [])[:8]
 
     if not items:
@@ -538,11 +664,13 @@ def search_knowledge(
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
+    config = _load_search_config()
+
     try:
         mode = (req.mode or "").strip()
 
         if mode == "plain_fts":
-            items = _search_plain_fts(conn, query, limit=20)
+            items = _search_plain_fts(conn, query, limit=config["fts"]["top_k"])
             return {
                 "ok": True,
                 "mode": mode,
@@ -550,10 +678,16 @@ def search_knowledge(
                 "query": req.query,
                 "count": len(items),
                 "items": items,
+                "search_config": config,
             }
 
         elif mode == "qa":
-            items = _search_qa_similarity(conn, query, limit=5)
+            items = _search_qa_similarity(
+                conn,
+                query,
+                limit=config["qa_similarity"]["top_k"],
+                threshold=config["qa_similarity"]["threshold"],
+            )
             return {
                 "ok": True,
                 "mode": mode,
@@ -561,10 +695,11 @@ def search_knowledge(
                 "query": req.query,
                 "count": len(items),
                 "items": items,
+                "search_config": config,
             }
 
         elif mode == "hybrid":
-            hybrid_result = _search_hybrid(conn, query)
+            hybrid_result = _search_hybrid(conn, query, config)
             return {
                 "ok": True,
                 "mode": mode,
@@ -574,10 +709,11 @@ def search_knowledge(
                 "items": hybrid_result["items"],
                 "qa_items": hybrid_result["qa_items"],
                 "plain_items": hybrid_result["plain_items"],
+                "search_config": config,
             }
 
         elif mode == "hybrid_ai":
-            item = _generate_hybrid_ai_answer(conn, query)
+            item = _generate_hybrid_ai_answer(conn, query, config)
             return {
                 "ok": True,
                 "mode": mode,
@@ -587,6 +723,7 @@ def search_knowledge(
                 "items": [item],
                 "grounded_count": len(item.get("grounded_items", [])),
                 "grounded_items": item.get("grounded_items", []),
+                "search_config": config,
             }
 
         elif mode == "ai_answer":
@@ -598,6 +735,7 @@ def search_knowledge(
                 "query": req.query,
                 "count": 1,
                 "items": [item],
+                "search_config": config,
             }
 
         else:
