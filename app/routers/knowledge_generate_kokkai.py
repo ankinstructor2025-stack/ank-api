@@ -16,9 +16,9 @@ from google.cloud import storage
 import firebase_admin
 from firebase_admin import auth as fb_auth
 
-from llm_client import run_chunked_llm_json
-from chunking import ChunkConfig, build_chunks
-from prompt_builder import build_kokkai_prompt_text
+from .llm_client import run_chunked_llm_json
+from .chunking import ChunkConfig, build_chunks
+from .prompt_builder import build_kokkai_prompt_text
 
 
 logger = logging.getLogger(__name__)
