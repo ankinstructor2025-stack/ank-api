@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import uuid
 import logging
@@ -16,7 +15,10 @@ from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
-from openai import OpenAI
+
+from .llm_client import run_chunked_llm_json
+from .chunking import ChunkConfig, build_chunks
+from .prompt_builder import build_opendata_prompt_text
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ SOURCE_TYPE = "opendata"
 
 OPENDATA_QA_PROMPT_PATH = "template/opendata_qa_prompt.txt"
 OPENDATA_PLAIN_PROMPT_PATH = "template/opendata_plain_prompt.txt"
+OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
 
 DEFAULT_OPENDATA_QA_PROMPT = """あなたは、オープンデータから検索に使えるQAを抽出するアシスタントです。
@@ -149,7 +152,7 @@ def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
             lines.extend(flatten_json_like(item, key))
         return lines
 
-    text = normalize_text(value)
+    text = normalize_text(str(value) if value is not None else "")
     if not text:
         return []
 
@@ -159,124 +162,19 @@ def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
 
 
 def extract_row_text(content_raw: str | None) -> str:
-    src = normalize_text(content_raw)
+    src = (content_raw or "").strip()
     if not src:
         return ""
 
     parsed = load_json_safe(src)
     if parsed is None:
-        return src
+        return normalize_text(src)
 
     lines = flatten_json_like(parsed)
     if not lines:
-        return src
+        return normalize_text(src)
 
     return "\n".join(lines)
-
-
-def get_openai_client() -> OpenAI:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise Exception("OPENAI_API_KEY not set")
-    return OpenAI(api_key=api_key)
-
-
-def strip_code_fence(text: str) -> str:
-    s = (text or "").strip()
-
-    if s.startswith("```"):
-        lines = s.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-
-    if s.lower().startswith("json"):
-        s = s[4:].strip()
-
-    return s
-
-
-def extract_json_candidate(text: str) -> str:
-    s = strip_code_fence(text)
-
-    start_obj = s.find("{")
-    start_arr = s.find("[")
-
-    candidates = [x for x in [start_obj, start_arr] if x >= 0]
-    if not candidates:
-        return s
-
-    start = min(candidates)
-    return s[start:].strip()
-
-
-def parse_llm_json(text: str) -> dict:
-    raw = extract_json_candidate(text)
-
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        pass
-
-    repaired = raw
-    repaired = repaired.replace("\r\n", "\n").replace("\r", "\n")
-    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
-    repaired = re.sub(
-        r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)',
-        r'\1"\2"\3',
-        repaired,
-    )
-
-    try:
-        obj = json.loads(repaired)
-        return obj if isinstance(obj, dict) else {}
-    except Exception as e:
-        logger.error("parse_llm_json failed. raw=%s", raw[:2000])
-        logger.error("parse_llm_json repaired=%s", repaired[:2000])
-        raise e
-
-
-def run_llm_json(prompt_text: str, log_prefix: str) -> dict:
-    client = get_openai_client()
-
-    try:
-        logger.info("%s request start", log_prefix)
-
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "user", "content": prompt_text}
-            ],
-        )
-
-        logger.info("%s response received", log_prefix)
-
-        content = res.choices[0].message.content or ""
-        content = content.strip()
-
-        logger.info("%s raw content: %s", log_prefix, content[:2000])
-
-        result = parse_llm_json(content)
-
-        logger.info("%s JSON parse success", log_prefix)
-        return result
-
-    except Exception:
-        logger.exception("%s generation failed", log_prefix)
-        raise
-
-
-def run_opendata_qa_llm(prompt_text: str) -> dict:
-    return run_llm_json(prompt_text, "LLM OPENDATA QA")
-
-
-def run_opendata_plain_llm(prompt_text: str) -> dict:
-    return run_llm_json(prompt_text, "LLM OPENDATA PLAIN")
 
 
 def load_template_text(path: str, default_text: str) -> str:
@@ -288,6 +186,185 @@ def load_template_text(path: str, default_text: str) -> str:
         return default_text.strip()
 
     return blob.download_as_bytes().decode("utf-8").strip()
+
+
+def load_chunk_config() -> dict:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(OPENAI_CHUNK_CONFIG_PATH)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"{OPENAI_CHUNK_CONFIG_PATH} not found")
+
+    try:
+        obj = json.loads(blob.download_as_bytes().decode("utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError("chunk config root is not object")
+        return obj
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to parse {OPENAI_CHUNK_CONFIG_PATH}: {e}")
+
+
+def get_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
+    conf = ((chunk_config.get("opendata") or {}).get(prompt_type) or {})
+    max_chars = int(conf.get("max_chars") or 10000)
+    max_items = int(conf.get("max_items") or 60)
+    overlap_items = int(conf.get("overlap_items") or 3)
+
+    if prompt_type == "plain":
+        if not conf.get("max_chars"):
+            max_chars = 12000
+        if not conf.get("max_items"):
+            max_items = 100
+        if not conf.get("overlap_items") and conf.get("overlap_items") != 0:
+            overlap_items = 5
+
+    if max_chars <= 0:
+        max_chars = 10000 if prompt_type == "qa" else 12000
+    if max_items <= 0:
+        max_items = 60 if prompt_type == "qa" else 100
+    if overlap_items < 0:
+        overlap_items = 0
+
+    return ChunkConfig(
+        max_chars=max_chars,
+        max_items=max_items,
+        overlap_items=overlap_items,
+    )
+
+
+def fetch_opendata_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
+    cur = conn.execute(
+        """
+        SELECT
+            ji.job_item_id,
+            ji.parent_source_id,
+            ji.parent_label,
+            ji.parent_key1,
+            ji.parent_key2,
+            ji.row_count
+        FROM knowledge_job_items ji
+        WHERE ji.job_item_id = ?
+        LIMIT 1
+        """,
+        (job_item_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
+    return row
+
+
+def fetch_opendata_content_rows(conn: sqlite3.Connection, job_item_id: str) -> list[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT
+            source_item_id,
+            row_id,
+            content_type,
+            content_text,
+            sort_no
+        FROM knowledge_contents
+        WHERE job_item_id = ?
+        ORDER BY sort_no
+        """,
+        (job_item_id,),
+    )
+    return cur.fetchall()
+
+
+def build_opendata_prompt_texts(
+    conn: sqlite3.Connection,
+    job_item_id: str,
+    template_path: str,
+    default_template: str,
+    chunk_conf: ChunkConfig,
+) -> list[str]:
+    item = fetch_opendata_job_item_meta(conn, job_item_id)
+    rows = fetch_opendata_content_rows(conn, job_item_id)
+
+    chunks = build_chunks(
+        rows,
+        chunk_conf,
+        allowed_content_types={"row"},
+    )
+
+    if not chunks:
+        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
+
+    prompt_template = load_template_text(template_path, default_template)
+
+    prompt_texts: list[str] = []
+    for chunk in chunks:
+        prompt_texts.append(
+            build_opendata_prompt_text(
+                job_item_id=job_item_id,
+                prompt_template=prompt_template,
+                chunk=chunk,
+                parent_source_id=item["parent_source_id"],
+                parent_key1=item["parent_key1"],
+                parent_key2=item["parent_key2"],
+                parent_label=item["parent_label"],
+                row_count=item["row_count"],
+            )
+        )
+
+    return prompt_texts
+
+
+def join_prompt_previews(prompt_texts: list[str]) -> str:
+    blocks: list[str] = []
+    for idx, prompt_text in enumerate(prompt_texts, start=1):
+        blocks.append(f"===== CHUNK {idx} / {len(prompt_texts)} =====\n{prompt_text}")
+    return "\n\n".join(blocks).strip()
+
+
+def merge_qa_chunk_results(job_item_id: str, chunk_results: list[dict]) -> dict:
+    merged: dict[str, Any] = {
+        "job_item_id": job_item_id,
+        "qa_list": [],
+        "chunk_count": len(chunk_results),
+    }
+
+    for idx, result in enumerate(chunk_results, start=1):
+        if not isinstance(result, dict):
+            continue
+
+        result_job_item_id = result.get("job_item_id")
+        if result_job_item_id not in (None, "", job_item_id):
+            raise Exception(f"qa job_item_id mismatch at chunk {idx}")
+
+        qa_list = result.get("qa_list") or []
+        if not isinstance(qa_list, list):
+            raise Exception(f"qa_list is not list at chunk {idx}")
+
+        merged["qa_list"].extend(qa_list)
+
+    return merged
+
+
+def merge_plain_chunk_results(job_item_id: str, chunk_results: list[dict]) -> dict:
+    merged: dict[str, Any] = {
+        "job_item_id": job_item_id,
+        "plain_list": [],
+        "chunk_count": len(chunk_results),
+    }
+
+    for idx, result in enumerate(chunk_results, start=1):
+        if not isinstance(result, dict):
+            continue
+
+        result_job_item_id = result.get("job_item_id")
+        if result_job_item_id not in (None, "", job_item_id):
+            raise Exception(f"plain job_item_id mismatch at chunk {idx}")
+
+        plain_list = result.get("plain_list") or []
+        if not isinstance(plain_list, list):
+            raise Exception(f"plain_list is not list at chunk {idx}")
+
+        merged["plain_list"].extend(plain_list)
+
+    return merged
 
 
 def insert_qa_items_from_llm_result(
@@ -382,6 +459,11 @@ def insert_qa_items_from_llm_result(
         inserted_count += 1
         sort_no += 1
 
+    logger.info(
+        "insert_qa_items_from_llm_result: job_item_id=%s qa_count=%s",
+        job_item_id,
+        inserted_count,
+    )
     return inserted_count
 
 
@@ -473,6 +555,11 @@ def insert_plain_items_from_llm_result(
         inserted_count += 1
         sort_no += 1
 
+    logger.info(
+        "insert_plain_items_from_llm_result: job_item_id=%s plain_count=%s",
+        job_item_id,
+        inserted_count,
+    )
     return inserted_count
 
 
@@ -540,80 +627,6 @@ def insert_opendata_contents(
         inserted_count += 1
 
     return inserted_count
-
-
-def build_opendata_prompt_text_from_contents(
-    conn: sqlite3.Connection,
-    job_item_id: str,
-    template_path: str,
-    default_template: str,
-) -> str:
-    cur = conn.execute(
-        """
-        SELECT
-            ji.job_item_id,
-            ji.parent_source_id,
-            ji.parent_label,
-            ji.parent_key1,
-            ji.parent_key2,
-            ji.row_count
-        FROM knowledge_job_items ji
-        WHERE ji.job_item_id = ?
-        LIMIT 1
-        """,
-        (job_item_id,),
-    )
-    item = cur.fetchone()
-    if not item:
-        raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
-
-    prompt_template = load_template_text(template_path, default_template)
-
-    cur = conn.execute(
-        """
-        SELECT
-            content_type,
-            content_text,
-            sort_no,
-            source_item_id
-        FROM knowledge_contents
-        WHERE job_item_id = ?
-        ORDER BY sort_no
-        """,
-        (job_item_id,),
-    )
-    rows = cur.fetchall()
-
-    lines: list[str] = []
-    for row in rows:
-        text = normalize_text(row["content_text"])
-        if not text:
-            continue
-
-        source_item_id = normalize_text(row["source_item_id"])
-        if source_item_id:
-            lines.append(f"[{row['sort_no']}] ({source_item_id}) {text}")
-        else:
-            lines.append(f"[{row['sort_no']}] {text}")
-
-    input_text = "\n\n".join(lines).strip()
-    if not input_text:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
-
-    return (
-        f"対象: {item['parent_label'] or item['parent_source_id'] or 'オープンデータ'}\n"
-        f"job_item_id: {item['job_item_id']}\n\n"
-        f"{prompt_template}\n\n"
-        f"【データセット情報】\n"
-        f"parent_source_id: {item['parent_source_id'] or ''}\n"
-        f"parent_key1: {item['parent_key1'] or ''}\n"
-        f"parent_key2: {item['parent_key2'] or ''}\n"
-        f"parent_label: {item['parent_label'] or ''}\n"
-        f"row_count: {item['row_count'] or 0}\n"
-        f"job_item_id: {item['job_item_id']}\n\n"
-        f"【行データ一覧】\n"
-        f"{input_text}\n"
-    )
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -698,6 +711,10 @@ def create_opendata_job(
     conn.row_factory = sqlite3.Row
 
     try:
+        chunk_config = load_chunk_config()
+        qa_chunk_conf = get_opendata_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_opendata_chunk_conf(chunk_config, "plain")
+
         job_id = new_id()
         requested_at = now_iso()
 
@@ -812,18 +829,20 @@ def create_opendata_job(
                     source_id=source_id,
                 )
 
-                qa_prompt_text = build_opendata_prompt_text_from_contents(
+                qa_prompt_texts = build_opendata_prompt_texts(
                     conn=conn,
                     job_item_id=job_item_id,
                     template_path=OPENDATA_QA_PROMPT_PATH,
                     default_template=DEFAULT_OPENDATA_QA_PROMPT,
+                    chunk_conf=qa_chunk_conf,
                 )
 
-                plain_prompt_text = build_opendata_prompt_text_from_contents(
+                plain_prompt_texts = build_opendata_prompt_texts(
                     conn=conn,
                     job_item_id=job_item_id,
                     template_path=OPENDATA_PLAIN_PROMPT_PATH,
                     default_template=DEFAULT_OPENDATA_PLAIN_PROMPT,
+                    chunk_conf=plain_chunk_conf,
                 )
 
                 prompt_previews.append(
@@ -832,7 +851,7 @@ def create_opendata_job(
                         parent_source_id=item.parent_source_id,
                         parent_label=item.parent_label,
                         prompt_type="qa",
-                        prompt_text=qa_prompt_text,
+                        prompt_text=join_prompt_previews(qa_prompt_texts),
                     )
                 )
 
@@ -842,16 +861,20 @@ def create_opendata_job(
                         parent_source_id=item.parent_source_id,
                         parent_label=item.parent_label,
                         prompt_type="plain",
-                        prompt_text=plain_prompt_text,
+                        prompt_text=join_prompt_previews(plain_prompt_texts),
                     )
                 )
 
                 if not body.preview_only:
-                    qa_llm_result = run_opendata_qa_llm(qa_prompt_text)
-                    qa_llm_result_for_debug = qa_llm_result
-
-                    if qa_llm_result.get("job_item_id") not in (None, "", job_item_id):
-                        raise Exception("qa job_item_id mismatch")
+                    qa_chunk_results = run_chunked_llm_json(
+                        qa_prompt_texts,
+                        "LLM OPENDATA QA",
+                    )
+                    qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
+                    qa_llm_result_for_debug = {
+                        "chunk_results": qa_chunk_results,
+                        "merged_result": qa_llm_result,
+                    }
 
                     qa_count = insert_qa_items_from_llm_result(
                         conn=conn,
@@ -861,11 +884,15 @@ def create_opendata_job(
                         llm_result=qa_llm_result,
                     )
 
-                    plain_llm_result = run_opendata_plain_llm(plain_prompt_text)
-                    plain_llm_result_for_debug = plain_llm_result
-
-                    if plain_llm_result.get("job_item_id") not in (None, "", job_item_id):
-                        raise Exception("plain job_item_id mismatch")
+                    plain_chunk_results = run_chunked_llm_json(
+                        plain_prompt_texts,
+                        "LLM OPENDATA PLAIN",
+                    )
+                    plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
+                    plain_llm_result_for_debug = {
+                        "chunk_results": plain_chunk_results,
+                        "merged_result": plain_llm_result,
+                    }
 
                     plain_count = insert_plain_items_from_llm_result(
                         conn=conn,
@@ -918,6 +945,7 @@ def create_opendata_job(
                 logger.exception("opendata job item failed: job_id=%s job_item_id=%s", job_id, job_item_id)
 
                 finished_at = now_iso()
+                total_error_count += 1
 
                 conn.execute(
                     """
@@ -933,6 +961,18 @@ def create_opendata_job(
                         str(e),
                         job_item_id,
                     ),
+                )
+
+                debug_items.append(
+                    KnowledgeDebugItem(
+                        job_item_id=job_item_id,
+                        parent_label=item.parent_label,
+                        status="error",
+                        qa_count=0,
+                        plain_count=0,
+                        error_message=str(e),
+                        llm_result=None,
+                    )
                 )
 
                 raise
