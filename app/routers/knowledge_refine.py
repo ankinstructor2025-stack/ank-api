@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import re
 import sqlite3
 import logging
 from typing import Optional, List
@@ -77,6 +78,22 @@ def normalize_text(text: str | None) -> str:
     return " ".join(str(text).split()).strip()
 
 
+def unique_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    result: list[str] = []
+
+    for value in values:
+        v = normalize_text(value)
+        if not v:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        result.append(v)
+
+    return result
+
+
 
 
 _janome_tokenizer: Optional[Tokenizer] = None
@@ -107,26 +124,27 @@ def tokenize_text_for_fts(text: str | None) -> list[str]:
         if not surface:
             continue
 
+        if surface in {"。", "、", ",", ".", "!", "?", "！", "？", "「", "」", "（", "）", "(", ")"}:
+            continue
+
         parts = token.part_of_speech.split(",")
         pos_major = parts[0] if parts else ""
-
-        if pos_major not in {"名詞", "動詞", "形容詞"}:
-            continue
 
         base = getattr(token, "base_form", None) or surface
         if base == "*":
             base = surface
         base = normalize_text(base)
-        if not base:
-            continue
 
-        if pos_major == "名詞":
+        # 品詞カットはしない。ただし最低限のノイズだけ抑える
+        # 記号・空文字・1文字ノイズを減らす
+        if len(surface) >= 2:
             tokens.append(surface)
-        else:
+
+        # 動詞・形容詞だけは原形も持っておく
+        if pos_major in {"動詞", "形容詞"} and len(base) >= 2 and base != surface:
             tokens.append(base)
 
-    return tokens
-
+    return unique_keep_order(tokens)
 def get_openai_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -320,20 +338,25 @@ def embed_search_text(search_text: str | None) -> Optional[str]:
 
 
 def build_search_text_from_row(row: sqlite3.Row) -> str:
-    fields = [
-        row["title"] if "title" in row.keys() else None,
-        row["question"] if "question" in row.keys() else None,
-        row["answer"] if "answer" in row.keys() else None,
-        row["content"] if "content" in row.keys() else None,
+    title = row["title"] if "title" in row.keys() else None
+    question = row["question"] if "question" in row.keys() else None
+    answer = row["answer"] if "answer" in row.keys() else None
+    content = row["content"] if "content" in row.keys() else None
+
+    raw_parts = [
+        normalize_text(title),
+        normalize_text(question),
+        normalize_text(answer),
+        normalize_text(content),
     ]
+    raw_parts = [x for x in raw_parts if x]
 
-    tokens: list[str] = []
-    for value in fields:
-        tokens.extend(tokenize_text_for_fts(value))
+    token_parts: list[str] = []
+    for value in [title, question, answer, content]:
+        token_parts.extend(tokenize_text_for_fts(value))
 
-    return " ".join(tokens).strip()
-
-
+    merged = unique_keep_order(raw_parts) + token_parts
+    return " ".join(merged).strip()
 def build_entry_title(row: sqlite3.Row) -> str:
     candidates = [
         row["title"] if "title" in row.keys() else None,
@@ -1807,4 +1830,3 @@ def build_knowledge_db_job(
 
     finally:
         conn.close()
-
