@@ -7,9 +7,9 @@ from app.routers.user_init import router as user_init_router
 from app.routers.kokkai import router as kokkai_router
 from app.routers.opendata import router as opendata_router
 from app.routers.public_url import router as public_url_router
-from app.routers.upload_and_register import router as upload_and_register
-from app.routers.row_data_ingest import router as row_data_ingest
-from app.routers.row_data import router as row_data_router
+from app.routers.upload_register import router as upload_register_router
+from app.routers.upload_ingest import router as upload_ingest_router
+from app.routers.upload_retrieve import router as upload_retrieve_router
 from app.routers.knowledge_generate_kokkai import router as knowledge_generate_kokkai_router
 from app.routers.knowledge_generate_opendata import router as knowledge_generate_opendata_router
 from app.routers.knowledge_refine import router as knowledge_refine_router
@@ -26,9 +26,9 @@ def create_app() -> FastAPI:
     app.include_router(kokkai_router, prefix="/v1")
     app.include_router(opendata_router, prefix="/v1")
     app.include_router(public_url_router, prefix="/v1")
-    app.include_router(upload_and_register, prefix="/v1")
-    app.include_router(row_data_ingest, prefix="/v1")
-    app.include_router(row_data_router, prefix="/v1")
+    app.include_router(upload_register_router, prefix="/v1")
+    app.include_router(upload_ingest_router, prefix="/v1")
+    app.include_router(upload_retrieve_router, prefix="/v1")
     app.include_router(knowledge_generate_kokkai_router, prefix="/v1")
     app.include_router(knowledge_generate_opendata_router, prefix="/v1")
     app.include_router(knowledge_refine_router, prefix="/v1")
