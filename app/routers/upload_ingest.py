@@ -15,6 +15,7 @@ import ulid
 from .content_detector import detect_content_kind
 from .content_splitter_csv import split_csv_records
 from .content_splitter_pdf import split_pdf_records
+from .content_splitter_text import split_text_records
 
 
 router = APIRouter()
@@ -60,6 +61,16 @@ def split_json_records(binary: bytes) -> list[str]:
     return [json.dumps(obj, ensure_ascii=False)]
 
 
+def split_text_block_records(binary: bytes) -> list[str]:
+    records = split_text_records(binary)
+
+    return [
+        json.dumps(record, ensure_ascii=False)
+        for record in records
+        if record and record.get("text")
+    ]
+
+
 def split_text_lines(binary: bytes) -> list[str]:
     text = binary.decode("utf-8", errors="replace")
     return [line for line in text.splitlines() if line.strip()]
@@ -81,6 +92,11 @@ def build_row_contents(file_bytes: bytes, original_filename: str, ext: str) -> l
 
     if kind == "json":
         return split_json_records(file_bytes)
+
+    if kind == "text":
+        records = split_text_block_records(file_bytes)
+        if records:
+            return records
 
     return split_text_lines(file_bytes)
 
