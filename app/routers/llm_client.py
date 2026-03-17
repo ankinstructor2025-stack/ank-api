@@ -4,12 +4,19 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Optional
 
 from openai import OpenAI
 
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_RETRY_COUNT = int(os.environ.get("OPENAI_RETRY_COUNT", "3"))
+DEFAULT_RETRY_SLEEP_SEC = float(os.environ.get("OPENAI_RETRY_SLEEP_SEC", "2"))
+DEFAULT_CHUNK_SLEEP_SEC = float(os.environ.get("OPENAI_CHUNK_SLEEP_SEC", "1"))
 
 
 def get_openai_client() -> OpenAI:
@@ -77,65 +84,121 @@ def parse_llm_json(text: str) -> dict:
         raise e
 
 
+def _create_chat_completion(
+    *,
+    client: OpenAI,
+    prompt_text: str,
+    model: str,
+    temperature: float,
+    response_format: Optional[dict[str, Any]],
+):
+    return client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        response_format=response_format,
+        messages=[
+            {"role": "user", "content": prompt_text}
+        ],
+    )
+
+
 def run_llm_json(
     prompt_text: str,
     log_prefix: str,
     *,
-    model: str = "gpt-4o-mini",
+    model: str = DEFAULT_MODEL,
     temperature: float = 0,
     response_format: Optional[dict[str, Any]] = None,
+    retry_count: int = DEFAULT_RETRY_COUNT,
+    retry_sleep_sec: float = DEFAULT_RETRY_SLEEP_SEC,
 ) -> dict:
     client = get_openai_client()
 
     if response_format is None:
         response_format = {"type": "json_object"}
 
-    try:
-        logger.info("%s request start", log_prefix)
+    last_error: Exception | None = None
 
-        res = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            response_format=response_format,
-            messages=[
-                {"role": "user", "content": prompt_text}
-            ],
-        )
+    for attempt in range(1, retry_count + 1):
+        try:
+            logger.info("%s request start attempt=%s/%s", log_prefix, attempt, retry_count)
 
-        logger.info("%s response received", log_prefix)
+            res = _create_chat_completion(
+                client=client,
+                prompt_text=prompt_text,
+                model=model,
+                temperature=temperature,
+                response_format=response_format,
+            )
 
-        content = res.choices[0].message.content or ""
-        content = content.strip()
+            logger.info("%s response received attempt=%s/%s", log_prefix, attempt, retry_count)
 
-        logger.info("%s raw content: %s", log_prefix, content[:2000])
+            content = res.choices[0].message.content or ""
+            content = content.strip()
 
-        result = parse_llm_json(content)
+            logger.info("%s raw content: %s", log_prefix, content[:2000])
 
-        logger.info("%s JSON parse success", log_prefix)
-        return result
+            result = parse_llm_json(content)
 
-    except Exception:
-        logger.exception("%s generation failed", log_prefix)
-        raise
+            logger.info("%s JSON parse success attempt=%s/%s", log_prefix, attempt, retry_count)
+            return result
+
+        except Exception as e:
+            last_error = e
+            logger.exception("%s generation failed attempt=%s/%s", log_prefix, attempt, retry_count)
+
+            if attempt >= retry_count:
+                break
+
+            sleep_sec = retry_sleep_sec * attempt
+            logger.warning(
+                "%s retry sleep %.1f sec before next attempt",
+                log_prefix,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError(f"{log_prefix} generation failed without explicit exception")
 
 
 def run_chunked_llm_json(
     prompt_texts: list[str],
     log_prefix: str,
     *,
-    model: str = "gpt-4o-mini",
+    model: str = DEFAULT_MODEL,
     temperature: float = 0,
+    retry_count: int = DEFAULT_RETRY_COUNT,
+    retry_sleep_sec: float = DEFAULT_RETRY_SLEEP_SEC,
+    chunk_sleep_sec: float = DEFAULT_CHUNK_SLEEP_SEC,
 ) -> list[dict]:
     results: list[dict] = []
 
+    total = len(prompt_texts)
+    logger.info("%s chunk execution start total=%s", log_prefix, total)
+
     for idx, prompt_text in enumerate(prompt_texts, start=1):
-        chunk_prefix = f"{log_prefix} chunk={idx}/{len(prompt_texts)}"
+        chunk_prefix = f"{log_prefix} chunk={idx}/{total}"
+
+        logger.info("%s start", chunk_prefix)
+
         result = run_llm_json(
             prompt_text,
             chunk_prefix,
             model=model,
             temperature=temperature,
+            retry_count=retry_count,
+            retry_sleep_sec=retry_sleep_sec,
         )
         results.append(result)
 
+        logger.info("%s done", chunk_prefix)
+
+        if idx < total and chunk_sleep_sec > 0:
+            logger.info("%s sleep %.1f sec before next chunk", chunk_prefix, chunk_sleep_sec)
+            time.sleep(chunk_sleep_sec)
+
+    logger.info("%s chunk execution finished total=%s", log_prefix, total)
     return results
