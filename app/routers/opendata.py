@@ -1,24 +1,29 @@
 # app/routers/opendata.py
 
-import os
-import io
-import csv
 import json
+import os
 import sqlite3
 from datetime import datetime
+from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-
-import requests
-from fastapi import APIRouter, HTTPException, Header, Query
-from google.cloud import storage
-from pypdf import PdfReader
 
 import firebase_admin
-from firebase_admin import auth as fb_auth
-
+import requests
 import ulid
+from fastapi import APIRouter, Header, HTTPException, Query
+from firebase_admin import auth as fb_auth
+from google.cloud import storage
+
+from .content_detector import (
+    detect_resource_kind,
+    guess_ext_from_url,
+    normalize_text,
+)
+from .content_splitter_csv import (
+    count_csv_rows_from_binary,
+    split_csv_records,
+)
+from .content_splitter_pdf import split_pdf_records
 
 router = APIRouter(prefix="/opendata", tags=["opendata"])
 
@@ -76,17 +81,6 @@ def load_opendata_template() -> dict:
 
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
-
-
-def guess_ext_from_url(url: str) -> str:
-    path = urlparse(url).path or ""
-    if "." not in path:
-        return ""
-    return path.rsplit(".", 1)[-1].lower().strip()
-
-
-def normalize_text(v: Any) -> str:
-    return str(v or "").strip()
 
 
 def safe_int(v: Any, default: int) -> int:
@@ -181,7 +175,6 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
     requested_url_last = endpoint
     collected: List[dict] = []
 
-    # 取り切れないループ防止
     max_scan_pages = 10
     scanned_pages = 0
 
@@ -301,23 +294,11 @@ def infer_ext_from_resources(resources: List[dict], tpl: dict) -> Optional[str]:
         if ext:
             found.append(ext)
 
-    for p in allowed_formats:
-        if p in found:
-            return p
+    for preferred in allowed_formats:
+        if preferred in found:
+            return preferred
 
     return found[0] if found else None
-
-
-def count_csv_rows_from_binary(binary: bytes, encoding: str) -> Optional[int]:
-    try:
-        text = binary.decode(encoding, errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
-        cnt = 0
-        for _ in reader:
-            cnt += 1
-        return cnt
-    except Exception:
-        return None
 
 
 def count_json_rows_from_binary(binary: bytes, encoding: str) -> Optional[int]:
@@ -345,7 +326,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
     dataset_search_endpoint = ds_search.get("endpoint") or ""
     datastore_endpoint = ckan_datastore_search_endpoint(dataset_search_endpoint)
 
-    # 1. datastore_search が使えるならそれを優先
     if datastore_endpoint:
         for resource in resources:
             if not isinstance(resource, dict):
@@ -368,7 +348,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
             except Exception:
                 continue
 
-    # 2. CSV / JSON は実データを軽く読んで件数を出す
     encoding = get_data_fetch_encoding(tpl)
 
     for resource in resources:
@@ -386,7 +365,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
         try:
             binary, final_url, content_type = _fetch_binary(url)
 
-            # URLやContent-Typeから再判定
             ext2 = guess_ext_from_url(final_url) or ext
             ctype = (content_type or "").lower()
 
@@ -421,24 +399,6 @@ def summarize_dataset_from_api(ds: dict, requested_url: str, tpl: dict) -> Optio
     }
 
 
-def detect_resource_kind(resource: dict, source_path: str, content_type: str = "") -> str:
-    fmt = normalize_text(resource.get("format")).lower()
-    mimetype = normalize_text(resource.get("mimetype")).lower()
-    ext = guess_ext_from_url(source_path)
-    ctype = content_type.lower()
-
-    if fmt == "csv" or ext == "csv" or "csv" in mimetype or "csv" in ctype:
-        return "csv"
-
-    if fmt == "json" or ext == "json" or "json" in mimetype or "json" in ctype:
-        return "json"
-
-    if fmt == "pdf" or ext == "pdf" or "pdf" in mimetype or "pdf" in ctype:
-        return "pdf"
-
-    return ""
-
-
 def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, content_type: str = "") -> bool:
     allowed_formats = get_resource_filter_formats(tpl)
     if not allowed_formats:
@@ -458,19 +418,6 @@ def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, co
         return True
 
     return False
-
-
-def split_csv_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
-    text = binary.decode(encoding, errors="replace")
-    f = io.StringIO(text)
-    reader = csv.DictReader(f)
-
-    rows = []
-    for row in reader:
-        rows.append(dict(row))
-        if len(rows) >= max_rows:
-            break
-    return rows
 
 
 def split_json_records(binary: bytes, encoding: str, max_rows: int) -> List[dict]:
@@ -494,29 +441,6 @@ def split_json_records(binary: bytes, encoding: str, max_rows: int) -> List[dict
         return [obj]
 
     return [{"value": obj}]
-
-
-def split_pdf_records(binary: bytes, max_rows: int) -> List[dict]:
-    reader = PdfReader(io.BytesIO(binary))
-    pages = []
-
-    for i, page in enumerate(reader.pages, start=1):
-        text = ""
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-
-        pages.append({
-            "page": i,
-            "text": text,
-            "char_count": len(text),
-        })
-
-        if len(pages) >= max_rows:
-            break
-
-    return pages
 
 
 def build_row_records_for_resource(resource: dict, tpl: dict) -> Tuple[List[dict], str, str]:
@@ -576,18 +500,22 @@ def upsert_dataset_headers(
         ext = infer_ext_from_resources(allowed_resources, tpl)
         row_count = try_get_row_count_from_metadata(allowed_resources, tpl)
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT source_id, status
             FROM opendata_documents
             WHERE source_item_id = ?
             LIMIT 1
-        """, (dataset_id,))
+            """,
+            (dataset_id,),
+        )
         row = cur.fetchone()
 
         if row:
             source_id = row[0]
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE opendata_documents
                 SET logical_name = ?,
                     source_key = ?,
@@ -596,35 +524,41 @@ def upsert_dataset_headers(
                     row_count = ?,
                     created_at = ?
                 WHERE source_id = ?
-            """, (
-                title,
-                dataset_id,
-                dataset_url,
-                ext,
-                row_count,
-                created_at,
-                source_id,
-            ))
+                """,
+                (
+                    title,
+                    dataset_id,
+                    dataset_url,
+                    ext,
+                    row_count,
+                    created_at,
+                    source_id,
+                ),
+            )
         else:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO opendata_documents
                   (source_id, status, logical_name, source_key, source_item_id, source_url, ext, row_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                str(ulid.new()),
-                "new",
-                title,
-                dataset_id,
-                dataset_id,
-                dataset_url,
-                ext,
-                row_count,
-                created_at,
-            ))
+                """,
+                (
+                    str(ulid.new()),
+                    "new",
+                    title,
+                    dataset_id,
+                    dataset_id,
+                    dataset_url,
+                    ext,
+                    row_count,
+                    created_at,
+                ),
+            )
 
 
 def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
-    cur.execute("""
+    cur.execute(
+        """
         SELECT
           source_id,
           status,
@@ -637,21 +571,24 @@ def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
           created_at
         FROM opendata_documents
         ORDER BY created_at DESC
-    """)
+        """
+    )
 
     rows = cur.fetchall()
     out = []
     for row in rows:
-        out.append({
-            "source_id": row[0],
-            "status": row[1],
-            "title": row[2],
-            "dataset_id": row[4],
-            "dataset_url": row[5],
-            "ext": row[6],
-            "row_count": row[7],
-            "created_at": row[8],
-        })
+        out.append(
+            {
+                "source_id": row[0],
+                "status": row[1],
+                "title": row[2],
+                "dataset_id": row[4],
+                "dataset_url": row[5],
+                "ext": row[6],
+                "row_count": row[7],
+                "created_at": row[8],
+            }
+        )
     return out
 
 
@@ -669,12 +606,15 @@ def expand_dataset_into_row_data(
     if not dataset_id:
         raise HTTPException(status_code=400, detail="dataset_id not found")
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT source_id, status
         FROM opendata_documents
         WHERE source_item_id = ?
         LIMIT 1
-    """, (dataset_id,))
+        """,
+        (dataset_id,),
+    )
     row = cur.fetchone()
 
     if not row:
@@ -724,20 +664,23 @@ def expand_dataset_into_row_data(
 
             content = json.dumps(content_obj, ensure_ascii=False)
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT OR IGNORE INTO row_data
                   (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                row_id,
-                source_id,
-                "opendata",
-                dataset_id,
-                row_source_item_id,
-                row_index,
-                content,
-                created_at,
-            ))
+                """,
+                (
+                    row_id,
+                    source_id,
+                    "opendata",
+                    dataset_id,
+                    row_source_item_id,
+                    row_index,
+                    content,
+                    created_at,
+                ),
+            )
 
             if cur.rowcount == 1:
                 inserted_rows += 1
@@ -749,18 +692,20 @@ def expand_dataset_into_row_data(
     if inserted_rows == 0 and skipped_rows == 0:
         raise HTTPException(status_code=400, detail="登録対象データがありません")
 
-    # row_data に1件以上登録できたら完了
     if inserted_rows > 0:
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE opendata_documents
             SET status = ?, row_count = ?, ext = ?
             WHERE source_id = ?
-        """, (
-            "done",
-            inserted_rows,
-            detected_ext,
-            source_id,
-        ))
+            """,
+            (
+                "done",
+                inserted_rows,
+                detected_ext,
+                source_id,
+            ),
+        )
 
     return inserted_rows, skipped_rows
 
@@ -779,7 +724,7 @@ def _fetch_datasets_impl(authorization: str | None):
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
     local_db_path = f"/tmp/ank_{uid}_opendata_fetch.db"
@@ -824,7 +769,7 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
     local_db_path = f"/tmp/ank_{uid}_opendata_expand_{dataset_id}.db"
@@ -844,12 +789,15 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
         )
         conn.commit()
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT source_id, status, row_count, ext
             FROM opendata_documents
             WHERE source_item_id = ?
             LIMIT 1
-        """, (dataset_id,))
+            """,
+            (dataset_id,),
+        )
         row = cur.fetchone()
         source_id = row[0] if row else None
         status = row[1] if row else None
@@ -884,7 +832,7 @@ def _list_documents_impl(authorization: str | None):
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
     local_db_path = f"/tmp/ank_{uid}_opendata_documents.db"
@@ -893,7 +841,8 @@ def _list_documents_impl(authorization: str | None):
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
               d.source_id,
               d.status,
@@ -918,23 +867,26 @@ def _list_documents_impl(authorization: str | None):
               d.ext,
               d.created_at
             ORDER BY d.created_at DESC
-        """)
+            """
+        )
         rows = cur.fetchall()
     finally:
         conn.close()
 
     datasets = []
     for row in rows:
-        datasets.append({
-            "source_id": row[0],
-            "status": row[1],
-            "title": row[2],
-            "dataset_id": row[4],
-            "dataset_url": row[5],
-            "ext": row[6],
-            "row_count": row[7],
-            "created_at": row[8],
-        })
+        datasets.append(
+            {
+                "source_id": row[0],
+                "status": row[1],
+                "title": row[2],
+                "dataset_id": row[4],
+                "dataset_url": row[5],
+                "ext": row[6],
+                "row_count": row[7],
+                "created_at": row[8],
+            }
+        )
 
     return {
         "mode": "documents",
@@ -954,7 +906,7 @@ def _rows_impl(file_id: str, authorization: str | None):
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
     local_db_path = f"/tmp/ank_{uid}_opendata_rows.db"
@@ -963,7 +915,8 @@ def _rows_impl(file_id: str, authorization: str | None):
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
               row_id,
               file_id,
@@ -977,23 +930,27 @@ def _rows_impl(file_id: str, authorization: str | None):
             WHERE source_type = 'opendata'
               AND file_id = ?
             ORDER BY row_index
-        """, (file_id,))
+            """,
+            (file_id,),
+        )
         fetched = cur.fetchall()
     finally:
         conn.close()
 
     rows = []
     for row in fetched:
-        rows.append({
-            "row_id": row[0],
-            "file_id": row[1],
-            "source_type": row[2],
-            "source_key": row[3],
-            "source_item_id": row[4],
-            "row_index": row[5],
-            "content": row[6],
-            "created_at": row[7],
-        })
+        rows.append(
+            {
+                "row_id": row[0],
+                "file_id": row[1],
+                "source_type": row[2],
+                "source_key": row[3],
+                "source_item_id": row[4],
+                "row_index": row[5],
+                "content": row[6],
+                "created_at": row[7],
+            }
+        )
 
     return {
         "mode": "rows",
