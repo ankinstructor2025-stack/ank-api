@@ -9,7 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
@@ -264,6 +264,100 @@ def fetch_opendata_source_rows(local_db_path: str, source_id: str) -> list[sqlit
         conn.close()
 
 
+def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                job_id,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                job_item_id,
+                job_id,
+                source_type,
+                parent_source_id,
+                parent_key1,
+                parent_key2,
+                parent_label,
+                row_count,
+                status,
+                knowledge_count,
+                error_message,
+                created_at,
+                started_at,
+                finished_at
+            FROM knowledge_job_items
+            WHERE job_id = ?
+            ORDER BY created_at, job_item_id
+            """,
+            (job_id,),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_next_queued_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                job_item_id,
+                job_id,
+                source_type,
+                parent_source_id,
+                parent_key1,
+                parent_key2,
+                parent_label,
+                row_count,
+                status,
+                knowledge_count,
+                error_message,
+                created_at,
+                started_at,
+                finished_at
+            FROM knowledge_job_items
+            WHERE job_id = ?
+              AND status = 'queued'
+            ORDER BY created_at, job_item_id
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
 def fetch_opendata_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
     cur = conn.execute(
         """
@@ -340,6 +434,12 @@ def build_opendata_prompt_texts(
             )
         )
 
+    logger.info(
+        "opendata prompt build: job_item_id=%s chunk_count=%s template=%s",
+        job_item_id,
+        len(prompt_texts),
+        template_path,
+    )
     return prompt_texts
 
 
@@ -697,7 +797,7 @@ def prepare_job_item_and_prompts(
                 item.parent_key2,
                 item.parent_label,
                 item.row_count,
-                "preview" if preview_only else "running",
+                "preview" if preview_only else "queued",
                 requested_at,
                 requested_at,
             ),
@@ -736,6 +836,28 @@ def prepare_job_item_and_prompts(
             "plain_prompt_texts": plain_prompt_texts,
         }
 
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            UPDATE knowledge_job_items
+            SET status = 'running',
+                started_at = COALESCE(started_at, ?),
+                error_message = NULL
+            WHERE job_item_id = ?
+            """,
+            (now_iso(), job_item_id),
+        )
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -817,13 +939,12 @@ def finalize_job_item_error(
         conn.execute(
             """
             UPDATE knowledge_job_items
-            SET status = ?,
+            SET status = 'error',
                 finished_at = ?,
                 error_message = ?
             WHERE job_item_id = ?
             """,
             (
-                "error",
                 now_iso(),
                 error_message,
                 job_item_id,
@@ -878,6 +999,140 @@ def update_job_summary(
         conn.close()
 
 
+def create_job_record(
+    local_db_path: str,
+    body: "KnowledgeJobCreateRequest",
+    selected_count: int,
+) -> tuple[str, str]:
+    job_id = new_id()
+    requested_at = now_iso()
+
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO knowledge_jobs (
+                job_id,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
+            """,
+            (
+                job_id,
+                SOURCE_TYPE,
+                body.source_name or "オープンデータ",
+                body.request_type,
+                "preview" if body.preview_only else "queued",
+                selected_count,
+                requested_at,
+            ),
+        )
+        conn.commit()
+        return job_id, requested_at
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def process_opendata_job_item(
+    local_db_path: str,
+    job_id: str,
+    requested_at: str,
+    row: sqlite3.Row,
+    qa_chunk_conf: ChunkConfig,
+    plain_chunk_conf: ChunkConfig,
+    preview_only: bool,
+) -> dict[str, Any]:
+    item = KnowledgeTargetItem(
+        source_type=row["source_type"],
+        parent_source_id=row["parent_source_id"],
+        parent_key1=row["parent_key1"],
+        parent_key2=row["parent_key2"],
+        parent_label=row["parent_label"],
+        row_count=row["row_count"] or 0,
+    )
+
+    prepared = prepare_job_item_and_prompts(
+        local_db_path=local_db_path,
+        job_id=job_id,
+        item=item,
+        requested_at=requested_at,
+        qa_chunk_conf=qa_chunk_conf,
+        plain_chunk_conf=plain_chunk_conf,
+        preview_only=preview_only,
+    )
+
+    job_item_id = prepared["job_item_id"]
+    source_id = prepared["source_id"]
+    qa_prompt_texts = prepared["qa_prompt_texts"]
+    plain_prompt_texts = prepared["plain_prompt_texts"]
+
+    if preview_only:
+        qa_llm_result = {"job_item_id": job_item_id, "qa_list": []}
+        plain_llm_result = {"job_item_id": job_item_id, "plain_list": []}
+        qa_llm_result_for_debug = None
+        plain_llm_result_for_debug = None
+    else:
+        mark_job_item_running(local_db_path, job_item_id)
+
+        qa_chunk_results = run_chunked_llm_json(
+            qa_prompt_texts,
+            "LLM OPENDATA QA",
+        )
+        qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
+        qa_llm_result_for_debug = {
+            "chunk_results": qa_chunk_results,
+            "merged_result": qa_llm_result,
+        }
+
+        plain_chunk_results = run_chunked_llm_json(
+            plain_prompt_texts,
+            "LLM OPENDATA PLAIN",
+        )
+        plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
+        plain_llm_result_for_debug = {
+            "chunk_results": plain_chunk_results,
+            "merged_result": plain_llm_result,
+        }
+
+    qa_count, plain_count = finalize_job_item_success(
+        local_db_path=local_db_path,
+        job_id=job_id,
+        job_item_id=job_item_id,
+        source_id=source_id,
+        qa_llm_result=qa_llm_result,
+        plain_llm_result=plain_llm_result,
+        preview_only=preview_only,
+    )
+
+    return {
+        "job_item_id": job_item_id,
+        "parent_source_id": item.parent_source_id,
+        "parent_label": item.parent_label,
+        "qa_count": qa_count,
+        "plain_count": plain_count,
+        "status": "preview" if preview_only else "ready",
+        "qa_prompt_texts": qa_prompt_texts,
+        "plain_prompt_texts": plain_prompt_texts,
+        "qa_debug": qa_llm_result_for_debug,
+        "plain_debug": plain_llm_result_for_debug,
+    }
+
+
 class KnowledgeTargetItem(BaseModel):
     source_type: Optional[str] = Field(default=SOURCE_TYPE, description="opendata")
     parent_source_id: Optional[str] = None
@@ -922,6 +1177,36 @@ class KnowledgeJobCreateResponse(BaseModel):
     debug_items: List[KnowledgeDebugItem] = []
 
 
+class KnowledgeRunRequest(BaseModel):
+    job_id: str
+
+
+class KnowledgeJobStatusItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    status: str
+    knowledge_count: int = 0
+    error_message: Optional[str] = None
+    row_count: int = 0
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class KnowledgeJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    selected_count: int = 0
+    qa_count: int = 0
+    plain_count: int = 0
+    error_count: int = 0
+    requested_at: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    error_message: Optional[str] = None
+    items: List[KnowledgeJobStatusItem] = []
+
+
 def validate_request(body: KnowledgeJobCreateRequest) -> None:
     if body.source_type not in (None, "", SOURCE_TYPE):
         raise HTTPException(status_code=400, detail=f"source_type must be '{SOURCE_TYPE}'")
@@ -961,9 +1246,6 @@ def create_opendata_job(
         qa_chunk_conf = get_opendata_chunk_conf(chunk_config, "qa")
         plain_chunk_conf = get_opendata_chunk_conf(chunk_config, "plain")
 
-        job_id = new_id()
-        requested_at = now_iso()
-
         unique_items: List[KnowledgeTargetItem] = []
         seen_keys = set()
 
@@ -980,38 +1262,153 @@ def create_opendata_job(
             unique_items.append(item)
 
         selected_count = len(unique_items)
+        job_id, requested_at = create_job_record(local_db_path, body, selected_count)
+
+        prompt_previews: List[PromptPreviewItem] = []
+        debug_items: List[KnowledgeDebugItem] = []
+        created_item_count = 0
+
+        for item in unique_items:
+            prepared = prepare_job_item_and_prompts(
+                local_db_path=local_db_path,
+                job_id=job_id,
+                item=item,
+                requested_at=requested_at,
+                qa_chunk_conf=qa_chunk_conf,
+                plain_chunk_conf=plain_chunk_conf,
+                preview_only=body.preview_only,
+            )
+
+            prompt_previews.append(
+                PromptPreviewItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_source_id=item.parent_source_id,
+                    parent_label=item.parent_label,
+                    prompt_type="qa",
+                    prompt_text=join_prompt_previews(prepared["qa_prompt_texts"]),
+                )
+            )
+            prompt_previews.append(
+                PromptPreviewItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_source_id=item.parent_source_id,
+                    parent_label=item.parent_label,
+                    prompt_type="plain",
+                    prompt_text=join_prompt_previews(prepared["plain_prompt_texts"]),
+                )
+            )
+
+            debug_items.append(
+                KnowledgeDebugItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_label=item.parent_label,
+                    status="preview" if body.preview_only else "queued",
+                    qa_count=0,
+                    plain_count=0,
+                    error_message=None,
+                    llm_result=None,
+                )
+            )
+            created_item_count += 1
+
+        initial_status = "preview" if body.preview_only else "queued"
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status=initial_status,
+            total_qa_count=0,
+            total_plain_count=0,
+            total_error_count=0,
+        )
+
+        db_blob.upload_from_filename(local_db_path)
+
+        return KnowledgeJobCreateResponse(
+            job_id=job_id,
+            selected_count=selected_count,
+            created_item_count=created_item_count,
+            status=initial_status,
+            prompt_previews=prompt_previews,
+            debug_items=debug_items,
+        )
+
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
+
+    except Exception as e:
+        logger.exception("create_opendata_job failed")
+        raise HTTPException(status_code=500, detail=f"create_opendata_job failed: {type(e).__name__}: {e}")
+
+
+@router.post("/run", response_model=KnowledgeJobCreateResponse)
+def run_opendata_job(
+    body: KnowledgeRunRequest,
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_run.db"
+    db_blob.download_to_filename(local_db_path)
+
+    try:
+        job_row = fetch_job_row(local_db_path, body.job_id)
+        if not job_row:
+            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
+        if job_row["source_type"] != SOURCE_TYPE:
+            raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
+
+        if job_row["status"] == "ready":
+            items = fetch_job_items(local_db_path, body.job_id)
+            return KnowledgeJobCreateResponse(
+                job_id=body.job_id,
+                selected_count=job_row["selected_count"] or 0,
+                created_item_count=len(items),
+                status="ready",
+                prompt_previews=[],
+                debug_items=[],
+            )
+
+        if job_row["status"] == "preview":
+            raise HTTPException(status_code=400, detail="preview job cannot be run")
+
+        chunk_config = load_chunk_config()
+        qa_chunk_conf = get_opendata_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_opendata_chunk_conf(chunk_config, "plain")
+
+        requested_at = job_row["requested_at"] or now_iso()
+        selected_count = job_row["selected_count"] or 0
+
+        prompt_previews: List[PromptPreviewItem] = []
+        debug_items: List[KnowledgeDebugItem] = []
+        created_item_count = 0
+        total_qa_count = int(job_row["qa_count"] or 0)
+        total_plain_count = int(job_row["plain_count"] or 0)
+        total_error_count = int(job_row["error_count"] or 0)
 
         conn = open_user_db(local_db_path)
         try:
             conn.execute("BEGIN")
             conn.execute(
                 """
-                INSERT INTO knowledge_jobs (
-                    job_id,
-                    source_type,
-                    source_name,
-                    request_type,
-                    status,
-                    selected_count,
-                    qa_count,
-                    plain_count,
-                    error_count,
-                    requested_at,
-                    started_at,
-                    finished_at,
-                    error_message
-                )
-                VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
+                UPDATE knowledge_jobs
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    error_message = NULL
+                WHERE job_id = ?
                 """,
-                (
-                    job_id,
-                    SOURCE_TYPE,
-                    body.source_name or "オープンデータ",
-                    body.request_type,
-                    "preview" if body.preview_only else "running",
-                    selected_count,
-                    requested_at,
-                ),
+                (now_iso(), body.job_id),
             )
             conn.commit()
         except Exception:
@@ -1020,113 +1417,65 @@ def create_opendata_job(
         finally:
             conn.close()
 
-        created_item_count = 0
-        total_plain_count = 0
-        total_qa_count = 0
-        total_error_count = 0
-        prompt_previews: List[PromptPreviewItem] = []
-        debug_items: List[KnowledgeDebugItem] = []
+        while True:
+            row = fetch_next_queued_job_item(local_db_path, body.job_id)
+            if not row:
+                break
 
-        for item in unique_items:
-            job_item_id: Optional[str] = None
+            job_item_id = None
             try:
-                prepared = prepare_job_item_and_prompts(
+                result = process_opendata_job_item(
                     local_db_path=local_db_path,
-                    job_id=job_id,
-                    item=item,
+                    job_id=body.job_id,
                     requested_at=requested_at,
+                    row=row,
                     qa_chunk_conf=qa_chunk_conf,
                     plain_chunk_conf=plain_chunk_conf,
-                    preview_only=body.preview_only,
+                    preview_only=False,
                 )
 
-                job_item_id = prepared["job_item_id"]
-                source_id = prepared["source_id"]
-                qa_prompt_texts = prepared["qa_prompt_texts"]
-                plain_prompt_texts = prepared["plain_prompt_texts"]
+                job_item_id = result["job_item_id"]
 
                 prompt_previews.append(
                     PromptPreviewItem(
                         job_item_id=job_item_id,
-                        parent_source_id=item.parent_source_id,
-                        parent_label=item.parent_label,
+                        parent_source_id=result["parent_source_id"],
+                        parent_label=result["parent_label"],
                         prompt_type="qa",
-                        prompt_text=join_prompt_previews(qa_prompt_texts),
+                        prompt_text=join_prompt_previews(result["qa_prompt_texts"]),
                     )
                 )
-
                 prompt_previews.append(
                     PromptPreviewItem(
                         job_item_id=job_item_id,
-                        parent_source_id=item.parent_source_id,
-                        parent_label=item.parent_label,
+                        parent_source_id=result["parent_source_id"],
+                        parent_label=result["parent_label"],
                         prompt_type="plain",
-                        prompt_text=join_prompt_previews(plain_prompt_texts),
+                        prompt_text=join_prompt_previews(result["plain_prompt_texts"]),
                     )
                 )
-
-                qa_llm_result_for_debug: Optional[dict] = None
-                plain_llm_result_for_debug: Optional[dict] = None
-
-                if body.preview_only:
-                    qa_llm_result = {"job_item_id": job_item_id, "qa_list": []}
-                    plain_llm_result = {"job_item_id": job_item_id, "plain_list": []}
-                else:
-                    qa_chunk_results = run_chunked_llm_json(
-                        qa_prompt_texts,
-                        "LLM OPENDATA QA",
-                    )
-                    qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
-                    qa_llm_result_for_debug = {
-                        "chunk_results": qa_chunk_results,
-                        "merged_result": qa_llm_result,
-                    }
-
-                    plain_chunk_results = run_chunked_llm_json(
-                        plain_prompt_texts,
-                        "LLM OPENDATA PLAIN",
-                    )
-                    plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
-                    plain_llm_result_for_debug = {
-                        "chunk_results": plain_chunk_results,
-                        "merged_result": plain_llm_result,
-                    }
-
-                qa_count, plain_count = finalize_job_item_success(
-                    local_db_path=local_db_path,
-                    job_id=job_id,
-                    job_item_id=job_item_id,
-                    source_id=source_id,
-                    qa_llm_result=qa_llm_result,
-                    plain_llm_result=plain_llm_result,
-                    preview_only=body.preview_only,
-                )
-
-                item_status = "preview" if body.preview_only else "ready"
 
                 debug_items.append(
                     KnowledgeDebugItem(
                         job_item_id=job_item_id,
-                        parent_label=item.parent_label,
-                        status=item_status,
-                        qa_count=qa_count,
-                        plain_count=plain_count,
+                        parent_label=result["parent_label"],
+                        status=result["status"],
+                        qa_count=result["qa_count"],
+                        plain_count=result["plain_count"],
                         error_message=None,
                         llm_result={
-                            "qa": qa_llm_result_for_debug,
-                            "plain": plain_llm_result_for_debug,
+                            "qa": result["qa_debug"],
+                            "plain": result["plain_debug"],
                         },
                     )
                 )
 
                 created_item_count += 1
-                total_qa_count += qa_count
-                total_plain_count += plain_count
+                total_qa_count += result["qa_count"]
+                total_plain_count += result["plain_count"]
 
             except Exception as e:
-                logger.exception("opendata job item failed: job_id=%s job_item_id=%s", job_id, job_item_id)
-
-                total_error_count += 1
+                logger.exception("run_opendata_job item failed: job_id=%s job_item_id=%s", body.job_id, job_item_id)
 
                 if job_item_id:
                     try:
@@ -1141,7 +1490,7 @@ def create_opendata_job(
                 debug_items.append(
                     KnowledgeDebugItem(
                         job_item_id=job_item_id or "",
-                        parent_label=item.parent_label,
+                        parent_label=row["parent_label"],
                         status="error",
                         qa_count=0,
                         plain_count=0,
@@ -1149,18 +1498,14 @@ def create_opendata_job(
                         llm_result=None,
                     )
                 )
+                total_error_count += 1
+                break
 
-                raise
-
-        final_status = (
-            "partial_error"
-            if total_error_count > 0
-            else ("preview" if body.preview_only else "ready")
-        )
+        final_status = "partial_error" if total_error_count > 0 else "ready"
 
         update_job_summary(
             local_db_path=local_db_path,
-            job_id=job_id,
+            job_id=body.job_id,
             requested_at=requested_at,
             status=final_status,
             total_qa_count=total_qa_count,
@@ -1171,7 +1516,7 @@ def create_opendata_job(
         db_blob.upload_from_filename(local_db_path)
 
         return KnowledgeJobCreateResponse(
-            job_id=job_id,
+            job_id=body.job_id,
             selected_count=selected_count,
             created_item_count=created_item_count,
             status=final_status,
@@ -1183,5 +1528,68 @@ def create_opendata_job(
         raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
 
     except Exception as e:
-        logger.exception("create_opendata_job failed")
-        raise HTTPException(status_code=500, detail=f"create_opendata_job failed: {type(e).__name__}: {e}")
+        logger.exception("run_opendata_job failed")
+        raise HTTPException(status_code=500, detail=f"run_opendata_job failed: {type(e).__name__}: {e}")
+
+
+@router.get("/status", response_model=KnowledgeJobStatusResponse)
+def get_opendata_job_status(
+    job_id: str = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_status.db"
+    db_blob.download_to_filename(local_db_path)
+
+    try:
+        job_row = fetch_job_row(local_db_path, job_id)
+        if not job_row:
+            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
+        if job_row["source_type"] != SOURCE_TYPE:
+            raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
+
+        item_rows = fetch_job_items(local_db_path, job_id)
+        items = [
+            KnowledgeJobStatusItem(
+                job_item_id=row["job_item_id"],
+                parent_source_id=row["parent_source_id"],
+                parent_label=row["parent_label"],
+                status=row["status"] or "",
+                knowledge_count=int(row["knowledge_count"] or 0),
+                error_message=row["error_message"],
+                row_count=int(row["row_count"] or 0),
+                started_at=row["started_at"],
+                finished_at=row["finished_at"],
+            )
+            for row in item_rows
+        ]
+
+        return KnowledgeJobStatusResponse(
+            job_id=job_row["job_id"],
+            status=job_row["status"] or "",
+            selected_count=int(job_row["selected_count"] or 0),
+            qa_count=int(job_row["qa_count"] or 0),
+            plain_count=int(job_row["plain_count"] or 0),
+            error_count=int(job_row["error_count"] or 0),
+            requested_at=job_row["requested_at"],
+            started_at=job_row["started_at"],
+            finished_at=job_row["finished_at"],
+            error_message=job_row["error_message"],
+            items=items,
+        )
+
+    except Exception as e:
+        logger.exception("get_opendata_job_status failed")
+        raise HTTPException(status_code=500, detail=f"get_opendata_job_status failed: {type(e).__name__}: {e}")
