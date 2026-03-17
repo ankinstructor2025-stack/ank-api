@@ -234,6 +234,11 @@ def open_user_db(local_db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
+    db_blob.upload_from_filename(local_db_path)
+    logger.info("db uploaded to gcs: %s", db_blob.name)
+
+
 def fetch_opendata_source_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
     try:
@@ -825,7 +830,7 @@ def prepare_job_item(
                 started_at,
                 finished_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL, NULL)
             """,
             (
                 job_item_id,
@@ -837,7 +842,6 @@ def prepare_job_item(
                 item.parent_label,
                 item.row_count,
                 "preview" if preview_only else "queued",
-                requested_at,
                 requested_at,
             ),
         )
@@ -1036,8 +1040,14 @@ def update_job_summary(
                 qa_count = ?,
                 plain_count = ?,
                 error_count = ?,
-                started_at = COALESCE(started_at, ?),
-                finished_at = ?
+                started_at = CASE
+                    WHEN ? IN ('running', 'ready', 'partial_error', 'error') THEN COALESCE(started_at, ?)
+                    ELSE started_at
+                END,
+                finished_at = CASE
+                    WHEN ? IN ('ready', 'partial_error', 'error', 'preview') THEN ?
+                    ELSE NULL
+                END
             WHERE job_id = ?
             """,
             (
@@ -1045,7 +1055,9 @@ def update_job_summary(
                 total_qa_count,
                 total_plain_count,
                 total_error_count,
+                status,
                 requested_at,
+                status,
                 now_iso(),
                 job_id,
             ),
@@ -1084,6 +1096,13 @@ def process_opendata_job_item(
         plain_llm_result_for_debug = None
     else:
         mark_job_item_running(local_db_path, job_item_id)
+
+        logger.info(
+            "llm start: job_item_id=%s qa_chunks=%s plain_chunks=%s",
+            job_item_id,
+            len(qa_prompt_texts),
+            len(plain_prompt_texts),
+        )
 
         qa_chunk_results = run_chunked_llm_json(
             qa_prompt_texts,
@@ -1323,7 +1342,7 @@ def create_opendata_job(
             total_error_count=0,
         )
 
-        db_blob.upload_from_filename(local_db_path)
+        upload_local_db(db_blob, local_db_path)
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
@@ -1406,6 +1425,7 @@ def run_opendata_job(
                 UPDATE knowledge_jobs
                 SET status = 'running',
                     started_at = COALESCE(started_at, ?),
+                    finished_at = NULL,
                     error_message = NULL
                 WHERE job_id = ?
                 """,
@@ -1418,12 +1438,17 @@ def run_opendata_job(
         finally:
             conn.close()
 
+        upload_local_db(db_blob, local_db_path)
+        logger.info("run_opendata_job start: job_id=%s", body.job_id)
+
         while True:
             row = fetch_next_queued_job_item(local_db_path, body.job_id)
             if not row:
+                logger.info("no queued items: job_id=%s", body.job_id)
                 break
 
             current_job_item_id = row["job_item_id"]
+            logger.info("processing queued item: job_id=%s job_item_id=%s", body.job_id, current_job_item_id)
 
             try:
                 result = process_opendata_job_item(
@@ -1473,6 +1498,17 @@ def run_opendata_job(
                 total_qa_count += result["qa_count"]
                 total_plain_count += result["plain_count"]
 
+                update_job_summary(
+                    local_db_path=local_db_path,
+                    job_id=body.job_id,
+                    requested_at=requested_at,
+                    status="running",
+                    total_qa_count=total_qa_count,
+                    total_plain_count=total_plain_count,
+                    total_error_count=total_error_count,
+                )
+                upload_local_db(db_blob, local_db_path)
+
             except Exception as e:
                 logger.exception(
                     "run_opendata_job item failed: job_id=%s job_item_id=%s",
@@ -1501,6 +1537,17 @@ def run_opendata_job(
                     )
                 )
                 total_error_count += 1
+
+                update_job_summary(
+                    local_db_path=local_db_path,
+                    job_id=body.job_id,
+                    requested_at=requested_at,
+                    status="partial_error",
+                    total_qa_count=total_qa_count,
+                    total_plain_count=total_plain_count,
+                    total_error_count=total_error_count,
+                )
+                upload_local_db(db_blob, local_db_path)
                 break
 
         final_status = "partial_error" if total_error_count > 0 else "ready"
@@ -1515,7 +1562,7 @@ def run_opendata_job(
             total_error_count=total_error_count,
         )
 
-        db_blob.upload_from_filename(local_db_path)
+        upload_local_db(db_blob, local_db_path)
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
