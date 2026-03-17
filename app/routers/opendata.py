@@ -181,7 +181,6 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
     requested_url_last = endpoint
     collected: List[dict] = []
 
-    # 取り切れないループ防止
     max_scan_pages = 10
     scanned_pages = 0
 
@@ -345,7 +344,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
     dataset_search_endpoint = ds_search.get("endpoint") or ""
     datastore_endpoint = ckan_datastore_search_endpoint(dataset_search_endpoint)
 
-    # 1. datastore_search が使えるならそれを優先
     if datastore_endpoint:
         for resource in resources:
             if not isinstance(resource, dict):
@@ -368,7 +366,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
             except Exception:
                 continue
 
-    # 2. CSV / JSON は実データを軽く読んで件数を出す
     encoding = get_data_fetch_encoding(tpl)
 
     for resource in resources:
@@ -386,7 +383,6 @@ def try_get_row_count_from_metadata(resources: List[dict], tpl: dict) -> Optiona
         try:
             binary, final_url, content_type = _fetch_binary(url)
 
-            # URLやContent-Typeから再判定
             ext2 = guess_ext_from_url(final_url) or ext
             ctype = (content_type or "").lower()
 
@@ -749,7 +745,6 @@ def expand_dataset_into_row_data(
     if inserted_rows == 0 and skipped_rows == 0:
         raise HTTPException(status_code=400, detail="登録対象データがありません")
 
-    # row_data に1件以上登録できたら完了
     if inserted_rows > 0:
         cur.execute("""
             UPDATE opendata_documents
@@ -801,6 +796,37 @@ def _fetch_datasets_impl(authorization: str | None):
     return {
         "mode": "fetch_datasets",
         "requested_url": requested_url,
+        "dataset_count": len(items),
+        "datasets": items,
+    }
+
+
+def _list_documents_impl(authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_opendata_documents.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    try:
+        cur = conn.cursor()
+        items = list_registered_datasets(cur)
+    finally:
+        conn.close()
+
+    return {
+        "mode": "documents",
         "dataset_count": len(items),
         "datasets": items,
     }
@@ -885,6 +911,13 @@ def opendata_fetch_datasets_post(
     authorization: str | None = Header(default=None),
 ):
     return _fetch_datasets_impl(authorization)
+
+
+@router.get("/documents")
+def opendata_documents_get(
+    authorization: str | None = Header(default=None),
+):
+    return _list_documents_impl(authorization)
 
 
 @router.get("/expand_dataset")
