@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import json
-import csv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +11,11 @@ import firebase_admin
 from firebase_admin import auth as fb_auth
 
 import ulid
+
+from .content_detector import detect_content_kind
+from .content_splitter_csv import split_csv_records
+from .content_splitter_pdf import split_pdf_records
+
 
 router = APIRouter()
 JST = ZoneInfo("Asia/Tokyo")
@@ -46,12 +50,46 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
+def split_json_records(binary: bytes) -> list[str]:
+    text = binary.decode("utf-8", errors="replace")
+    obj = json.loads(text)
+
+    if isinstance(obj, list):
+        return [json.dumps(r, ensure_ascii=False) for r in obj]
+
+    return [json.dumps(obj, ensure_ascii=False)]
+
+
+def split_text_lines(binary: bytes) -> list[str]:
+    text = binary.decode("utf-8", errors="replace")
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def build_row_contents(file_bytes: bytes, original_filename: str, ext: str) -> list[str]:
+    kind = detect_content_kind(
+        filename=original_filename,
+        declared_format=ext,
+    )
+
+    if kind == "csv":
+        records = split_csv_records(file_bytes)
+        return [json.dumps(r, ensure_ascii=False) for r in records]
+
+    if kind == "pdf":
+        records = split_pdf_records(file_bytes)
+        return [json.dumps(r, ensure_ascii=False) for r in records]
+
+    if kind == "json":
+        return split_json_records(file_bytes)
+
+    return split_text_lines(file_bytes)
+
+
 @router.post("/ingest_uploaded_file/{file_id}")
 def ingest_uploaded_file(
     file_id: str,
     authorization: str | None = Header(default=None),
 ):
-
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
@@ -70,11 +108,14 @@ def ingest_uploaded_file(
         conn = sqlite3.connect(local_db_path)
         cur = conn.cursor()
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT logical_name, original_name, ext
             FROM upload_files
             WHERE file_id = ?
-        """, (file_id,))
+            """,
+            (file_id,),
+        )
 
         row = cur.fetchone()
 
@@ -97,38 +138,35 @@ def ingest_uploaded_file(
             raise HTTPException(status_code=404, detail="uploaded file not found")
 
         file_bytes = upload_blob.download_as_bytes()
-        text = file_bytes.decode("utf-8", errors="replace")
 
-        ext_lower = (ext or "").lower()
-
-        if ext_lower == "csv":
-            reader = csv.DictReader(text.splitlines())
-            rows = [json.dumps(r, ensure_ascii=False) for r in reader]
-        elif ext_lower == "json":
-            obj = json.loads(text)
-            if isinstance(obj, list):
-                rows = [json.dumps(r, ensure_ascii=False) for r in obj]
-            else:
-                rows = [json.dumps(obj, ensure_ascii=False)]
-        else:
-            rows = [line for line in text.splitlines() if line.strip()]
+        try:
+            rows = build_row_contents(file_bytes, original_filename, ext)
+        except json.JSONDecodeError as e:
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"json parse error: {e}")
+        except Exception as e:
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"split error: {e}")
 
         created_at = datetime.now(tz=JST).isoformat()
 
         for i, content in enumerate(rows):
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO row_data
                 (row_id, file_id, source_type, source_key, row_index, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                str(ulid.new()),
-                file_id,
-                "upload",
-                logical_name,
-                i,
-                content,
-                created_at
-            ))
+                """,
+                (
+                    str(ulid.new()),
+                    file_id,
+                    "upload",
+                    logical_name,
+                    i,
+                    content,
+                    created_at,
+                ),
+            )
 
         conn.commit()
         conn.close()
@@ -138,7 +176,7 @@ def ingest_uploaded_file(
         return {
             "file_id": file_id,
             "logical_name": logical_name,
-            "row_count": len(rows)
+            "row_count": len(rows),
         }
 
     finally:
