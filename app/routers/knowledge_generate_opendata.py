@@ -96,6 +96,93 @@ def new_id() -> str:
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
+def opendata_status_json_path(uid: str, job_id: str) -> str:
+    return f"users/{uid}/job_status/opendata_{job_id}.json"
+
+
+def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "job_item_id": row["job_item_id"],
+        "parent_source_id": row["parent_source_id"],
+        "parent_label": row["parent_label"],
+        "status": row["status"] or "",
+        "knowledge_count": int(row["knowledge_count"] or 0),
+        "error_message": row["error_message"],
+        "row_count": int(row["row_count"] or 0),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
+    job_row = fetch_job_row(local_db_path, job_id)
+    if not job_row:
+        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
+
+    item_rows = fetch_job_items(local_db_path, job_id)
+    return {
+        "job_id": job_row["job_id"],
+        "status": job_row["status"] or "",
+        "selected_count": int(job_row["selected_count"] or 0),
+        "qa_count": int(job_row["qa_count"] or 0),
+        "plain_count": int(job_row["plain_count"] or 0),
+        "error_count": int(job_row["error_count"] or 0),
+        "requested_at": job_row["requested_at"],
+        "started_at": job_row["started_at"],
+        "finished_at": job_row["finished_at"],
+        "error_message": job_row["error_message"],
+        "items": [row_to_status_item(row) for row in item_rows],
+    }
+
+
+def upload_status_payload(bucket: storage.Bucket, uid: str, job_id: str, payload: dict[str, Any]) -> None:
+    blob = bucket.blob(opendata_status_json_path(uid, job_id))
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        content_type="application/json; charset=utf-8",
+    )
+    logger.info("status json uploaded: %s", blob.name)
+
+
+def build_and_upload_status_payload(bucket: storage.Bucket, uid: str, local_db_path: str, job_id: str) -> dict[str, Any]:
+    payload = build_status_payload_from_db(local_db_path, job_id)
+    upload_status_payload(bucket, uid, job_id, payload)
+    return payload
+
+
+def try_read_status_payload(bucket: storage.Bucket, uid: str, job_id: str) -> dict[str, Any] | None:
+    blob = bucket.blob(opendata_status_json_path(uid, job_id))
+    if not blob.exists():
+        return None
+    try:
+        payload = json.loads(blob.download_as_bytes().decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("job_id") == job_id:
+            return payload
+    except Exception:
+        logger.exception("failed to read status json: job_id=%s", job_id)
+    return None
+
+
+def fetch_other_running_job_id(local_db_path: str, job_id: str) -> str | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT job_id
+            FROM knowledge_jobs
+            WHERE source_type = ?
+              AND status = 'running'
+              AND job_id <> ?
+            ORDER BY requested_at
+            LIMIT 1
+            """,
+            (SOURCE_TYPE, job_id),
+        )
+        row = cur.fetchone()
+        return row["job_id"] if row else None
+    finally:
+        conn.close()
+
 
 def ensure_firebase_initialized():
     if firebase_admin._apps:
@@ -1100,8 +1187,6 @@ def process_opendata_job_item(
         qa_llm_result_for_debug = None
         plain_llm_result_for_debug = None
     else:
-        mark_job_item_running(local_db_path, job_item_id)
-
         logger.info(
             "llm start: job_item_id=%s qa_chunks=%s plain_chunks=%s",
             job_item_id,
@@ -1184,6 +1269,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 error_message="invalid source_type",
             )
             upload_local_db(db_blob, local_db_path)
+            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
             logger.error(
                 "job source_type mismatch: job_id=%s source_type=%s",
                 job_id,
@@ -1203,6 +1289,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 error_message="preview job cannot run",
             )
             upload_local_db(db_blob, local_db_path)
+            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
             logger.warning("preview job cannot be run: job_id=%s", job_id)
             return
 
@@ -1225,7 +1312,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             total_error_count=total_error_count,
             error_message=None,
         )
-        upload_local_db(db_blob, local_db_path)
+        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
         logger.info("run_opendata_job_background start: job_id=%s", job_id)
 
@@ -1243,6 +1330,9 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             )
 
             try:
+                mark_job_item_running(local_db_path, current_job_item_id)
+                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
+
                 result = process_opendata_job_item(
                     local_db_path=local_db_path,
                     job_id=job_id,
@@ -1265,7 +1355,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     total_error_count=total_error_count,
                     error_message=None,
                 )
-                upload_local_db(db_blob, local_db_path)
+                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
             except Exception as e:
                 logger.exception(
@@ -1299,6 +1389,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     error_message=str(e),
                 )
                 upload_local_db(db_blob, local_db_path)
+                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
                 return
 
         final_status = "partial_error" if total_error_count > 0 else "ready"
@@ -1314,6 +1405,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             error_message=None if final_status == "ready" else "partial_error",
         )
         upload_local_db(db_blob, local_db_path)
+        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
         logger.info("run_opendata_job_background finished: job_id=%s status=%s", job_id, final_status)
 
@@ -1338,6 +1430,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 error_message=f"{type(e).__name__}: {e}",
             )
             upload_local_db(db_blob, local_db_path)
+            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
         except Exception:
             logger.exception("failed to update job error state in background: job_id=%s", job_id)
 
@@ -1538,6 +1631,7 @@ def create_opendata_job(
         )
 
         upload_local_db(db_blob, local_db_path)
+        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
@@ -1586,53 +1680,38 @@ def run_opendata_job(
         if not job_row:
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
         if job_row["source_type"] != SOURCE_TYPE:
-            update_job_summary(
-                local_db_path=local_db_path,
-                job_id=job_id,
-                requested_at=(job_row["requested_at"] or now_iso()),
-                status="error",
-                total_qa_count=int(job_row["qa_count"] or 0),
-                total_plain_count=int(job_row["plain_count"] or 0),
-                total_error_count=int(job_row["error_count"] or 0) + 1,
-                error_message="invalid source_type",
-            )
-            upload_local_db(db_blob, local_db_path)
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         if job_row["status"] == "ready":
-            items = fetch_job_items(local_db_path, body.job_id)
+            payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(job_row["selected_count"] or 0),
-                created_item_count=len(items),
+                selected_count=int(payload["selected_count"] or 0),
+                created_item_count=len(payload["items"]),
                 status="ready",
                 prompt_previews=[],
                 debug_items=[],
             )
 
         if job_row["status"] == "preview":
-            update_job_summary(
-                local_db_path=local_db_path,
-                job_id=job_id,
-                requested_at=(job_row["requested_at"] or now_iso()),
-                status="error",
-                total_qa_count=int(job_row["qa_count"] or 0),
-                total_plain_count=int(job_row["plain_count"] or 0),
-                total_error_count=int(job_row["error_count"] or 0) + 1,
-                error_message="preview job cannot run",
-            )
-            upload_local_db(db_blob, local_db_path)
             raise HTTPException(status_code=400, detail="preview job cannot be run")
 
         if job_row["status"] == "running":
-            items = fetch_job_items(local_db_path, body.job_id)
+            payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(job_row["selected_count"] or 0),
-                created_item_count=len(items),
+                selected_count=int(payload["selected_count"] or 0),
+                created_item_count=len(payload["items"]),
                 status="running",
                 prompt_previews=[],
                 debug_items=[],
+            )
+
+        other_running_job_id = fetch_other_running_job_id(local_db_path, body.job_id)
+        if other_running_job_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"別のジョブが実行中です。完了後に再実行してください。 running_job_id={other_running_job_id}",
             )
 
         requested_at = job_row["requested_at"] or now_iso()
@@ -1651,14 +1730,14 @@ def run_opendata_job(
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
+        payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
 
         background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
 
-        items = fetch_job_items(local_db_path, body.job_id)
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=int(job_row["selected_count"] or 0),
-            created_item_count=len(items),
+            selected_count=int(payload["selected_count"] or 0),
+            created_item_count=len(payload["items"]),
             status="running",
             prompt_previews=[],
             debug_items=[],
@@ -1685,6 +1764,10 @@ def get_opendata_job_status(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
+    status_payload = try_read_status_payload(bucket, uid, job_id)
+    if status_payload:
+        return KnowledgeJobStatusResponse(**status_payload)
+
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
@@ -1697,52 +1780,8 @@ def get_opendata_job_status(
     db_blob.download_to_filename(local_db_path)
 
     try:
-        job_row = fetch_job_row(local_db_path, job_id)
-        if not job_row:
-            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
-        if job_row["source_type"] != SOURCE_TYPE:
-            update_job_summary(
-                local_db_path=local_db_path,
-                job_id=job_id,
-                requested_at=(job_row["requested_at"] or now_iso()),
-                status="error",
-                total_qa_count=int(job_row["qa_count"] or 0),
-                total_plain_count=int(job_row["plain_count"] or 0),
-                total_error_count=int(job_row["error_count"] or 0) + 1,
-                error_message="invalid source_type",
-            )
-            upload_local_db(db_blob, local_db_path)
-            raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
-
-        item_rows = fetch_job_items(local_db_path, job_id)
-        items = [
-            KnowledgeJobStatusItem(
-                job_item_id=row["job_item_id"],
-                parent_source_id=row["parent_source_id"],
-                parent_label=row["parent_label"],
-                status=row["status"] or "",
-                knowledge_count=int(row["knowledge_count"] or 0),
-                error_message=row["error_message"],
-                row_count=int(row["row_count"] or 0),
-                started_at=row["started_at"],
-                finished_at=row["finished_at"],
-            )
-            for row in item_rows
-        ]
-
-        return KnowledgeJobStatusResponse(
-            job_id=job_row["job_id"],
-            status=job_row["status"] or "",
-            selected_count=int(job_row["selected_count"] or 0),
-            qa_count=int(job_row["qa_count"] or 0),
-            plain_count=int(job_row["plain_count"] or 0),
-            error_count=int(job_row["error_count"] or 0),
-            requested_at=job_row["requested_at"],
-            started_at=job_row["started_at"],
-            finished_at=job_row["finished_at"],
-            error_message=job_row["error_message"],
-            items=items,
-        )
+        payload = build_status_payload_from_db(local_db_path, job_id)
+        return KnowledgeJobStatusResponse(**payload)
 
     except HTTPException:
         raise
