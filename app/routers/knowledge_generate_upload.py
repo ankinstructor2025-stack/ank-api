@@ -409,15 +409,17 @@ def build_upload_prompt_text(
     *,
     job_item_id: str,
     prompt_template: str,
-    chunk: list[sqlite3.Row],
+    chunk,
     parent_source_id: str | None,
     parent_key1: str | None,
     parent_key2: str | None,
     parent_label: str | None,
     row_count: int,
 ) -> str:
+    chunk_rows = getattr(chunk, "items", chunk)
+
     lines: list[str] = []
-    for row in chunk:
+    for row in chunk_rows:
         text = normalize_text(row["content_text"])
         if not text:
             continue
