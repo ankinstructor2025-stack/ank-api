@@ -96,8 +96,9 @@ def new_id() -> str:
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
-def opendata_status_json_path(uid: str, job_id: str) -> str:
-    return f"users/{uid}/job_status/opendata_{job_id}.json"
+
+def local_user_db_path(uid: str) -> str:
+    return f"/tmp/ank_{uid}.db"
 
 
 def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
@@ -134,20 +135,6 @@ def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, A
         "items": [row_to_status_item(row) for row in item_rows],
     }
 
-
-def upload_status_payload(bucket: storage.Bucket, uid: str, job_id: str, payload: dict[str, Any]) -> None:
-    blob = bucket.blob(opendata_status_json_path(uid, job_id))
-    blob.upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        content_type="application/json; charset=utf-8",
-    )
-    logger.info("status json uploaded: %s", blob.name)
-
-
-def build_and_upload_status_payload(bucket: storage.Bucket, uid: str, local_db_path: str, job_id: str) -> dict[str, Any]:
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    upload_status_payload(bucket, uid, job_id, payload)
-    return payload
 
 
 def fetch_other_running_job_id(local_db_path: str, job_id: str) -> str | None:
@@ -313,6 +300,80 @@ def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
     logger.info("db uploaded to gcs: %s", db_blob.name)
 
 
+LOCK_TTL_SECONDS = 60 * 60 * 6
+
+
+def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_locks (
+            lock_key TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            locked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def build_lock_key(uid: str) -> str:
+    return f"{uid}:{SOURCE_TYPE}"
+
+
+def try_acquire_job_lock(local_db_path: str, lock_key: str, job_id: str) -> bool:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_job_locks_table(conn)
+        now = now_iso()
+        expires_at = datetime.fromisoformat(now).timestamp() + LOCK_TTL_SECONDS
+        expires_iso = datetime.fromtimestamp(expires_at, tz=JST).isoformat()
+        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
+        try:
+            conn.execute(
+                "INSERT INTO job_locks (lock_key, job_id, locked_at, expires_at) VALUES (?, ?, ?, ?)",
+                (lock_key, job_id, now, expires_iso),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+    finally:
+        conn.close()
+
+
+def release_job_lock(local_db_path: str, lock_key: str, job_id: str | None = None) -> None:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_job_locks_table(conn)
+        if job_id:
+            conn.execute("DELETE FROM job_locks WHERE lock_key = ? AND job_id = ?", (lock_key, job_id))
+        else:
+            conn.execute("DELETE FROM job_locks WHERE lock_key = ?", (lock_key,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_running_lock_job_id(local_db_path: str, lock_key: str) -> str | None:
+    conn = open_user_db(local_db_path)
+    try:
+        ensure_job_locks_table(conn)
+        now = now_iso()
+        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
+        conn.commit()
+        cur = conn.execute("SELECT job_id FROM job_locks WHERE lock_key = ? LIMIT 1", (lock_key,))
+        row = cur.fetchone()
+        return row["job_id"] if row else None
+    finally:
+        conn.close()
+
+
 def fetch_opendata_source_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
     try:
@@ -396,7 +457,7 @@ def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
         conn.close()
 
 
-def fetch_next_queued_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | None:
     conn = open_user_db(local_db_path)
     try:
         cur = conn.execute(
@@ -418,7 +479,7 @@ def fetch_next_queued_job_item(local_db_path: str, job_id: str) -> sqlite3.Row |
                 finished_at
             FROM knowledge_job_items
             WHERE job_id = ?
-              AND status = 'queued'
+              AND status = 'new'
             ORDER BY created_at, job_item_id
             LIMIT 1
             """,
@@ -851,7 +912,7 @@ def create_job_record(
                 SOURCE_TYPE,
                 body.source_name or "オープンデータ",
                 body.request_type,
-                "preview" if body.preview_only else "queued",
+                "done" if body.preview_only else "new",
                 selected_count,
                 requested_at,
             ),
@@ -915,7 +976,7 @@ def prepare_job_item(
                 item.parent_key2,
                 item.parent_label,
                 item.row_count,
-                "preview" if preview_only else "queued",
+                "done" if preview_only else "new",
                 requested_at,
             ),
         )
@@ -1036,7 +1097,7 @@ def finalize_job_item_success(
             )
 
         finished_at = now_iso()
-        item_status = "preview" if preview_only else "ready"
+        item_status = "done"
 
         conn.execute(
             """
@@ -1117,16 +1178,17 @@ def update_job_summary(
                 error_count = ?,
                 error_message = ?,
                 started_at = CASE
-                    WHEN ? IN ('running', 'ready', 'partial_error', 'error') THEN COALESCE(started_at, ?)
+                    WHEN ? = 'running' THEN COALESCE(started_at, ?)
                     ELSE started_at
                 END,
                 finished_at = CASE
-                    WHEN ? IN ('ready', 'partial_error', 'error', 'preview') THEN ?
+                    WHEN ? IN ('done', 'error') THEN ?
                     WHEN ? = 'running' THEN NULL
                     ELSE finished_at
                 END
             WHERE job_id = ?
-            """,
+            """
+            ,
             (
                 status,
                 total_qa_count,
@@ -1217,7 +1279,7 @@ def process_opendata_job_item(
         "parent_label": prepared["parent_label"],
         "qa_count": qa_count,
         "plain_count": plain_count,
-        "status": "preview" if preview_only else "ready",
+        "status": "done",
         "qa_prompt_texts": qa_prompt_texts,
         "plain_prompt_texts": plain_prompt_texts,
         "qa_debug": qa_llm_result_for_debug,
@@ -1235,10 +1297,13 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
         logger.error("ank.db not found in background: %s", db_gcs_path)
         return
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_bg_{job_id}.db"
-    db_blob.download_to_filename(local_db_path)
+    local_db_path = local_user_db_path(uid)
+    lock_key = build_lock_key(uid)
 
     try:
+        if not os.path.exists(local_db_path):
+            db_blob.download_to_filename(local_db_path)
+
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
             logger.error("knowledge_jobs not found in background: %s", job_id)
@@ -1256,28 +1321,11 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 error_message="invalid source_type",
             )
             upload_local_db(db_blob, local_db_path)
-            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
-            logger.error(
-                "job source_type mismatch: job_id=%s source_type=%s",
-                job_id,
-                job_row["source_type"],
-            )
+            logger.error("job source_type mismatch: job_id=%s source_type=%s", job_id, job_row["source_type"])
             return
 
-        if job_row["status"] == "preview":
-            update_job_summary(
-                local_db_path=local_db_path,
-                job_id=job_id,
-                requested_at=(job_row["requested_at"] or now_iso()),
-                status="error",
-                total_qa_count=0,
-                total_plain_count=0,
-                total_error_count=1,
-                error_message="preview job cannot run",
-            )
+        if job_row["status"] == "done":
             upload_local_db(db_blob, local_db_path)
-            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
-            logger.warning("preview job cannot be run: job_id=%s", job_id)
             return
 
         chunk_config = load_chunk_config()
@@ -1289,36 +1337,19 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        update_job_summary(
-            local_db_path=local_db_path,
-            job_id=job_id,
-            requested_at=requested_at,
-            status="running",
-            total_qa_count=total_qa_count,
-            total_plain_count=total_plain_count,
-            total_error_count=total_error_count,
-            error_message=None,
-        )
-        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
-
         logger.info("run_opendata_job_background start: job_id=%s", job_id)
 
         while True:
-            row = fetch_next_queued_job_item(local_db_path, job_id)
+            row = fetch_next_new_job_item(local_db_path, job_id)
             if not row:
-                logger.info("no queued items: job_id=%s", job_id)
+                logger.info("no new items: job_id=%s", job_id)
                 break
 
             current_job_item_id = row["job_item_id"]
-            logger.info(
-                "processing queued item in background: job_id=%s job_item_id=%s",
-                job_id,
-                current_job_item_id,
-            )
+            logger.info("processing item in background: job_id=%s job_item_id=%s", job_id, current_job_item_id)
 
             try:
                 mark_job_item_running(local_db_path, current_job_item_id)
-                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
                 result = process_opendata_job_item(
                     local_db_path=local_db_path,
@@ -1342,15 +1373,9 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     total_error_count=total_error_count,
                     error_message=None,
                 )
-                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
             except Exception as e:
-                logger.exception(
-                    "run_opendata_job_background item failed: job_id=%s job_item_id=%s",
-                    job_id,
-                    current_job_item_id,
-                )
-
+                logger.exception("run_opendata_job_background item failed: job_id=%s job_item_id=%s", job_id, current_job_item_id)
                 try:
                     finalize_job_item_error(
                         local_db_path=local_db_path,
@@ -1358,43 +1383,35 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                         error_message=str(e),
                     )
                 except Exception:
-                    logger.exception(
-                        "failed to update error state: job_item_id=%s",
-                        current_job_item_id,
-                    )
+                    logger.exception("failed to update error state: job_item_id=%s", current_job_item_id)
 
                 total_error_count += 1
-
                 update_job_summary(
                     local_db_path=local_db_path,
                     job_id=job_id,
                     requested_at=requested_at,
-                    status="partial_error",
+                    status="error",
                     total_qa_count=total_qa_count,
                     total_plain_count=total_plain_count,
                     total_error_count=total_error_count,
                     error_message=str(e),
                 )
                 upload_local_db(db_blob, local_db_path)
-                build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
                 return
-
-        final_status = "partial_error" if total_error_count > 0 else "ready"
 
         update_job_summary(
             local_db_path=local_db_path,
             job_id=job_id,
             requested_at=requested_at,
-            status=final_status,
+            status="done",
             total_qa_count=total_qa_count,
             total_plain_count=total_plain_count,
             total_error_count=total_error_count,
-            error_message=None if final_status == "ready" else "partial_error",
+            error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
-        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
-        logger.info("run_opendata_job_background finished: job_id=%s status=%s", job_id, final_status)
+        logger.info("run_opendata_job_background finished: job_id=%s status=done", job_id)
 
     except Exception as e:
         logger.exception("run_opendata_job_background failed: job_id=%s", job_id)
@@ -1417,9 +1434,13 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 error_message=f"{type(e).__name__}: {e}",
             )
             upload_local_db(db_blob, local_db_path)
-            build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
         except Exception:
             logger.exception("failed to update job error state in background: job_id=%s", job_id)
+    finally:
+        try:
+            release_job_lock(local_db_path, lock_key, job_id)
+        except Exception:
+            logger.exception("failed to release job lock: job_id=%s", job_id)
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -1527,7 +1548,7 @@ def create_opendata_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata.db"
+    local_db_path = local_user_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     try:
@@ -1596,7 +1617,7 @@ def create_opendata_job(
                 KnowledgeDebugItem(
                     job_item_id=prepared["job_item_id"],
                     parent_label=item.parent_label,
-                    status="preview" if body.preview_only else "queued",
+                    status="done" if body.preview_only else "new",
                     qa_count=0,
                     plain_count=0,
                     error_message=None,
@@ -1605,7 +1626,7 @@ def create_opendata_job(
             )
             created_item_count += 1
 
-        initial_status = "preview" if body.preview_only else "queued"
+        initial_status = "done" if body.preview_only else "new"
         update_job_summary(
             local_db_path=local_db_path,
             job_id=job_id,
@@ -1618,7 +1639,6 @@ def create_opendata_job(
         )
 
         upload_local_db(db_blob, local_db_path)
-        build_and_upload_status_payload(bucket, uid, local_db_path, job_id)
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
@@ -1659,7 +1679,7 @@ def run_opendata_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_run.db"
+    local_db_path = local_user_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     try:
@@ -1669,22 +1689,19 @@ def run_opendata_job(
         if job_row["source_type"] != SOURCE_TYPE:
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
-        if job_row["status"] == "ready":
-            payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
+        if job_row["status"] == "done":
+            payload = build_status_payload_from_db(local_db_path, body.job_id)
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
                 selected_count=int(payload["selected_count"] or 0),
                 created_item_count=len(payload["items"]),
-                status="ready",
+                status="done",
                 prompt_previews=[],
                 debug_items=[],
             )
 
-        if job_row["status"] == "preview":
-            raise HTTPException(status_code=400, detail="preview job cannot be run")
-
         if job_row["status"] == "running":
-            payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
+            payload = build_status_payload_from_db(local_db_path, body.job_id)
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
                 selected_count=int(payload["selected_count"] or 0),
@@ -1694,12 +1711,21 @@ def run_opendata_job(
                 debug_items=[],
             )
 
-        other_running_job_id = fetch_other_running_job_id(local_db_path, body.job_id)
-        if other_running_job_id:
+        lock_key = build_lock_key(uid)
+        other_running_job_id = get_running_lock_job_id(local_db_path, lock_key)
+        if other_running_job_id and other_running_job_id != body.job_id:
             raise HTTPException(
                 status_code=409,
                 detail=f"別のジョブが実行中です。完了後に再実行してください。 running_job_id={other_running_job_id}",
             )
+        if not other_running_job_id:
+            acquired = try_acquire_job_lock(local_db_path, lock_key, body.job_id)
+            if not acquired:
+                other_running_job_id = get_running_lock_job_id(local_db_path, lock_key)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"別のジョブが実行中です。完了後に再実行してください。 running_job_id={other_running_job_id or ''}",
+                )
 
         requested_at = job_row["requested_at"] or now_iso()
         total_qa_count = int(job_row["qa_count"] or 0)
@@ -1716,8 +1742,7 @@ def run_opendata_job(
             total_error_count=total_error_count,
             error_message=None,
         )
-        upload_local_db(db_blob, local_db_path)
-        payload = build_and_upload_status_payload(bucket, uid, local_db_path, body.job_id)
+        payload = build_status_payload_from_db(local_db_path, body.job_id)
 
         background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
 
@@ -1760,8 +1785,9 @@ def get_opendata_job_status(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_status.db"
-    db_blob.download_to_filename(local_db_path)
+    local_db_path = local_user_db_path(uid)
+    if not os.path.exists(local_db_path):
+        db_blob.download_to_filename(local_db_path)
 
     try:
         payload = build_status_payload_from_db(local_db_path, job_id)
