@@ -14,6 +14,23 @@ MULTI_NEWLINES_RE = re.compile(r"\n{3,}")
 LONG_DIGITS_RE = re.compile(r"\d{20,}")
 
 
+def safe_decode(binary: bytes) -> str:
+    """
+    日本語テキスト向けの安全なデコード。
+    優先順:
+      1. utf-8
+      2. shift_jis
+      3. cp932
+      4. utf-8(ignore)
+    """
+    for encoding in ("utf-8", "shift_jis", "cp932"):
+        try:
+            return binary.decode(encoding)
+        except Exception:
+            pass
+    return binary.decode("utf-8", errors="ignore")
+
+
 def clean_text(text: str) -> str:
     """
     テキスト専用の軽い整形。
@@ -232,7 +249,7 @@ def split_text_records(
       2. Q/A 形式
       3. 段落分割
     """
-    raw_text = binary.decode(encoding, errors="replace")
+    raw_text = safe_decode(binary)
     text = clean_text(raw_text)
 
     if not text:

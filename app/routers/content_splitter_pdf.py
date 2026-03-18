@@ -22,16 +22,13 @@ def clean_pdf_text(text: str) -> str:
     if not text:
         return ""
 
-    # 文字化け気味データも安全側で通す
     text = str(text).encode("utf-8", "ignore").decode("utf-8")
-
-    # 改行統一
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     # 制御文字除去
     text = CONTROL_CHARS_RE.sub("", text)
 
-    # PDF由来の壊れた数字列を軽く除去
+    # 明らかに壊れた数字列を軽く除去
     text = BROKEN_NUMBER_LINES_RE.sub(" ", text)
     text = LONG_DIGITS_RE.sub(" ", text)
 
