@@ -160,31 +160,30 @@ def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
     return [text]
 
 
-def extract_row_text(content_raw: str | None) -> str:
-    src = (content_raw or "").strip()
-    if not src:
-        return ""
+def extract_row_text(content):
+    if not content:
+        return None
 
-    parsed = load_json_safe(src)
-    if parsed is None:
-        return normalize_text(src)
+    # すでに文字列ならJSONとしてパース試みる
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except Exception:
+            return content.strip()
 
-    # text splitter の結果を優先利用
-    if isinstance(parsed, dict):
-        record_text = normalize_text(parsed.get("text"))
-        if record_text:
-            return record_text
+    if isinstance(content, dict):
+        # PDF系
+        if "text" in content:
+            return content["text"].strip()
 
-        question = normalize_text(parsed.get("question"))
-        answer = normalize_text(parsed.get("answer"))
-        if question and answer:
-            return f"Q: {question}\nA: {answer}"
+        # paragraph系
+        if "paragraph" in content:
+            return content["paragraph"].strip()
 
-    lines = flatten_json_like(parsed)
-    if not lines:
-        return normalize_text(src)
+        if "content" in content:
+            return content["content"].strip()
 
-    return "\n".join(lines)
+    return None
 
 
 def load_template_text(path: str, default_text: str) -> str:
