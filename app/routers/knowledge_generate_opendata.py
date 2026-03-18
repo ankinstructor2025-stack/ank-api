@@ -150,19 +150,6 @@ def build_and_upload_status_payload(bucket: storage.Bucket, uid: str, local_db_p
     return payload
 
 
-def try_read_status_payload(bucket: storage.Bucket, uid: str, job_id: str) -> dict[str, Any] | None:
-    blob = bucket.blob(opendata_status_json_path(uid, job_id))
-    if not blob.exists():
-        return None
-    try:
-        payload = json.loads(blob.download_as_bytes().decode("utf-8"))
-        if isinstance(payload, dict) and payload.get("job_id") == job_id:
-            return payload
-    except Exception:
-        logger.exception("failed to read status json: job_id=%s", job_id)
-    return None
-
-
 def fetch_other_running_job_id(local_db_path: str, job_id: str) -> str | None:
     conn = open_user_db(local_db_path)
     try:
@@ -1764,12 +1751,9 @@ def get_opendata_job_status(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    status_payload = try_read_status_payload(bucket, uid, job_id)
-    if status_payload:
-        return KnowledgeJobStatusResponse(**status_payload)
-
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
+
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
@@ -1788,4 +1772,7 @@ def get_opendata_job_status(
 
     except Exception as e:
         logger.exception("get_opendata_job_status failed")
-        raise HTTPException(status_code=500, detail=f"get_opendata_job_status failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"get_opendata_job_status failed: {type(e).__name__}: {e}"
+        )
