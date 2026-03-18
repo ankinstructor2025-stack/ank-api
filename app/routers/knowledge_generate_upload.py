@@ -420,10 +420,25 @@ def build_upload_prompt_text(
 
     lines: list[str] = []
     for row in chunk_rows:
-        text = normalize_text(row["content_text"])
+        content_text = getattr(row, "content_text", None)
+        sort_no = getattr(row, "sort_no", None)
+
+        if content_text is None and isinstance(row, dict):
+            content_text = row.get("content_text")
+            sort_no = row.get("sort_no")
+
+        if content_text is None:
+            try:
+                content_text = row["content_text"]
+                sort_no = row["sort_no"]
+            except Exception:
+                content_text = ""
+
+        text = normalize_text(content_text)
         if not text:
             continue
-        lines.append(f"[{row['sort_no']}] {text}")
+
+        lines.append(f"[{sort_no}] {text}")
 
     input_text = "\n\n".join(lines).strip()
     if not input_text:
