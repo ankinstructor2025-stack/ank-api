@@ -8,6 +8,11 @@ QUESTION_START_RE = re.compile(r"^\s*(\d+)[\.\)]\s+")
 QA_QUESTION_RE = re.compile(r"^\s*(q|question|問い|質問)[:：]\s*", re.IGNORECASE)
 QA_ANSWER_RE = re.compile(r"^\s*(a|answer|回答|答え)[:：]\s*", re.IGNORECASE)
 
+CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]")
+MULTI_SPACES_RE = re.compile(r"[ \t]+")
+MULTI_NEWLINES_RE = re.compile(r"\n{3,}")
+LONG_DIGITS_RE = re.compile(r"\d{20,}")
+
 
 def clean_text(text: str) -> str:
     """
@@ -17,11 +22,13 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
 
+    text = str(text).encode("utf-8", "ignore").decode("utf-8")
     text = text.replace("\ufeff", "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\x00", "")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = CONTROL_CHARS_RE.sub("", text)
+    text = LONG_DIGITS_RE.sub(" ", text)
+    text = MULTI_SPACES_RE.sub(" ", text)
+    text = MULTI_NEWLINES_RE.sub("\n\n", text)
     return text.strip()
 
 
@@ -180,7 +187,6 @@ def split_qa_blocks(text: str, max_rows: int = 2000) -> list[dict[str, Any]]:
         elif mode == "a":
             current_a.append(line)
         else:
-            # 先頭がQ/Aで始まらない雑なテキストは question 側に寄せる
             current_q.append(line)
 
         if len(records) >= max_rows:
@@ -195,7 +201,6 @@ def split_qa_blocks(text: str, max_rows: int = 2000) -> list[dict[str, Any]]:
 def split_paragraph_blocks(text: str, max_rows: int = 2000) -> list[dict[str, Any]]:
     """
     通常テキストは空行区切りで段落分割。
-    空行が少ない場合も、clean_text 済みテキストならある程度まとまる。
     """
     chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", text) if chunk.strip()]
 

@@ -2,7 +2,28 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from typing import Any, Optional
+
+
+CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]")
+MULTI_SPACES_RE = re.compile(r"[ \t]+")
+
+
+def clean_csv_cell(value: Any) -> str:
+    """
+    CSVセル専用の軽い整形。
+    構造は壊さず、セル文字列だけ軽くクレンジングする。
+    """
+    if value is None:
+        return ""
+
+    text = str(value).encode("utf-8", "ignore").decode("utf-8")
+    text = text.replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = CONTROL_CHARS_RE.sub("", text)
+    text = MULTI_SPACES_RE.sub(" ", text)
+    return text.strip()
 
 
 def count_csv_rows_from_binary(binary: bytes, encoding: str = "utf-8") -> Optional[int]:
@@ -27,7 +48,8 @@ def split_csv_records(
 
     rows: list[dict[str, Any]] = []
     for row in reader:
-        rows.append(dict(row))
+        cleaned_row = {key: clean_csv_cell(value) for key, value in dict(row).items()}
+        rows.append(cleaned_row)
         if len(rows) >= max_rows:
             break
     return rows
