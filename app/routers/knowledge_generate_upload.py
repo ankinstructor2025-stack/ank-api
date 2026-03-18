@@ -805,9 +805,12 @@ def create_job_record(
     job_id = new_id()
     requested_at = now_iso()
 
+    print(f"[START] create_job_record job_id={job_id} selected_count={selected_count} source_name={body.source_name}")
+
     conn = open_user_db(local_db_path)
     try:
         conn.execute("BEGIN")
+
         conn.execute(
             """
             INSERT INTO knowledge_jobs (
@@ -837,11 +840,20 @@ def create_job_record(
                 requested_at,
             ),
         )
+
         conn.commit()
+
+        print(f"[SUCCESS] create_job_record job_id={job_id}")
+
         return job_id, requested_at
-    except Exception:
+
+    except Exception as e:
         conn.rollback()
+
+        print(f"[ERROR] create_job_record failed job_id={job_id} error={str(e)}")
+
         raise
+
     finally:
         conn.close()
 
