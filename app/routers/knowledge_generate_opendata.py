@@ -9,7 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
@@ -1029,6 +1029,7 @@ def update_job_summary(
     total_qa_count: int,
     total_plain_count: int,
     total_error_count: int,
+    error_message: str | None = None,
 ) -> None:
     conn = open_user_db(local_db_path)
     try:
@@ -1040,13 +1041,15 @@ def update_job_summary(
                 qa_count = ?,
                 plain_count = ?,
                 error_count = ?,
+                error_message = ?,
                 started_at = CASE
                     WHEN ? IN ('running', 'ready', 'partial_error', 'error') THEN COALESCE(started_at, ?)
                     ELSE started_at
                 END,
                 finished_at = CASE
                     WHEN ? IN ('ready', 'partial_error', 'error', 'preview') THEN ?
-                    ELSE NULL
+                    WHEN ? = 'running' THEN NULL
+                    ELSE finished_at
                 END
             WHERE job_id = ?
             """,
@@ -1055,10 +1058,12 @@ def update_job_summary(
                 total_qa_count,
                 total_plain_count,
                 total_error_count,
+                error_message,
                 status,
                 requested_at,
                 status,
                 now_iso(),
+                status,
                 job_id,
             ),
         )
@@ -1146,6 +1151,173 @@ def process_opendata_job_item(
         "qa_debug": qa_llm_result_for_debug,
         "plain_debug": plain_llm_result_for_debug,
     }
+
+
+def run_opendata_job_background(uid: str, job_id: str) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        logger.error("ank.db not found in background: %s", db_gcs_path)
+        return
+
+    local_db_path = f"/tmp/ank_{uid}_knowledge_opendata_bg_{job_id}.db"
+    db_blob.download_to_filename(local_db_path)
+
+    try:
+        job_row = fetch_job_row(local_db_path, job_id)
+        if not job_row:
+            logger.error("knowledge_jobs not found in background: %s", job_id)
+            return
+
+        if job_row["source_type"] != SOURCE_TYPE:
+            logger.error(
+                "job source_type mismatch: job_id=%s source_type=%s",
+                job_id,
+                job_row["source_type"],
+            )
+            return
+
+        if job_row["status"] == "preview":
+            logger.warning("preview job cannot be run: job_id=%s", job_id)
+            return
+
+        chunk_config = load_chunk_config()
+        qa_chunk_conf = get_opendata_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_opendata_chunk_conf(chunk_config, "plain")
+
+        requested_at = job_row["requested_at"] or now_iso()
+        total_qa_count = int(job_row["qa_count"] or 0)
+        total_plain_count = int(job_row["plain_count"] or 0)
+        total_error_count = int(job_row["error_count"] or 0)
+
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status="running",
+            total_qa_count=total_qa_count,
+            total_plain_count=total_plain_count,
+            total_error_count=total_error_count,
+            error_message=None,
+        )
+        upload_local_db(db_blob, local_db_path)
+
+        logger.info("run_opendata_job_background start: job_id=%s", job_id)
+
+        while True:
+            row = fetch_next_queued_job_item(local_db_path, job_id)
+            if not row:
+                logger.info("no queued items: job_id=%s", job_id)
+                break
+
+            current_job_item_id = row["job_item_id"]
+            logger.info(
+                "processing queued item in background: job_id=%s job_item_id=%s",
+                job_id,
+                current_job_item_id,
+            )
+
+            try:
+                result = process_opendata_job_item(
+                    local_db_path=local_db_path,
+                    job_id=job_id,
+                    job_item_id=current_job_item_id,
+                    qa_chunk_conf=qa_chunk_conf,
+                    plain_chunk_conf=plain_chunk_conf,
+                    preview_only=False,
+                )
+
+                total_qa_count += int(result["qa_count"] or 0)
+                total_plain_count += int(result["plain_count"] or 0)
+
+                update_job_summary(
+                    local_db_path=local_db_path,
+                    job_id=job_id,
+                    requested_at=requested_at,
+                    status="running",
+                    total_qa_count=total_qa_count,
+                    total_plain_count=total_plain_count,
+                    total_error_count=total_error_count,
+                    error_message=None,
+                )
+                upload_local_db(db_blob, local_db_path)
+
+            except Exception as e:
+                logger.exception(
+                    "run_opendata_job_background item failed: job_id=%s job_item_id=%s",
+                    job_id,
+                    current_job_item_id,
+                )
+
+                try:
+                    finalize_job_item_error(
+                        local_db_path=local_db_path,
+                        job_item_id=current_job_item_id,
+                        error_message=str(e),
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to update error state: job_item_id=%s",
+                        current_job_item_id,
+                    )
+
+                total_error_count += 1
+
+                update_job_summary(
+                    local_db_path=local_db_path,
+                    job_id=job_id,
+                    requested_at=requested_at,
+                    status="partial_error",
+                    total_qa_count=total_qa_count,
+                    total_plain_count=total_plain_count,
+                    total_error_count=total_error_count,
+                    error_message=str(e),
+                )
+                upload_local_db(db_blob, local_db_path)
+                return
+
+        final_status = "partial_error" if total_error_count > 0 else "ready"
+
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status=final_status,
+            total_qa_count=total_qa_count,
+            total_plain_count=total_plain_count,
+            total_error_count=total_error_count,
+            error_message=None if final_status == "ready" else "partial_error",
+        )
+        upload_local_db(db_blob, local_db_path)
+
+        logger.info("run_opendata_job_background finished: job_id=%s status=%s", job_id, final_status)
+
+    except Exception as e:
+        logger.exception("run_opendata_job_background failed: job_id=%s", job_id)
+
+        try:
+            job_row = fetch_job_row(local_db_path, job_id)
+            requested_at = (job_row["requested_at"] if job_row else None) or now_iso()
+            total_qa_count = int(job_row["qa_count"] or 0) if job_row else 0
+            total_plain_count = int(job_row["plain_count"] or 0) if job_row else 0
+            total_error_count = int(job_row["error_count"] or 0) if job_row else 0
+
+            update_job_summary(
+                local_db_path=local_db_path,
+                job_id=job_id,
+                requested_at=requested_at,
+                status="error",
+                total_qa_count=total_qa_count,
+                total_plain_count=total_plain_count,
+                total_error_count=total_error_count + 1,
+                error_message=f"{type(e).__name__}: {e}",
+            )
+            upload_local_db(db_blob, local_db_path)
+        except Exception:
+            logger.exception("failed to update job error state in background: job_id=%s", job_id)
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -1340,6 +1512,7 @@ def create_opendata_job(
             total_qa_count=0,
             total_plain_count=0,
             total_error_count=0,
+            error_message=None,
         )
 
         upload_local_db(db_blob, local_db_path)
@@ -1364,6 +1537,7 @@ def create_opendata_job(
 @router.post("/run", response_model=KnowledgeJobCreateResponse)
 def run_opendata_job(
     body: KnowledgeRunRequest,
+    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
@@ -1403,174 +1577,44 @@ def run_opendata_job(
         if job_row["status"] == "preview":
             raise HTTPException(status_code=400, detail="preview job cannot be run")
 
-        chunk_config = load_chunk_config()
-        qa_chunk_conf = get_opendata_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_opendata_chunk_conf(chunk_config, "plain")
+        if job_row["status"] == "running":
+            items = fetch_job_items(local_db_path, body.job_id)
+            return KnowledgeJobCreateResponse(
+                job_id=body.job_id,
+                selected_count=int(job_row["selected_count"] or 0),
+                created_item_count=len(items),
+                status="running",
+                prompt_previews=[],
+                debug_items=[],
+            )
 
         requested_at = job_row["requested_at"] or now_iso()
-        selected_count = int(job_row["selected_count"] or 0)
-
-        prompt_previews: List[PromptPreviewItem] = []
-        debug_items: List[KnowledgeDebugItem] = []
-        created_item_count = 0
         total_qa_count = int(job_row["qa_count"] or 0)
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
-
-        conn = open_user_db(local_db_path)
-        try:
-            conn.execute("BEGIN")
-            conn.execute(
-                """
-                UPDATE knowledge_jobs
-                SET status = 'running',
-                    started_at = COALESCE(started_at, ?),
-                    finished_at = NULL,
-                    error_message = NULL
-                WHERE job_id = ?
-                """,
-                (now_iso(), body.job_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-        upload_local_db(db_blob, local_db_path)
-        logger.info("run_opendata_job start: job_id=%s", body.job_id)
-
-        while True:
-            row = fetch_next_queued_job_item(local_db_path, body.job_id)
-            if not row:
-                logger.info("no queued items: job_id=%s", body.job_id)
-                break
-
-            current_job_item_id = row["job_item_id"]
-            logger.info("processing queued item: job_id=%s job_item_id=%s", body.job_id, current_job_item_id)
-
-            try:
-                result = process_opendata_job_item(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    job_item_id=current_job_item_id,
-                    qa_chunk_conf=qa_chunk_conf,
-                    plain_chunk_conf=plain_chunk_conf,
-                    preview_only=False,
-                )
-
-                prompt_previews.append(
-                    PromptPreviewItem(
-                        job_item_id=result["job_item_id"],
-                        parent_source_id=result["parent_source_id"],
-                        parent_label=result["parent_label"],
-                        prompt_type="qa",
-                        prompt_text=join_prompt_previews(result["qa_prompt_texts"]),
-                    )
-                )
-                prompt_previews.append(
-                    PromptPreviewItem(
-                        job_item_id=result["job_item_id"],
-                        parent_source_id=result["parent_source_id"],
-                        parent_label=result["parent_label"],
-                        prompt_type="plain",
-                        prompt_text=join_prompt_previews(result["plain_prompt_texts"]),
-                    )
-                )
-
-                debug_items.append(
-                    KnowledgeDebugItem(
-                        job_item_id=result["job_item_id"],
-                        parent_label=result["parent_label"],
-                        status=result["status"],
-                        qa_count=result["qa_count"],
-                        plain_count=result["plain_count"],
-                        error_message=None,
-                        llm_result={
-                            "qa": result["qa_debug"],
-                            "plain": result["plain_debug"],
-                        },
-                    )
-                )
-
-                created_item_count += 1
-                total_qa_count += result["qa_count"]
-                total_plain_count += result["plain_count"]
-
-                update_job_summary(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    requested_at=requested_at,
-                    status="running",
-                    total_qa_count=total_qa_count,
-                    total_plain_count=total_plain_count,
-                    total_error_count=total_error_count,
-                )
-                upload_local_db(db_blob, local_db_path)
-
-            except Exception as e:
-                logger.exception(
-                    "run_opendata_job item failed: job_id=%s job_item_id=%s",
-                    body.job_id,
-                    current_job_item_id,
-                )
-
-                try:
-                    finalize_job_item_error(
-                        local_db_path=local_db_path,
-                        job_item_id=current_job_item_id,
-                        error_message=str(e),
-                    )
-                except Exception:
-                    logger.exception("failed to update error state: job_item_id=%s", current_job_item_id)
-
-                debug_items.append(
-                    KnowledgeDebugItem(
-                        job_item_id=current_job_item_id,
-                        parent_label=row["parent_label"],
-                        status="error",
-                        qa_count=0,
-                        plain_count=0,
-                        error_message=str(e),
-                        llm_result=None,
-                    )
-                )
-                total_error_count += 1
-
-                update_job_summary(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    requested_at=requested_at,
-                    status="partial_error",
-                    total_qa_count=total_qa_count,
-                    total_plain_count=total_plain_count,
-                    total_error_count=total_error_count,
-                )
-                upload_local_db(db_blob, local_db_path)
-                break
-
-        final_status = "partial_error" if total_error_count > 0 else "ready"
 
         update_job_summary(
             local_db_path=local_db_path,
             job_id=body.job_id,
             requested_at=requested_at,
-            status=final_status,
+            status="running",
             total_qa_count=total_qa_count,
             total_plain_count=total_plain_count,
             total_error_count=total_error_count,
+            error_message=None,
         )
-
         upload_local_db(db_blob, local_db_path)
 
+        background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
+
+        items = fetch_job_items(local_db_path, body.job_id)
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=selected_count,
-            created_item_count=created_item_count,
-            status=final_status,
-            prompt_previews=prompt_previews,
-            debug_items=debug_items,
+            selected_count=int(job_row["selected_count"] or 0),
+            created_item_count=len(items),
+            status="running",
+            prompt_previews=[],
+            debug_items=[],
         )
 
     except sqlite3.IntegrityError as e:
