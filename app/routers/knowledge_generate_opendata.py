@@ -1160,6 +1160,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
+            update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="ank.db not found")
         logger.error("ank.db not found in background: %s", db_gcs_path)
         return
 
@@ -1169,10 +1170,12 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
     try:
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="job not found")
             logger.error("knowledge_jobs not found in background: %s", job_id)
             return
 
         if job_row["source_type"] != SOURCE_TYPE:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=job_row.get("requested_at") or now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="invalid source_type")
             logger.error(
                 "job source_type mismatch: job_id=%s source_type=%s",
                 job_id,
@@ -1181,6 +1184,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             return
 
         if job_row["status"] == "preview":
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=job_row.get("requested_at") or now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="preview job cannot run")
             logger.warning("preview job cannot be run: job_id=%s", job_id)
             return
 
@@ -1420,6 +1424,7 @@ def create_opendata_job(
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
+            update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="ank.db not found")
         raise HTTPException(
             status_code=400,
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
@@ -1548,6 +1553,7 @@ def run_opendata_job(
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
+            update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="ank.db not found")
         raise HTTPException(
             status_code=400,
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
@@ -1559,8 +1565,10 @@ def run_opendata_job(
     try:
         job_row = fetch_job_row(local_db_path, body.job_id)
         if not job_row:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="job not found")
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
         if job_row["source_type"] != SOURCE_TYPE:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=job_row.get("requested_at") or now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="invalid source_type")
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         if job_row["status"] == "ready":
@@ -1575,6 +1583,7 @@ def run_opendata_job(
             )
 
         if job_row["status"] == "preview":
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=job_row.get("requested_at") or now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="preview job cannot run")
             raise HTTPException(status_code=400, detail="preview job cannot be run")
 
         if job_row["status"] == "running":
@@ -1638,6 +1647,7 @@ def get_opendata_job_status(
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
+            update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="ank.db not found")
         raise HTTPException(
             status_code=400,
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
@@ -1649,8 +1659,10 @@ def get_opendata_job_status(
     try:
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="job not found")
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
         if job_row["source_type"] != SOURCE_TYPE:
+        update_job_summary(local_db_path=local_db_path, job_id=job_id, requested_at=job_row.get("requested_at") or now_iso(), status="error", total_qa_count=0, total_plain_count=0, total_error_count=1, error_message="invalid source_type")
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         item_rows = fetch_job_items(local_db_path, job_id)
