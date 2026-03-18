@@ -92,6 +92,10 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+def debug(message: str) -> None:
+    print(f"[DEBUG][knowledge_upload] {message}")
+
+
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
@@ -160,30 +164,49 @@ def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
     return [text]
 
 
-def extract_row_text(content):
+def extract_row_text(content: Any) -> str | None:
     if not content:
         return None
 
-    # すでに文字列ならJSONとしてパース試みる
+    parsed = content
     if isinstance(content, str):
         try:
-            content = json.loads(content)
+            parsed = json.loads(content)
         except Exception:
-            return content.strip()
+            return content.strip() or None
 
-    if isinstance(content, dict):
-        # PDF系
-        if "text" in content:
-            return content["text"].strip()
+    if isinstance(parsed, dict):
+        text = normalize_text(parsed.get("text"))
+        if text:
+            return text
 
-        # paragraph系
-        if "paragraph" in content:
-            return content["paragraph"].strip()
+        paragraph = normalize_text(parsed.get("paragraph"))
+        if paragraph:
+            return paragraph
 
-        if "content" in content:
-            return content["content"].strip()
+        content_text = normalize_text(parsed.get("content"))
+        if content_text:
+            return content_text
 
-    return None
+        question = normalize_text(parsed.get("question"))
+        answer = normalize_text(parsed.get("answer"))
+        if question and answer:
+            return f"Q: {question}\nA: {answer}"
+
+        title = normalize_text(parsed.get("title"))
+        if title:
+            return title
+
+        lines = flatten_json_like(parsed)
+        merged = "\n".join(lines).strip()
+        return merged or None
+
+    if isinstance(parsed, list):
+        lines = flatten_json_like(parsed)
+        merged = "\n".join(lines).strip()
+        return merged or None
+
+    return normalize_text(str(parsed)) or None
 
 
 def load_template_text(path: str, default_text: str) -> str:
@@ -192,6 +215,7 @@ def load_template_text(path: str, default_text: str) -> str:
     blob = bucket.blob(path)
 
     if not blob.exists():
+        debug(f"template not found. use default template: {path}")
         return default_text.strip()
 
     return blob.download_as_bytes().decode("utf-8").strip()
@@ -246,6 +270,16 @@ def open_user_db(local_db_path: str) -> sqlite3.Connection:
 def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
     db_blob.upload_from_filename(local_db_path)
     logger.info("db uploaded to gcs: %s", db_blob.name)
+    debug(f"db uploaded to gcs: {db_blob.name}")
+
+
+def safe_upload_local_db(db_blob: storage.Blob, local_db_path: str, reason: str) -> None:
+    try:
+        upload_local_db(db_blob, local_db_path)
+        debug(f"safe upload success: reason={reason}")
+    except Exception as e:
+        logger.exception("safe upload failed: reason=%s", reason)
+        debug(f"safe upload failed: reason={reason} error={type(e).__name__}: {e}")
 
 
 def fetch_upload_source_rows(local_db_path: str, file_id: str) -> list[sqlite3.Row]:
@@ -265,7 +299,9 @@ def fetch_upload_source_rows(local_db_path: str, file_id: str) -> list[sqlite3.R
             """,
             (file_id,),
         )
-        return cur.fetchall()
+        rows = cur.fetchall()
+        debug(f"fetch_upload_source_rows file_id={file_id} count={len(rows)}")
+        return rows
     finally:
         conn.close()
 
@@ -401,14 +437,16 @@ def fetch_upload_content_rows(conn: sqlite3.Connection, job_item_id: str) -> lis
         """,
         (job_item_id,),
     )
-    return cur.fetchall()
+    rows = cur.fetchall()
+    debug(f"fetch_upload_content_rows job_item_id={job_item_id} count={len(rows)}")
+    return rows
 
 
 def build_upload_prompt_text(
     *,
     job_item_id: str,
     prompt_template: str,
-    chunk,
+    chunk: Any,
     parent_source_id: str | None,
     parent_key1: str | None,
     parent_key2: str | None,
@@ -416,32 +454,74 @@ def build_upload_prompt_text(
     row_count: int,
 ) -> str:
     chunk_rows = getattr(chunk, "items", chunk)
+    debug(
+        f"build_upload_prompt_text job_item_id={job_item_id} "
+        f"chunk_type={type(chunk).__name__} rows_type={type(chunk_rows).__name__}"
+    )
 
     lines: list[str] = []
-    for row in chunk_rows:
-        content_text = getattr(row, "content_text", None)
+    empty_count = 0
+
+    for idx, row in enumerate(chunk_rows, start=1):
+        content_text = (
+            getattr(row, "content_text", None)
+            or getattr(row, "text", None)
+            or getattr(row, "content", None)
+        )
         sort_no = getattr(row, "sort_no", None)
 
-        if content_text is None and isinstance(row, dict):
-            content_text = row.get("content_text")
-            sort_no = row.get("sort_no")
+        raw_item = getattr(row, "item", None) or getattr(row, "row", None)
+        if not content_text and raw_item is not None:
+            if isinstance(raw_item, dict):
+                content_text = (
+                    raw_item.get("content_text")
+                    or raw_item.get("text")
+                    or raw_item.get("content")
+                )
+                if sort_no is None:
+                    sort_no = raw_item.get("sort_no")
+
+        if not content_text and isinstance(row, dict):
+            content_text = (
+                row.get("content_text")
+                or row.get("text")
+                or row.get("content")
+            )
+            if sort_no is None:
+                sort_no = row.get("sort_no")
 
         if content_text is None:
             try:
                 content_text = row["content_text"]
-                sort_no = row["sort_no"]
+                if sort_no is None:
+                    sort_no = row["sort_no"]
             except Exception:
-                content_text = ""
+                content_text = None
 
         text = normalize_text(content_text)
         if not text:
+            empty_count += 1
+            if idx <= 3:
+                debug(
+                    f"build_upload_prompt_text empty row sample "
+                    f"job_item_id={job_item_id} idx={idx} row_type={type(row).__name__} "
+                    f"row_repr={str(row)[:300]}"
+                )
             continue
 
         lines.append(f"[{sort_no}] {text}")
 
     input_text = "\n\n".join(lines).strip()
+    debug(
+        f"build_upload_prompt_text result job_item_id={job_item_id} "
+        f"line_count={len(lines)} empty_count={empty_count}"
+    )
+
     if not input_text:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"knowledge_contents text empty after chunk build: {job_item_id}",
+        )
 
     return (
         f"対象: {parent_label or parent_source_id or ''}\n"
@@ -469,19 +549,31 @@ def build_upload_prompt_texts(
     item = fetch_upload_job_item_meta(conn, job_item_id)
     rows = fetch_upload_content_rows(conn, job_item_id)
 
+    if not rows:
+        raise HTTPException(status_code=400, detail=f"knowledge_contents not found before chunking: {job_item_id}")
+
     chunks = build_chunks(
         rows,
         chunk_conf,
         allowed_content_types={"row"},
     )
 
+    debug(
+        f"build_upload_prompt_texts job_item_id={job_item_id} "
+        f"row_count={len(rows)} chunk_count={len(chunks)}"
+    )
+
     if not chunks:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
+        raise HTTPException(status_code=400, detail=f"knowledge_contents not found after chunking: {job_item_id}")
 
     prompt_template = load_template_text(template_path, default_template)
 
     prompt_texts: list[str] = []
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks, start=1):
+        debug(
+            f"build_upload_prompt_texts chunk start job_item_id={job_item_id} "
+            f"chunk_index={idx} chunk_type={type(chunk).__name__}"
+        )
         prompt_texts.append(
             build_upload_prompt_text(
                 job_item_id=job_item_id,
@@ -753,11 +845,29 @@ def insert_upload_contents(
     source_rows: list[sqlite3.Row],
 ) -> int:
     inserted_count = 0
+    skipped_count = 0
     now = now_iso()
 
+    debug(
+        f"insert_upload_contents start job_id={job_id} job_item_id={job_item_id} "
+        f"source_id={source_id} source_rows={len(source_rows)}"
+    )
+
     for idx, row in enumerate(source_rows, start=1):
-        content_text = extract_row_text(row["content"])
+        raw_content = row["content"]
+        content_text = extract_row_text(raw_content)
+
+        if idx <= 5:
+            debug(
+                f"insert_upload_contents sample idx={idx} row_index={row['row_index']} "
+                f"source_item_id={row['source_item_id']} raw={str(raw_content)[:250]}"
+            )
+            debug(
+                f"insert_upload_contents sample idx={idx} extracted={str(content_text)[:250]}"
+            )
+
         if not content_text:
+            skipped_count += 1
             continue
 
         conn.execute(
@@ -793,6 +903,20 @@ def insert_upload_contents(
         )
         inserted_count += 1
 
+    debug(
+        f"insert_upload_contents result job_item_id={job_item_id} "
+        f"inserted_count={inserted_count} skipped_count={skipped_count}"
+    )
+
+    if inserted_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"knowledge_contents insert 0 rows: job_item_id={job_item_id}, "
+                f"source_id={source_id}, source_rows={len(source_rows)}, skipped_count={skipped_count}"
+            ),
+        )
+
     return inserted_count
 
 
@@ -804,7 +928,10 @@ def create_job_record(
     job_id = new_id()
     requested_at = now_iso()
 
-    print(f"[START] create_job_record job_id={job_id} selected_count={selected_count} source_name={body.source_name}")
+    print(
+        f"[START] create_job_record job_id={job_id} "
+        f"selected_count={selected_count} source_name={body.source_name}"
+    )
 
     conn = open_user_db(local_db_path)
     try:
@@ -848,9 +975,7 @@ def create_job_record(
 
     except Exception as e:
         conn.rollback()
-
         print(f"[ERROR] create_job_record failed job_id={job_id} error={str(e)}")
-
         raise
 
     finally:
@@ -867,6 +992,11 @@ def prepare_job_item(
     source_id = item.parent_source_id or ""
     if not source_id:
         raise HTTPException(status_code=400, detail="parent_source_id is required")
+
+    debug(
+        f"prepare_job_item start job_id={job_id} source_id={source_id} "
+        f"parent_label={item.parent_label} row_count={item.row_count}"
+    )
 
     source_rows = fetch_upload_source_rows(local_db_path, source_id)
     if not source_rows:
@@ -912,7 +1042,7 @@ def prepare_job_item(
             ),
         )
 
-        insert_upload_contents(
+        inserted_count = insert_upload_contents(
             conn=conn,
             job_id=job_id,
             job_item_id=job_item_id,
@@ -920,16 +1050,38 @@ def prepare_job_item(
             source_rows=source_rows,
         )
 
+        debug(
+            f"prepare_job_item before commit job_item_id={job_item_id} "
+            f"inserted_count={inserted_count}"
+        )
+
         conn.commit()
+
+        debug(f"prepare_job_item committed job_item_id={job_item_id}")
 
         return {
             "job_item_id": job_item_id,
             "source_id": source_id,
+            "inserted_count": inserted_count,
         }
 
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        debug(f"prepare_job_item rollback job_item_id={job_item_id} error={type(e).__name__}: {e}")
         raise
+    finally:
+        conn.close()
+
+
+def count_knowledge_contents(local_db_path: str, job_item_id: str) -> int:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM knowledge_contents WHERE job_item_id = ?",
+            (job_item_id,),
+        )
+        row = cur.fetchone()
+        return int(row["cnt"] or 0)
     finally:
         conn.close()
 
@@ -940,6 +1092,9 @@ def build_prompts_for_existing_job_item(
     qa_chunk_conf: ChunkConfig,
     plain_chunk_conf: ChunkConfig,
 ) -> dict[str, Any]:
+    count = count_knowledge_contents(local_db_path, job_item_id)
+    debug(f"build_prompts_for_existing_job_item precheck job_item_id={job_item_id} knowledge_contents_count={count}")
+
     conn = open_user_db(local_db_path)
     try:
         meta = fetch_upload_job_item_meta(conn, job_item_id)
@@ -1336,19 +1491,36 @@ def create_upload_job(
             unique_items.append(item)
 
         selected_count = len(unique_items)
+        debug(f"create_upload_job unique_items={selected_count}")
+
         job_id, requested_at = create_job_record(local_db_path, body, selected_count)
+
+        # 途中で失敗しても knowledge_jobs を確認できるように、ここで一度アップロードする
+        safe_upload_local_db(db_blob, local_db_path, f"after create_job_record job_id={job_id}")
 
         prompt_previews: List[PromptPreviewItem] = []
         debug_items: List[KnowledgeDebugItem] = []
         created_item_count = 0
 
         for item in unique_items:
+            debug(
+                f"create_upload_job loop start job_id={job_id} "
+                f"parent_source_id={item.parent_source_id} parent_label={item.parent_label}"
+            )
+
             prepared = prepare_job_item(
                 local_db_path=local_db_path,
                 job_id=job_id,
                 item=item,
                 requested_at=requested_at,
                 preview_only=body.preview_only,
+            )
+
+            # prepare_job_item 後も状態確認できるようにアップロード
+            safe_upload_local_db(
+                db_blob,
+                local_db_path,
+                f"after prepare_job_item job_id={job_id} job_item_id={prepared['job_item_id']}",
             )
 
             prompts = build_prompts_for_existing_job_item(
@@ -1385,7 +1557,9 @@ def create_upload_job(
                     qa_count=0,
                     plain_count=0,
                     error_message=None,
-                    llm_result=None,
+                    llm_result={
+                        "inserted_count": prepared.get("inserted_count"),
+                    },
                 )
             )
             created_item_count += 1
@@ -1413,9 +1587,11 @@ def create_upload_job(
         )
 
     except sqlite3.IntegrityError as e:
+        safe_upload_local_db(db_blob, local_db_path, "sqlite integrity error")
         raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
 
     except Exception as e:
+        safe_upload_local_db(db_blob, local_db_path, f"create_upload_job exception {type(e).__name__}")
         logger.exception("create_upload_job failed")
         raise HTTPException(status_code=500, detail=f"create_upload_job failed: {type(e).__name__}: {e}")
 
