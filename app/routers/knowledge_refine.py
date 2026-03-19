@@ -277,6 +277,20 @@ def upload_user_db(uid: str, local_db_path: str) -> None:
     db_gcs_path = user_db_path(uid)
     blob = bucket.blob(db_gcs_path)
     blob.upload_from_filename(local_db_path, content_type="application/octet-stream")
+    print("UPLOAD FINISHED:", db_gcs_path)
+
+    verify_path = f"/tmp/verify_{uid}.db"
+    blob.download_to_filename(verify_path)
+
+    conn = sqlite3.connect(verify_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT job_id, status, phase FROM knowledge_jobs ORDER BY requested_at DESC LIMIT 1"
+        ).fetchone()
+        print("GCS DB AFTER UPLOAD:", dict(row) if row else None)
+    finally:
+        conn.close()
 
 
 def knowledge_template_db_path() -> str:
