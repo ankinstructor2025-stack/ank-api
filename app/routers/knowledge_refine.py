@@ -1601,7 +1601,7 @@ def list_refine_job_items(
         conn.close()
 
 
-@router.post("/jobs/{job_id}/normalize", response_model=RefineActionResponse)
+@router.post("/jobs/{job_id}/cleanse", response_model=RefineActionResponse)
 def normalize_refine_job(
     job_id: str,
     authorization: str | None = Header(default=None),
@@ -1633,7 +1633,7 @@ def normalize_refine_job(
         return RefineActionResponse(
             ok=True,
             job_id=job_id,
-            action="normalize",
+            action="cleanse",
             status="normalized",
             message=f"normalized: {normalized_count}",
         )
