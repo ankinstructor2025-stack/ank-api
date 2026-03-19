@@ -1624,7 +1624,7 @@ def list_refine_job_items(
         conn.close()
 
 
-@router.post("/jobs/{job_id}/cleanse", response_model=RefineActionResponse)
+@router.post("/jobs/{job_id}/cleanse_TEST", response_model=RefineActionResponse)
 def normalize_refine_job(
     job_id: str,
     authorization: str | None = Header(default=None),
