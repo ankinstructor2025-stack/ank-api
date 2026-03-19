@@ -26,8 +26,7 @@ from firebase_admin import auth as fb_auth
 
 logger = logging.getLogger(__name__)
 
-#router = APIRouter(prefix="/knowledge/refine", tags=["knowledge_refine"])
-router = APIRouter()
+router = APIRouter(prefix="/knowledge/refine", tags=["knowledge_refine"])
 
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
