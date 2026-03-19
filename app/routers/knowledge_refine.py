@@ -207,6 +207,7 @@ class RefineJobRow(BaseModel):
     source_name: Optional[str] = None
     request_type: Optional[str] = None
     status: str
+    phase: Optional[str] = None
     selected_count: int = 0
     qa_count: int = 0
     plain_count: int = 0
@@ -630,6 +631,7 @@ def ensure_job_exists(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row:
             source_name,
             request_type,
             status,
+            phase,
             selected_count,
             qa_count,
             plain_count,
@@ -678,6 +680,25 @@ def update_job_status(
     """
     params.append(job_id)
     conn.execute(sql, params)
+
+
+def update_job_phase(
+    conn: sqlite3.Connection,
+    job_id: str,
+    new_phase: str,
+) -> None:
+    columns = get_table_columns(conn, "knowledge_jobs")
+    if "phase" not in columns:
+        return
+
+    conn.execute(
+        """
+        UPDATE knowledge_jobs
+        SET phase = ?
+        WHERE job_id = ?
+        """,
+        (new_phase, job_id),
+    )
 
 
 def update_item_statuses_for_job(
@@ -1385,6 +1406,7 @@ def list_refine_jobs(
                 source_name,
                 request_type,
                 status,
+                phase,
                 selected_count,
                 qa_count,
                 plain_count,
@@ -1410,6 +1432,7 @@ def list_refine_jobs(
                 source_name=row["source_name"],
                 request_type=row["request_type"],
                 status=row["status"],
+                phase=row["phase"] if "phase" in row.keys() else None,
                 selected_count=row["selected_count"] or 0,
                 qa_count=row["qa_count"] or 0,
                 plain_count=row["plain_count"] or 0,
@@ -1624,8 +1647,9 @@ def normalize_refine_job(
 
         normalized_count = normalize_knowledge_items_for_job(conn, job_id)
 
-        update_job_status(conn, job_id, "normalized")
-        update_item_statuses_for_job(conn, job_id, "normalized")
+        update_job_phase(conn, job_id, "cleansed")
+        update_job_status(conn, job_id, "done")
+        update_item_statuses_for_job(conn, job_id, "done")
 
         conn.commit()
         upload_user_db(uid, local_db_path)
@@ -1634,8 +1658,8 @@ def normalize_refine_job(
             ok=True,
             job_id=job_id,
             action="cleanse",
-            status="normalized",
-            message=f"normalized: {normalized_count}",
+            status="done",
+            message=f"cleansed: {normalized_count}",
         )
 
     except HTTPException:
@@ -1669,17 +1693,18 @@ def vectorize_refine_job(
     try:
         job_row = ensure_job_exists(conn, job_id)
 
-        current_status = str(job_row["status"] or "").lower()
-        if current_status not in {"normalized", "normalize_done"}:
+        current_phase = str(job_row["phase"] or "created").lower()
+        if current_phase != "cleansed":
             raise HTTPException(
                 status_code=409,
-                detail=f"vectorize is not allowed for status={job_row['status']}",
+                detail=f"vectorize is not allowed for phase={job_row['phase']}",
             )
 
         vectorized_count = vectorize_knowledge_items_for_job(conn, job_id)
 
-        update_job_status(conn, job_id, "vectorized")
-        update_item_statuses_for_job(conn, job_id, "vectorized")
+        update_job_phase(conn, job_id, "vectorized")
+        update_job_status(conn, job_id, "done")
+        update_item_statuses_for_job(conn, job_id, "done")
 
         conn.commit()
         upload_user_db(uid, local_db_path)
@@ -1688,7 +1713,7 @@ def vectorize_refine_job(
             ok=True,
             job_id=job_id,
             action="vectorize",
-            status="vectorized",
+            status="done",
             message=f"vectorized: {vectorized_count}",
         )
 
@@ -1723,11 +1748,11 @@ def deduplicate_refine_job(
     try:
         job_row = ensure_job_exists(conn, job_id)
 
-        current_status = str(job_row["status"] or "").lower()
-        if current_status not in {"vectorized", "vectorize_done"}:
+        current_phase = str(job_row["phase"] or "created").lower()
+        if current_phase != "vectorized":
             raise HTTPException(
                 status_code=409,
-                detail=f"deduplicate is not allowed for status={job_row['status']}",
+                detail=f"deduplicate is not allowed for phase={job_row['phase']}",
             )
 
         result = deduplicate_knowledge_items_for_job(
@@ -1737,7 +1762,9 @@ def deduplicate_refine_job(
             plain_threshold=PLAIN_DEDUP_THRESHOLD,
         )
 
-        update_job_status(conn, job_id, "deduplicated")
+        update_job_phase(conn, job_id, "deduplicated")
+        update_job_status(conn, job_id, "done")
+        update_item_statuses_for_job(conn, job_id, "done")
 
         conn.commit()
         upload_user_db(uid, local_db_path)
@@ -1746,7 +1773,7 @@ def deduplicate_refine_job(
             ok=True,
             job_id=job_id,
             action="deduplicate",
-            status="deduplicated",
+            status="done",
             message=(
                 "deduplicated: "
                 f"groups={result['group_count']}, "
@@ -1788,16 +1815,18 @@ def build_knowledge_db_job(
     try:
         job_row = ensure_job_exists(conn, job_id)
 
-        current_status = str(job_row["status"] or "").lower()
-        if current_status not in {"deduplicated", "knowledge_db_created"}:
+        current_phase = str(job_row["phase"] or "created").lower()
+        if current_phase != "deduplicated":
             raise HTTPException(
                 status_code=409,
-                detail=f"build-knowledge-db is not allowed for status={job_row['status']}",
+                detail=f"build-knowledge-db is not allowed for phase={job_row['phase']}",
             )
 
         result = build_knowledge_db_for_job(conn, uid, job_id)
 
-        update_job_status(conn, job_id, "knowledge_db_created")
+        update_job_phase(conn, job_id, "built")
+        update_job_status(conn, job_id, "done")
+        update_item_statuses_for_job(conn, job_id, "done")
 
         conn.commit()
         upload_user_db(uid, local_db_path)
@@ -1806,7 +1835,7 @@ def build_knowledge_db_job(
             ok=True,
             job_id=job_id,
             action="build-knowledge-db",
-            status="knowledge_db_created",
+            status="done",
             message=(
                 f"knowledge db created: {result['filename']} / "
                 f"entries={result['entry_count']} / "
