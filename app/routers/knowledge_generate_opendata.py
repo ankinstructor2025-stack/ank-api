@@ -23,7 +23,8 @@ from .prompt_builder import build_opendata_prompt_text
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/knowledge/opendata", tags=["knowledge_opendata"])
+#router = APIRouter(prefix="/knowledge/opendata", tags=["knowledge_opendata"])
+router = APIRouter()
 
 JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
