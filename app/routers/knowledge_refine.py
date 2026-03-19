@@ -1636,10 +1636,13 @@ def normalize_refine_job(
     conn.row_factory = sqlite3.Row
 
     try:
+        print("=== CLEANSE START ===")
+        print("JOB_ID:", job_id)
+        print("DB_PATH:", local_db_path)
+
         job_row = ensure_job_exists(conn, job_id)
 
-        logger.info("CLEANSE start job_id=%s", job_id)
-        logger.info("CLEANSE loaded status=%s phase=%s", job_row["status"], job_row["phase"])
+        print("STATUS BEFORE:", job_row["status"], job_row["phase"])
 
         current_status = str(job_row["status"] or "").lower()
         if current_status not in {"new", "ready", "done"}:
@@ -1648,24 +1651,41 @@ def normalize_refine_job(
                 detail=f"normalize is not allowed for status={job_row['status']}",
             )
 
+        # job_id一致確認
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+        print("MATCH COUNT:", row_count)
+
         normalized_count = normalize_knowledge_items_for_job(conn, job_id)
 
         columns = get_table_columns(conn, "knowledge_jobs")
-        logger.info("CLEANSE knowledge_jobs columns=%s", sorted(list(columns)))
+        print("COLUMNS:", sorted(list(columns)))
 
+        print("=== UPDATE PHASE ===")
         update_job_phase(conn, job_id, "cleansed")
+
+        print("=== UPDATE STATUS ===")
         update_job_status(conn, job_id, "done")
+
+        print("=== UPDATE ITEMS ===")
         update_item_statuses_for_job(conn, job_id, "done")
 
-        cur = conn.execute(
+        after_row = conn.execute(
             "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
             (job_id,),
-        )
-        after_row = cur.fetchone()
-        logger.info("CLEANSE after update status=%s phase=%s", after_row["status"], after_row["phase"])
+        ).fetchone()
+
+        print("AFTER UPDATE:", after_row["status"], after_row["phase"])
 
         conn.commit()
+        print("COMMIT DONE")
+
         upload_user_db(uid, local_db_path)
+        print("UPLOAD DONE")
+
+        print("=== CLEANSE END ===")
 
         return RefineActionResponse(
             ok=True,
@@ -1680,12 +1700,12 @@ def normalize_refine_job(
 
     except sqlite3.Error as e:
         conn.rollback()
-        logger.exception("normalize_refine_job sqlite error")
+        print("SQLITE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
         conn.rollback()
-        logger.exception("normalize_refine_job failed")
+        print("GENERAL ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
