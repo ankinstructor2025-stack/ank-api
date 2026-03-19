@@ -1638,6 +1638,9 @@ def normalize_refine_job(
     try:
         job_row = ensure_job_exists(conn, job_id)
 
+        logger.info("CLEANSE start job_id=%s", job_id)
+        logger.info("CLEANSE loaded status=%s phase=%s", job_row["status"], job_row["phase"])
+
         current_status = str(job_row["status"] or "").lower()
         if current_status not in {"new", "ready", "done"}:
             raise HTTPException(
@@ -1647,9 +1650,19 @@ def normalize_refine_job(
 
         normalized_count = normalize_knowledge_items_for_job(conn, job_id)
 
+        columns = get_table_columns(conn, "knowledge_jobs")
+        logger.info("CLEANSE knowledge_jobs columns=%s", sorted(list(columns)))
+
         update_job_phase(conn, job_id, "cleansed")
         update_job_status(conn, job_id, "done")
         update_item_statuses_for_job(conn, job_id, "done")
+
+        cur = conn.execute(
+            "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        after_row = cur.fetchone()
+        logger.info("CLEANSE after update status=%s phase=%s", after_row["status"], after_row["phase"])
 
         conn.commit()
         upload_user_db(uid, local_db_path)
