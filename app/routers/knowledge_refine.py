@@ -1655,7 +1655,6 @@ def normalize_refine_job(
         print("DB_PATH:", local_db_path)
 
         job_row = ensure_job_exists(conn, job_id)
-
         print("STATUS BEFORE:", job_row["status"], job_row["phase"])
 
         current_status = str(job_row["status"] or "").lower()
@@ -1665,7 +1664,6 @@ def normalize_refine_job(
                 detail=f"normalize is not allowed for status={job_row['status']}",
             )
 
-        # job_id一致確認
         row_count = conn.execute(
             "SELECT COUNT(*) FROM knowledge_jobs WHERE job_id = ?",
             (job_id,),
@@ -1690,11 +1688,21 @@ def normalize_refine_job(
             "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
-
         print("AFTER UPDATE:", after_row["status"], after_row["phase"])
 
         conn.commit()
         print("COMMIT DONE")
+
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        print("JOURNAL MODE:", journal_mode)
+
+        if str(journal_mode).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+            print("WAL CHECKPOINT DONE")
+
+        conn.close()
+        conn = None
+        print("CONN CLOSED")
 
         upload_user_db(uid, local_db_path)
         print("UPLOAD DONE")
@@ -1710,20 +1718,30 @@ def normalize_refine_job(
         )
 
     except HTTPException:
+        if conn is not None:
+            conn.close()
+            conn = None
         raise
 
     except sqlite3.Error as e:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
         print("SQLITE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
         print("GENERAL ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @router.post("/jobs/{job_id}/vectorize", response_model=RefineActionResponse)
