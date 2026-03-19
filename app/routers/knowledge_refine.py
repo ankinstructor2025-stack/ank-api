@@ -1638,7 +1638,7 @@ def list_refine_job_items(
         conn.close()
 
 
-@router.post("/jobs/{job_id}/cleanse_TEST", response_model=RefineActionResponse)
+@router.post("/jobs/{job_id}/cleanse", response_model=RefineActionResponse)
 def normalize_refine_job(
     job_id: str,
     authorization: str | None = Header(default=None),
@@ -1756,7 +1756,12 @@ def vectorize_refine_job(
     conn.row_factory = sqlite3.Row
 
     try:
+        print("=== VECTORIZe START ===")
+        print("JOB_ID:", job_id)
+        print("DB_PATH:", local_db_path)
+
         job_row = ensure_job_exists(conn, job_id)
+        print("STATUS BEFORE:", job_row["status"], job_row["phase"])
 
         current_phase = str(job_row["phase"] or "created").lower()
         if current_phase != "cleansed":
@@ -1771,8 +1776,30 @@ def vectorize_refine_job(
         update_job_status(conn, job_id, "done")
         update_item_statuses_for_job(conn, job_id, "done")
 
+        after_row = conn.execute(
+            "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        print("AFTER UPDATE:", after_row["status"], after_row["phase"])
+
         conn.commit()
+        print("COMMIT DONE")
+
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        print("JOURNAL MODE:", journal_mode)
+
+        if str(journal_mode).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+            print("WAL CHECKPOINT DONE")
+
+        conn.close()
+        conn = None
+        print("CONN CLOSED")
+
         upload_user_db(uid, local_db_path)
+        print("UPLOAD DONE")
+
+        print("=== VECTORIZE END ===")
 
         return RefineActionResponse(
             ok=True,
@@ -1783,20 +1810,30 @@ def vectorize_refine_job(
         )
 
     except HTTPException:
+        if conn is not None:
+            conn.close()
+            conn = None
         raise
 
     except sqlite3.Error as e:
-        conn.rollback()
-        logger.exception("vectorize_refine_job sqlite error")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("SQLITE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
-        conn.rollback()
-        logger.exception("vectorize_refine_job failed")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("GENERAL ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @router.post("/jobs/{job_id}/deduplicate", response_model=RefineActionResponse)
@@ -1811,7 +1848,12 @@ def deduplicate_refine_job(
     conn.row_factory = sqlite3.Row
 
     try:
+        print("=== DEDUPLICATE START ===")
+        print("JOB_ID:", job_id)
+        print("DB_PATH:", local_db_path)
+
         job_row = ensure_job_exists(conn, job_id)
+        print("STATUS BEFORE:", job_row["status"], job_row["phase"])
 
         current_phase = str(job_row["phase"] or "created").lower()
         if current_phase != "vectorized":
@@ -1831,8 +1873,30 @@ def deduplicate_refine_job(
         update_job_status(conn, job_id, "done")
         update_item_statuses_for_job(conn, job_id, "done")
 
+        after_row = conn.execute(
+            "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        print("AFTER UPDATE:", after_row["status"], after_row["phase"])
+
         conn.commit()
+        print("COMMIT DONE")
+
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        print("JOURNAL MODE:", journal_mode)
+
+        if str(journal_mode).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+            print("WAL CHECKPOINT DONE")
+
+        conn.close()
+        conn = None
+        print("CONN CLOSED")
+
         upload_user_db(uid, local_db_path)
+        print("UPLOAD DONE")
+
+        print("=== DEDUPLICATE END ===")
 
         return RefineActionResponse(
             ok=True,
@@ -1851,20 +1915,31 @@ def deduplicate_refine_job(
         )
 
     except HTTPException:
+        if conn is not None:
+            conn.close()
+            conn = None
         raise
 
     except sqlite3.Error as e:
-        conn.rollback()
-        logger.exception("deduplicate_refine_job sqlite error")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("SQLITE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
-        conn.rollback()
-        logger.exception("deduplicate_refine_job failed")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("GENERAL ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
 
 @router.post("/jobs/{job_id}/build-knowledge-db", response_model=RefineActionResponse)
 def build_knowledge_db_job(
@@ -1878,7 +1953,12 @@ def build_knowledge_db_job(
     conn.row_factory = sqlite3.Row
 
     try:
+        print("=== BUILD KNOWLEDGE DB START ===")
+        print("JOB_ID:", job_id)
+        print("DB_PATH:", local_db_path)
+
         job_row = ensure_job_exists(conn, job_id)
+        print("STATUS BEFORE:", job_row["status"], job_row["phase"])
 
         current_phase = str(job_row["phase"] or "created").lower()
         if current_phase != "deduplicated":
@@ -1893,8 +1973,30 @@ def build_knowledge_db_job(
         update_job_status(conn, job_id, "done")
         update_item_statuses_for_job(conn, job_id, "done")
 
+        after_row = conn.execute(
+            "SELECT status, phase FROM knowledge_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        print("AFTER UPDATE:", after_row["status"], after_row["phase"])
+
         conn.commit()
+        print("COMMIT DONE")
+
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        print("JOURNAL MODE:", journal_mode)
+
+        if str(journal_mode).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+            print("WAL CHECKPOINT DONE")
+
+        conn.close()
+        conn = None
+        print("CONN CLOSED")
+
         upload_user_db(uid, local_db_path)
+        print("UPLOAD DONE")
+
+        print("=== BUILD KNOWLEDGE DB END ===")
 
         return RefineActionResponse(
             ok=True,
@@ -1910,17 +2012,27 @@ def build_knowledge_db_job(
         )
 
     except HTTPException:
+        if conn is not None:
+            conn.close()
+            conn = None
         raise
 
     except sqlite3.Error as e:
-        conn.rollback()
-        logger.exception("build_knowledge_db_job sqlite error")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("SQLITE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
-        conn.rollback()
-        logger.exception("build_knowledge_db_job failed")
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        print("GENERAL ERROR:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
