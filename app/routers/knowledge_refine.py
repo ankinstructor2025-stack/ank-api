@@ -1616,7 +1616,7 @@ def normalize_refine_job(
         job_row = ensure_job_exists(conn, job_id)
 
         current_status = str(job_row["status"] or "").lower()
-        if current_status not in {"new", "ready"}:
+        if current_status not in {"new", "ready", "done"}:
             raise HTTPException(
                 status_code=409,
                 detail=f"normalize is not allowed for status={job_row['status']}",
