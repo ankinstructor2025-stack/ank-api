@@ -14,6 +14,7 @@ from .knowledge_generate_common import (
     build_lock_key,
     fetch_job_row,
     fetch_next_new_job_item,
+    extract_row_text,
     get_running_lock_job_id,
     get_uid_from_auth_header,
     load_chunk_config,
