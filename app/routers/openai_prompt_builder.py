@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .chunking import Chunk, render_chunk_text
+from .openai_chunking import Chunk, render_chunk_text
 
 
 def normalize_text(text: str | None) -> str:
