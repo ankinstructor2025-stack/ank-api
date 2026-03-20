@@ -1273,6 +1273,8 @@ def create_opendata_job(
                 job_item_id=prepared["job_item_id"],
                 qa_chunk_conf=qa_chunk_conf,
                 plain_chunk_conf=plain_chunk_conf,
+                qa_template_text=qa_template_text,
+                plain_template_text=plain_template_text,
             )
 
             prompt_previews.append(
