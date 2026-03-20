@@ -9,6 +9,42 @@ from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
+class KnowledgeJobStatusItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    status: str
+    knowledge_count: int = 0
+    error_message: Optional[str] = None
+    row_count: int = 0
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    qa_chunk_total: int = 0
+    qa_chunk_done: int = 0
+    plain_chunk_total: int = 0
+    plain_chunk_done: int = 0
+    chunk_total: int = 0
+    chunk_done: int = 0
+
+class KnowledgeJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    selected_count: int = 0
+    qa_count: int = 0
+    plain_count: int = 0
+    error_count: int = 0
+    requested_at: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    error_message: Optional[str] = None
+    total_qa_chunks: int = 0
+    processed_qa_chunks: int = 0
+    total_plain_chunks: int = 0
+    processed_plain_chunks: int = 0
+    total_chunks: int = 0
+    processed_chunks: int = 0
+    items: List[KnowledgeJobStatusItem] = []
+
 from .knowledge_generate_common import (
     build_status_payload_from_db,
     build_lock_key,
@@ -707,7 +743,37 @@ def build_prompts_for_existing_job_item(
             "parent_label": meta["parent_label"],
             "qa_prompt_texts": qa_prompt_texts,
             "plain_prompt_texts": plain_prompt_texts,
+            "qa_chunk_total": len(qa_prompt_texts),
+            "plain_chunk_total": len(plain_prompt_texts),
         }
+    finally:
+        conn.close()
+
+
+def update_job_item_chunk_totals(
+    local_db_path: str,
+    job_item_id: str,
+    qa_chunk_total: int,
+    plain_chunk_total: int,
+) -> None:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            UPDATE knowledge_job_items
+            SET qa_chunk_total = ?,
+                qa_chunk_done = COALESCE(qa_chunk_done, 0),
+                plain_chunk_total = ?,
+                plain_chunk_done = COALESCE(plain_chunk_done, 0)
+            WHERE job_item_id = ?
+            """,
+            (qa_chunk_total, plain_chunk_total, job_item_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -918,20 +984,28 @@ def process_opendata_job_item(
             len(plain_prompt_texts),
         )
 
-        qa_chunk_results = run_chunked_llm_json(
-            qa_prompt_texts,
-            "LLM OPENDATA QA",
-        )
+        qa_chunk_results = []
+        for prompt_text in qa_prompt_texts:
+            result_list = run_chunked_llm_json([prompt_text], "LLM OPENDATA QA")
+            if not result_list:
+                raise Exception("empty qa chunk result")
+            qa_chunk_results.append(result_list[0])
+            increment_job_item_chunk_done(local_db_path, job_item_id, "qa")
+
         qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
         qa_llm_result_for_debug = {
             "chunk_results": qa_chunk_results,
             "merged_result": qa_llm_result,
         }
 
-        plain_chunk_results = run_chunked_llm_json(
-            plain_prompt_texts,
-            "LLM OPENDATA PLAIN",
-        )
+        plain_chunk_results = []
+        for prompt_text in plain_prompt_texts:
+            result_list = run_chunked_llm_json([prompt_text], "LLM OPENDATA PLAIN")
+            if not result_list:
+                raise Exception("empty plain chunk result")
+            plain_chunk_results.append(result_list[0])
+            increment_job_item_chunk_done(local_db_path, job_item_id, "plain")
+
         plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
         plain_llm_result_for_debug = {
             "chunk_results": plain_chunk_results,
@@ -1170,32 +1244,6 @@ class KnowledgeRunRequest(BaseModel):
     job_id: str
 
 
-class KnowledgeJobStatusItem(BaseModel):
-    job_item_id: str
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    status: str
-    knowledge_count: int = 0
-    error_message: Optional[str] = None
-    row_count: int = 0
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-
-
-class KnowledgeJobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    selected_count: int = 0
-    qa_count: int = 0
-    plain_count: int = 0
-    error_count: int = 0
-    requested_at: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    error_message: Optional[str] = None
-    items: List[KnowledgeJobStatusItem] = []
-
-
 def validate_request(body: KnowledgeJobCreateRequest) -> None:
     if body.source_type not in (None, "", SOURCE_TYPE):
         raise HTTPException(status_code=400, detail=f"source_type must be '{SOURCE_TYPE}'")
@@ -1277,6 +1325,13 @@ def create_opendata_job(
                 plain_template_text=plain_template_text,
             )
 
+            update_job_item_chunk_totals(
+                local_db_path=local_db_path,
+                job_item_id=prepared["job_item_id"],
+                qa_chunk_total=int(prompts["qa_chunk_total"] or 0),
+                plain_chunk_total=int(prompts["plain_chunk_total"] or 0),
+            )
+
             prompt_previews.append(
                 PromptPreviewItem(
                     job_item_id=prepared["job_item_id"],
@@ -1341,6 +1396,35 @@ def create_opendata_job(
     except Exception as e:
         logger.exception("create_opendata_job failed")
         raise HTTPException(status_code=500, detail=f"create_opendata_job failed: {type(e).__name__}: {e}")
+
+
+def increment_job_item_chunk_done(
+    local_db_path: str,
+    job_item_id: str,
+    prompt_type: str,
+) -> None:
+    if prompt_type not in ("qa", "plain"):
+        raise ValueError(f"invalid prompt_type: {prompt_type}")
+
+    column = "qa_chunk_done" if prompt_type == "qa" else "plain_chunk_done"
+
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            f"""
+            UPDATE knowledge_job_items
+            SET {column} = COALESCE({column}, 0) + 1
+            WHERE job_item_id = ?
+            """,
+            (job_item_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @router.post("/run", response_model=KnowledgeJobCreateResponse)

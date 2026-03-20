@@ -38,6 +38,11 @@ def local_user_db_path(uid: str) -> str:
 
 
 def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
+    qa_chunk_total = int(row["qa_chunk_total"] or 0)
+    qa_chunk_done = int(row["qa_chunk_done"] or 0)
+    plain_chunk_total = int(row["plain_chunk_total"] or 0)
+    plain_chunk_done = int(row["plain_chunk_done"] or 0)
+
     return {
         "job_item_id": row["job_item_id"],
         "parent_source_id": row["parent_source_id"],
@@ -48,8 +53,13 @@ def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
         "row_count": int(row["row_count"] or 0),
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
+        "qa_chunk_total": qa_chunk_total,
+        "qa_chunk_done": qa_chunk_done,
+        "plain_chunk_total": plain_chunk_total,
+        "plain_chunk_done": plain_chunk_done,
+        "chunk_total": qa_chunk_total + plain_chunk_total,
+        "chunk_done": qa_chunk_done + plain_chunk_done,
     }
-
 
 def ensure_firebase_initialized() -> None:
     if firebase_admin._apps:
@@ -326,6 +336,10 @@ def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
                 status,
                 knowledge_count,
                 error_message,
+                qa_chunk_total,
+                qa_chunk_done,
+                plain_chunk_total,
+                plain_chunk_done,
                 created_at,
                 started_at,
                 finished_at
@@ -346,6 +360,13 @@ def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, A
         raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
 
     item_rows = fetch_job_items(local_db_path, job_id)
+    items = [row_to_status_item(row) for row in item_rows]
+
+    total_qa_chunks = sum(int(item["qa_chunk_total"] or 0) for item in items)
+    done_qa_chunks = sum(int(item["qa_chunk_done"] or 0) for item in items)
+    total_plain_chunks = sum(int(item["plain_chunk_total"] or 0) for item in items)
+    done_plain_chunks = sum(int(item["plain_chunk_done"] or 0) for item in items)
+
     return {
         "job_id": job_row["job_id"],
         "status": job_row["status"] or "",
@@ -357,7 +378,13 @@ def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, A
         "started_at": job_row["started_at"],
         "finished_at": job_row["finished_at"],
         "error_message": job_row["error_message"],
-        "items": [row_to_status_item(row) for row in item_rows],
+        "total_qa_chunks": total_qa_chunks,
+        "processed_qa_chunks": done_qa_chunks,
+        "total_plain_chunks": total_plain_chunks,
+        "processed_plain_chunks": done_plain_chunks,
+        "total_chunks": total_qa_chunks + total_plain_chunks,
+        "processed_chunks": done_qa_chunks + done_plain_chunks,
+        "items": items,
     }
 
 
