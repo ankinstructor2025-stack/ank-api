@@ -131,13 +131,13 @@ def extract_row_text(content_raw: str | None) -> str:
     return "\n".join(lines).strip()
 
 
-def load_template_text(bucket_name: str, path: str, default_text: str) -> str:
+def load_template_text(bucket_name: str, path: str) -> str:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(path)
 
     if not blob.exists():
-        return default_text.strip()
+        raise HTTPException(status_code=404, detail=f"{path} not found")
 
     return blob.download_as_bytes().decode("utf-8").strip()
 
