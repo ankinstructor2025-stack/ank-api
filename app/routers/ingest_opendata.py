@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import firebase_admin
 import requests
 import ulid
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Response
 from firebase_admin import auth as fb_auth
 from google.cloud import storage
 
@@ -619,10 +619,7 @@ def _download_url_impl(source_id: str, authorization: str | None):
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
-        )
+        raise HTTPException(status_code=400, detail=f"ank.db not found. path={db_gcs_path}")
 
     local_db_path = f"/tmp/ank_{uid}_opendata_download_{source_id}.db"
     db_blob.download_to_filename(local_db_path)
@@ -631,7 +628,6 @@ def _download_url_impl(source_id: str, authorization: str | None):
     try:
         cur = conn.cursor()
         ensure_original_name_column(cur)
-
         cur.execute(
             """
             SELECT source_id, ext, original_name, status
@@ -646,36 +642,37 @@ def _download_url_impl(source_id: str, authorization: str | None):
         conn.close()
 
     if not row:
-        raise HTTPException(status_code=404, detail="document not found")
+        raise HTTPException(status_code=404, detail=f"document not found: source_id={source_id}")
 
     saved_source_id, ext, original_name, status = row
 
     if str(status).lower() != "done":
-        raise HTTPException(status_code=400, detail="document is not ready")
-
-    if not ext:
-        raise HTTPException(status_code=400, detail="ext not found")
+        raise HTTPException(status_code=400, detail=f"document is not ready. status={status}")
 
     object_path = opendata_object_path(uid, saved_source_id, ext)
     blob = bucket.blob(object_path)
 
     if not blob.exists():
-        raise HTTPException(status_code=404, detail="stored file not found")
+        raise HTTPException(status_code=404, detail=f"stored file not found: path={object_path}")
 
-    safe_name = original_name or f"{saved_source_id}.{ext}"
-    download_url = blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(minutes=15),
-        method="GET",
-        response_disposition=f'attachment; filename="{safe_name}"',
-    )
+    # ▼ここが変更本体（署名URL→直接返却）
+    data = blob.download_as_bytes()
 
-    return {
-        "source_id": saved_source_id,
-        "ext": ext,
-        "original_name": safe_name,
-        "download_url": download_url,
+    media_type_map = {
+        "pdf": "application/pdf",
+        "csv": "text/csv; charset=utf-8",
+        "json": "application/json; charset=utf-8",
     }
+    media_type = media_type_map.get((ext or "").lower(), "application/octet-stream")
+    filename = original_name or f"{saved_source_id}.{ext}"
+
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
 
 
 def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
