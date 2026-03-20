@@ -16,8 +16,8 @@ from google.cloud import storage
 import firebase_admin
 from firebase_admin import auth as fb_auth
 
-from .llm_client import run_chunked_llm_json
-from .chunking import ChunkConfig, build_chunks
+from .openai_llm_client import run_chunked_llm_json
+from .openai_chunking import ChunkConfig, build_chunks
 
 
 logger = logging.getLogger(__name__)
