@@ -1,9 +1,9 @@
-# app/routers/opendata.py
+# app/routers/ingest_opendata.py
 
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 from zoneinfo import ZoneInfo
@@ -23,7 +23,6 @@ JST = ZoneInfo("Asia/Tokyo")
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 OPENDATA_TEMPLATE_PATH = "template/opendata.json"
-
 
 ALLOWED_EXTS = {"pdf", "csv", "json"}
 
@@ -103,6 +102,7 @@ def get_resource_filter_formats(tpl: dict) -> list[str]:
     formats = rf.get("formats") or []
     if not isinstance(formats, list):
         return []
+
     out = []
     for x in formats:
         v = str(x).strip().lower()
@@ -264,31 +264,6 @@ def filter_allowed_resources(ds: dict, tpl: dict) -> List[dict]:
     return matched
 
 
-def infer_ext_from_resources(resources: List[dict], tpl: dict) -> Optional[str]:
-    if not resources:
-        return None
-
-    preferred_order = get_resource_filter_formats(tpl) or ["csv", "json", "pdf"]
-    found: List[str] = []
-    for resource in resources:
-        ext = resource_meta_ext(resource)
-        if ext:
-            found.append(ext)
-
-    for preferred in preferred_order:
-        if preferred in found:
-            return preferred
-
-    return found[0] if found else None
-
-
-def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
-    for ds in datasets:
-        if dataset_id_of(ds) == dataset_id:
-            return ds
-    return None
-
-
 def choose_resource_for_dataset(ds: dict, tpl: dict) -> tuple[Optional[dict], Optional[str]]:
     resources = filter_allowed_resources(ds, tpl)
     if not resources:
@@ -324,16 +299,29 @@ def summarize_dataset_from_api(ds: dict, tpl: dict) -> Optional[dict]:
     if not resource or not ext:
         return None
 
+    title = dataset_title_of(ds)
+    source_url = normalize_text(resource.get("url"))
+
     return {
         "dataset_id": dataset_id_of(ds),
-        "title": dataset_title_of(ds),
+        "title": title,
         "ext": ext,
-        "source_url": normalize_text(resource.get("url")),
-        "original_name": guess_original_name(resource, normalize_text(resource.get("url")), ext, dataset_title_of(ds)),
+        "source_url": source_url,
+        "original_name": guess_original_name(resource, source_url, ext, title),
     }
 
 
+def ensure_original_name_column(cur: sqlite3.Cursor) -> None:
+    cur.execute("PRAGMA table_info(opendata_documents)")
+    cols = cur.fetchall()
+    col_names = {str(col[1]) for col in cols}
+    if "original_name" not in col_names:
+        cur.execute("ALTER TABLE opendata_documents ADD COLUMN original_name TEXT")
+
+
 def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict, created_at: str) -> None:
+    ensure_original_name_column(cur)
+
     for ds in datasets:
         dataset_id = dataset_id_of(ds)
         if not dataset_id:
@@ -368,11 +356,10 @@ def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict,
                     original_name = ?,
                     source_key = ?,
                     source_url = ?,
-                    ext = ?,
-                    created_at = ?
+                    ext = ?
                 WHERE source_id = ?
                 """,
-                (title, original_name, dataset_id, source_url, ext, created_at, source_id),
+                (title, original_name, dataset_id, source_url, ext, source_id),
             )
         else:
             cur.execute(
@@ -381,11 +368,23 @@ def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict,
                   (source_id, status, logical_name, original_name, source_key, source_item_id, source_url, ext, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(ulid.new()), "new", title, original_name, dataset_id, dataset_id, source_url, ext, created_at),
+                (
+                    str(ulid.new()),
+                    "new",
+                    title,
+                    original_name,
+                    dataset_id,
+                    dataset_id,
+                    source_url,
+                    ext,
+                    created_at,
+                ),
             )
 
 
 def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
+    ensure_original_name_column(cur)
+
     cur.execute(
         """
         SELECT
@@ -412,6 +411,7 @@ def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
                 "status": row[1],
                 "title": row[2],
                 "original_name": row[3],
+                "source_key": row[4],
                 "dataset_id": row[5],
                 "source_url": row[6],
                 "ext": row[7],
@@ -514,6 +514,8 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
+        ensure_original_name_column(cur)
+
         cur.execute(
             """
             SELECT source_id, status, logical_name
@@ -529,6 +531,7 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
 
         source_id, prev_status, logical_name = row
         object_path = opendata_object_path(uid, source_id, ext)
+
         blob = bucket.blob(object_path)
         blob.upload_from_string(binary)
 
@@ -607,6 +610,81 @@ def _list_documents_impl(authorization: str | None):
     }
 
 
+def _download_url_impl(source_id: str, authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_opendata_download_{source_id}.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    try:
+        cur = conn.cursor()
+        ensure_original_name_column(cur)
+
+        cur.execute(
+            """
+            SELECT source_id, ext, original_name, status
+            FROM opendata_documents
+            WHERE source_id = ?
+            LIMIT 1
+            """,
+            (source_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    saved_source_id, ext, original_name, status = row
+
+    if str(status).lower() != "done":
+        raise HTTPException(status_code=400, detail="document is not ready")
+
+    if not ext:
+        raise HTTPException(status_code=400, detail="ext not found")
+
+    object_path = opendata_object_path(uid, saved_source_id, ext)
+    blob = bucket.blob(object_path)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="stored file not found")
+
+    safe_name = original_name or f"{saved_source_id}.{ext}"
+    download_url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(minutes=15),
+        method="GET",
+        response_disposition=f'attachment; filename="{safe_name}"',
+    )
+
+    return {
+        "source_id": saved_source_id,
+        "ext": ext,
+        "original_name": safe_name,
+        "download_url": download_url,
+    }
+
+
+def find_dataset_by_id(datasets: List[dict], dataset_id: str) -> Optional[dict]:
+    for ds in datasets:
+        if dataset_id_of(ds) == dataset_id:
+            return ds
+    return None
+
+
 @router.get("/fetch_datasets")
 def opendata_fetch_datasets_get(
     authorization: str | None = Header(default=None),
@@ -634,3 +712,11 @@ def opendata_documents_get(
     authorization: str | None = Header(default=None),
 ):
     return _list_documents_impl(authorization)
+
+
+@router.get("/download_url")
+def opendata_download_url_get(
+    source_id: str,
+    authorization: str | None = Header(default=None),
+):
+    return _download_url_impl(source_id, authorization)
