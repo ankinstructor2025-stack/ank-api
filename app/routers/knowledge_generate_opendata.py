@@ -957,6 +957,7 @@ def process_opendata_job_item(
     qa_template_text: str,
     plain_template_text: str,
     preview_only: bool,
+    db_blob: storage.Blob,
 ) -> dict[str, Any]:
     prepared = build_prompts_for_existing_job_item(
         local_db_path=local_db_path,
@@ -990,7 +991,7 @@ def process_opendata_job_item(
             if not result_list:
                 raise Exception("empty qa chunk result")
             qa_chunk_results.append(result_list[0])
-            increment_job_item_chunk_done(local_db_path, job_item_id, "qa")
+            increment_job_item_chunk_done(local_db_path, job_item_id, "qa", db_blob)
 
         qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
         qa_llm_result_for_debug = {
@@ -1004,7 +1005,7 @@ def process_opendata_job_item(
             if not result_list:
                 raise Exception("empty plain chunk result")
             plain_chunk_results.append(result_list[0])
-            increment_job_item_chunk_done(local_db_path, job_item_id, "plain")
+            increment_job_item_chunk_done(local_db_path, job_item_id, "plain", db_blob)
 
         plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
         plain_llm_result_for_debug = {
@@ -1111,6 +1112,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     qa_template_text=qa_template_text,
                     plain_template_text=plain_template_text,
                     preview_only=False,
+                    db_blob=db_blob,
                 )
 
                 total_qa_count += int(result["qa_count"] or 0)
@@ -1402,6 +1404,7 @@ def increment_job_item_chunk_done(
     local_db_path: str,
     job_item_id: str,
     prompt_type: str,
+    db_blob: storage.Blob,
 ) -> None:
     if prompt_type not in ("qa", "plain"):
         raise ValueError(f"invalid prompt_type: {prompt_type}")
@@ -1425,6 +1428,8 @@ def increment_job_item_chunk_done(
         raise
     finally:
         conn.close()
+
+    upload_local_db(db_blob, local_db_path)
 
 
 @router.post("/run", response_model=KnowledgeJobCreateResponse)
