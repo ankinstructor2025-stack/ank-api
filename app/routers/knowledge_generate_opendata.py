@@ -228,6 +228,45 @@ def build_opendata_prompt_texts(
     return prompt_texts
 
 
+def build_prompts_for_existing_job_item(
+    local_db_path: str,
+    job_item_id: str,
+    qa_chunk_conf: ChunkConfig,
+    plain_chunk_conf: ChunkConfig,
+) -> dict[str, Any]:
+    conn = open_user_db(local_db_path)
+    try:
+        meta = fetch_opendata_job_item_meta(conn, job_item_id)
+        source_id = meta["parent_source_id"]
+
+        qa_prompt_texts = build_opendata_prompt_texts(
+            conn=conn,
+            job_item_id=job_item_id,
+            template_path=OPENDATA_QA_PROMPT_PATH,
+            default_template=DEFAULT_OPENDATA_QA_PROMPT,
+            chunk_conf=qa_chunk_conf,
+        )
+
+        plain_prompt_texts = build_opendata_prompt_texts(
+            conn=conn,
+            job_item_id=job_item_id,
+            template_path=OPENDATA_PLAIN_PROMPT_PATH,
+            default_template=DEFAULT_OPENDATA_PLAIN_PROMPT,
+            chunk_conf=plain_chunk_conf,
+        )
+
+        return {
+            "job_item_id": job_item_id,
+            "source_id": source_id,
+            "parent_source_id": meta["parent_source_id"],
+            "parent_label": meta["parent_label"],
+            "qa_prompt_texts": qa_prompt_texts,
+            "plain_prompt_texts": plain_prompt_texts,
+        }
+    finally:
+        conn.close()
+
+
 def join_prompt_previews(prompt_texts: list[str]) -> str:
     blocks: list[str] = []
     for idx, prompt_text in enumerate(prompt_texts, start=1):
