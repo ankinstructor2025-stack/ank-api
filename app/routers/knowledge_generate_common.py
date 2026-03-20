@@ -128,7 +128,7 @@ def extract_row_text(content_raw: str | None) -> str:
     if not lines:
         return normalize_text(src)
 
-    return "\n".join(lines).strip()
+    RETURN_PLACEHOLDER
 
 
 def load_template_text(bucket_name: str, path: str, default_text: str) -> str:
