@@ -9,7 +9,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
-from .knowledge_generate_common_use_common_fixed import (
+from .knowledge_generate_common import (
     build_status_payload_from_db,
     build_lock_key,
     fetch_job_row,
