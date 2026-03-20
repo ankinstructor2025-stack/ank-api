@@ -100,6 +100,10 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
+def local_user_db_path(uid: str, suffix: str) -> str:
+    return f"/tmp/ank_{uid}_upload_{suffix}_{new_id()}.db"
+
+
 def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
@@ -315,6 +319,80 @@ def safe_upload_local_db(db_blob: storage.Blob, local_db_path: str, reason: str)
     except Exception as e:
         logger.exception("safe upload failed: reason=%s", reason)
         debug(f"safe upload failed: reason={reason} error={type(e).__name__}: {e}")
+
+
+LOCK_TTL_SECONDS = 60 * 60 * 6
+
+
+def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_locks (
+            lock_key TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            locked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def build_lock_key(uid: str) -> str:
+    return f"{uid}:{SOURCE_TYPE}"
+
+
+def try_acquire_job_lock(local_db_path: str, lock_key: str, job_id: str) -> bool:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_job_locks_table(conn)
+        now = now_iso()
+        expires_at = datetime.fromisoformat(now).timestamp() + LOCK_TTL_SECONDS
+        expires_iso = datetime.fromtimestamp(expires_at, tz=JST).isoformat()
+        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
+        try:
+            conn.execute(
+                "INSERT INTO job_locks (lock_key, job_id, locked_at, expires_at) VALUES (?, ?, ?, ?)",
+                (lock_key, job_id, now, expires_iso),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+    finally:
+        conn.close()
+
+
+def release_job_lock(local_db_path: str, lock_key: str, job_id: str | None = None) -> None:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_job_locks_table(conn)
+        if job_id:
+            conn.execute("DELETE FROM job_locks WHERE lock_key = ? AND job_id = ?", (lock_key, job_id))
+        else:
+            conn.execute("DELETE FROM job_locks WHERE lock_key = ?", (lock_key,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_running_lock_job_id(local_db_path: str, lock_key: str) -> str | None:
+    conn = open_user_db(local_db_path)
+    try:
+        ensure_job_locks_table(conn)
+        now = now_iso()
+        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
+        conn.commit()
+        cur = conn.execute("SELECT job_id FROM job_locks WHERE lock_key = ? LIMIT 1", (lock_key,))
+        row = cur.fetchone()
+        return row["job_id"] if row else None
+    finally:
+        conn.close()
 
 
 def fetch_upload_source_rows(local_db_path: str, file_id: str) -> list[sqlite3.Row]:
@@ -970,7 +1048,7 @@ def create_job_record(
 
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
 
         conn.execute(
             """
@@ -1041,7 +1119,7 @@ def prepare_job_item(
 
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
 
         conn.execute(
             """
@@ -1165,7 +1243,7 @@ def build_prompts_for_existing_job_item(
 def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -1195,7 +1273,7 @@ def finalize_job_item_success(
 ) -> tuple[int, int]:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
 
         qa_count = 0
         plain_count = 0
@@ -1254,7 +1332,7 @@ def finalize_job_item_error(
 ) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -1288,7 +1366,7 @@ def update_job_summary(
 ) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             UPDATE knowledge_jobs
@@ -1502,13 +1580,18 @@ def create_upload_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_upload.db"
+    local_db_path = local_user_db_path(uid, "job")
     db_blob.download_to_filename(local_db_path)
 
     try:
         chunk_config = load_chunk_config()
         qa_chunk_conf = get_upload_chunk_conf(chunk_config, "qa")
         plain_chunk_conf = get_upload_chunk_conf(chunk_config, "plain")
+
+        lock_key = build_lock_key(uid)
+        running_job_id = get_running_lock_job_id(local_db_path, lock_key)
+        if running_job_id:
+            raise HTTPException(status_code=409, detail=f"another upload job is running: {running_job_id}")
 
         unique_items: List[KnowledgeTargetItem] = []
         seen_keys = set()
@@ -1649,7 +1732,7 @@ def run_upload_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_upload_run.db"
+    local_db_path = local_user_db_path(uid, "run")
     db_blob.download_to_filename(local_db_path)
 
     try:
@@ -1680,6 +1763,14 @@ def run_upload_job(
         requested_at = job_row["requested_at"] or now_iso()
         selected_count = int(job_row["selected_count"] or 0)
 
+        lock_key = build_lock_key(uid)
+        acquired = try_acquire_job_lock(local_db_path, lock_key, body.job_id)
+        if not acquired:
+            running_job_id = get_running_lock_job_id(local_db_path, lock_key)
+            if running_job_id == body.job_id:
+                raise HTTPException(status_code=409, detail=f"job already running: {body.job_id}")
+            raise HTTPException(status_code=409, detail=f"another upload job is running: {running_job_id or body.job_id}")
+
         prompt_previews: List[PromptPreviewItem] = []
         debug_items: List[KnowledgeDebugItem] = []
         created_item_count = 0
@@ -1689,7 +1780,7 @@ def run_upload_job(
 
         conn = open_user_db(local_db_path)
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 UPDATE knowledge_jobs
@@ -1847,6 +1938,12 @@ def run_upload_job(
         logger.exception("run_upload_job failed")
         raise HTTPException(status_code=500, detail=f"run_upload_job failed: {type(e).__name__}: {e}")
 
+    finally:
+        try:
+            release_job_lock(local_db_path, build_lock_key(uid), body.job_id)
+        except Exception:
+            logger.exception("failed to release upload job lock: job_id=%s", body.job_id)
+
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
 def get_upload_job_status(
@@ -1866,7 +1963,7 @@ def get_upload_job_status(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_upload_status.db"
+    local_db_path = local_user_db_path(uid, "status")
     db_blob.download_to_filename(local_db_path)
 
     try:
