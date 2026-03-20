@@ -368,10 +368,6 @@ def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def build_lock_key(uid: str) -> str:
-    return f"{uid}:{SOURCE_TYPE}"
-
-
 def try_acquire_job_lock(local_db_path: str, lock_key: str, job_id: str) -> bool:
     conn = open_user_db(local_db_path)
     try:
