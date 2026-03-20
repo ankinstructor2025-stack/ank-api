@@ -4,7 +4,7 @@ from app.routers.health import router as health_router
 from app.routers.session import router as session_router
 from app.routers.user_init import router as user_init_router
 from app.routers.kokkai import router as kokkai_router
-from app.routers.opendata import router as opendata_router
+from app.routers.ingest_opendata import router as ingest_opendata_router
 from app.routers.public_url import router as public_url_router
 from app.routers.upload_register import router as upload_register_router
 from app.routers.upload_ingest import router as upload_ingest_router
@@ -23,7 +23,7 @@ def create_app() -> FastAPI:
     app.include_router(session_router, prefix="/v1")
     app.include_router(user_init_router, prefix="/v1")
     app.include_router(kokkai_router, prefix="/v1")
-    app.include_router(opendata_router, prefix="/v1")
+    app.include_router(ingest_opendata_router, prefix="/v1")
     app.include_router(public_url_router, prefix="/v1")
     app.include_router(upload_register_router, prefix="/v1")
     app.include_router(upload_ingest_router, prefix="/v1")
