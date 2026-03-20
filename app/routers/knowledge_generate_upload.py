@@ -268,9 +268,44 @@ def open_user_db(local_db_path: str) -> sqlite3.Connection:
 
 
 def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
-    db_blob.upload_from_filename(local_db_path)
+    if not os.path.exists(local_db_path):
+        raise FileNotFoundError(f"local db not found: {local_db_path}")
+
+    snapshot_path = f"{local_db_path}.upload.sqlite"
+
+    src_conn = None
+    dst_conn = None
+
+    try:
+        src_conn = sqlite3.connect(local_db_path, timeout=30)
+        src_conn.row_factory = sqlite3.Row
+        src_conn.execute("PRAGMA busy_timeout = 30000")
+
+        journal_mode = src_conn.execute("PRAGMA journal_mode").fetchone()[0]
+        logger.info("upload_local_db journal_mode=%s path=%s", journal_mode, local_db_path)
+
+        if str(journal_mode).lower() == "wal":
+            src_conn.execute("PRAGMA wal_checkpoint(FULL)")
+            logger.info("upload_local_db wal checkpoint done: %s", local_db_path)
+
+        dst_conn = sqlite3.connect(snapshot_path, timeout=30)
+        src_conn.backup(dst_conn)
+        dst_conn.commit()
+
+    finally:
+        if dst_conn is not None:
+            dst_conn.close()
+        if src_conn is not None:
+            src_conn.close()
+
+    db_blob.upload_from_filename(snapshot_path)
     logger.info("db uploaded to gcs: %s", db_blob.name)
     debug(f"db uploaded to gcs: {db_blob.name}")
+
+    try:
+        os.remove(snapshot_path)
+    except Exception:
+        logger.warning("failed to remove snapshot file: %s", snapshot_path)
 
 
 def safe_upload_local_db(db_blob: storage.Blob, local_db_path: str, reason: str) -> None:

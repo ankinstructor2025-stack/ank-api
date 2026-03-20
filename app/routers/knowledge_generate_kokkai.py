@@ -45,6 +45,59 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
+def local_user_db_path(uid: str) -> str:
+    return f"/tmp/ank_{uid}_knowledge.db"
+
+
+def open_user_db(local_db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(local_db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn
+
+
+def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
+    if not os.path.exists(local_db_path):
+        raise FileNotFoundError(f"local db not found: {local_db_path}")
+
+    snapshot_path = f"{local_db_path}.upload.sqlite"
+
+    src_conn = None
+    dst_conn = None
+
+    try:
+        src_conn = sqlite3.connect(local_db_path, timeout=30)
+        src_conn.row_factory = sqlite3.Row
+        src_conn.execute("PRAGMA busy_timeout = 30000")
+
+        journal_mode = src_conn.execute("PRAGMA journal_mode").fetchone()[0]
+        logger.info("upload_local_db journal_mode=%s path=%s", journal_mode, local_db_path)
+
+        if str(journal_mode).lower() == "wal":
+            src_conn.execute("PRAGMA wal_checkpoint(FULL)")
+            logger.info("upload_local_db wal checkpoint done: %s", local_db_path)
+
+        dst_conn = sqlite3.connect(snapshot_path, timeout=30)
+        src_conn.backup(dst_conn)
+        dst_conn.commit()
+
+    finally:
+        if dst_conn is not None:
+            dst_conn.close()
+        if src_conn is not None:
+            src_conn.close()
+
+    db_blob.upload_from_filename(snapshot_path)
+    logger.info("db uploaded to gcs: %s", db_blob.name)
+
+    try:
+        os.remove(snapshot_path)
+    except Exception:
+        logger.warning("failed to remove snapshot file: %s", snapshot_path)
+
+
 def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
@@ -204,7 +257,7 @@ def build_kokkai_prompt_texts(
     chunks = build_chunks(
         rows,
         chunk_conf,
-        allowed_content_types={"speech"},
+        allowed_content_types={"row"},
     )
 
     if not chunks:
@@ -535,7 +588,7 @@ def insert_kokkai_contents(
                 source_id,
                 source_item_id,
                 row["row_id"],
-                "speech",
+                "row",
                 speech_text,
                 idx,
                 now,
@@ -622,11 +675,10 @@ def create_kokkai_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge.db"
+    local_db_path = local_user_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
-    conn = sqlite3.connect(local_db_path)
-    conn.row_factory = sqlite3.Row
+    conn = open_user_db(local_db_path)
 
     try:
         chunk_config = load_chunk_config()
@@ -923,7 +975,9 @@ def create_kokkai_job(
         )
 
         conn.commit()
-        db_blob.upload_from_filename(local_db_path)
+        conn.close()
+        conn = None
+        upload_local_db(db_blob, local_db_path)
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
@@ -944,4 +998,5 @@ def create_kokkai_job(
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
