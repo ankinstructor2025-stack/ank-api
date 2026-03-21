@@ -1262,6 +1262,7 @@ def process_kokkai_job_item(
         qa_chunk_total=len(qa_prompt_texts),
         plain_chunk_total=len(plain_prompt_texts),
     )
+    upload_local_db(db_blob, local_db_path)
 
     if preview_only:
         qa_llm_result = {"job_item_id": job_item_id, "qa_list": []}
