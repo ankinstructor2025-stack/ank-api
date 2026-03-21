@@ -418,3 +418,55 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         return cur.fetchone()
     finally:
         conn.close()
+
+
+def load_json_safe(text: str) -> Any | None:
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
+    lines: list[str] = []
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            lines.extend(flatten_json_like(v, key))
+        return lines
+
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            lines.extend(flatten_json_like(item, key))
+        return lines
+
+    text = normalize_text(str(value) if value is not None else "")
+    if not text:
+        return []
+
+    if prefix:
+        return [f"{prefix}: {text}"]
+    return [text]
+
+
+def extract_json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        lines = flatten_json_like(value)
+        return "\n".join(lines).strip() if lines else ""
+
+    text = normalize_text(str(value))
+    parsed = load_json_safe(text)
+    if parsed is None:
+        return text
+
+    lines = flatten_json_like(parsed)
+    return "\n".join(lines).strip() if lines else text
