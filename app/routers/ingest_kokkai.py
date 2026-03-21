@@ -370,6 +370,7 @@ def replace_kokkai_document_rows(
     for r in sorted_records:
         speech_id = speech_id_of(r)
         speech_text = speech_of(r)
+        speech_order = speech_order_of(r)
 
         if not speech_id or not speech_text:
             skipped += 1
@@ -380,17 +381,19 @@ def replace_kokkai_document_rows(
             INSERT INTO kokkai_document_rows (
               issue_id,
               speech_id,
+              speech_order,
               status,
               speaker,
               speech,
               created_at,
               updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 issue_id,
                 speech_id,
+                speech_order,
                 "new",
                 speaker_of(r),
                 speech_text,
@@ -673,6 +676,7 @@ def kokkai_rows(
             SELECT
               issue_id,
               speech_id,
+              speech_order,
               status,
               speaker,
               speech,
@@ -680,7 +684,7 @@ def kokkai_rows(
               updated_at
             FROM kokkai_document_rows
             WHERE issue_id = ?
-            ORDER BY speech_id
+            ORDER BY COALESCE(speech_order, 0), speech_id
             """,
             (target_issue_id,),
         )
