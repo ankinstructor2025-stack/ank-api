@@ -3,9 +3,9 @@
 import json
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, List, Optional, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import firebase_admin
@@ -24,15 +24,18 @@ JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 OPENDATA_TEMPLATE_PATH = "template/opendata.json"
 
-ALLOWED_EXTS = {"pdf", "csv", "json"}
-
 
 def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
-def opendata_object_path(uid: str, source_id: str, ext: str) -> str:
-    return f"users/{uid}/uploads/{source_id}.{ext}"
+def get_local_db_path(uid: str) -> str:
+    return f"/tmp/ank_{uid}.db"
+
+
+def opendata_child_object_path(uid: str, source_id: str, file_id: str, ext: str) -> str:
+    safe_ext = normalize_text(ext).lower().strip(".") or "dat"
+    return f"users/{uid}/opendata/{source_id}/{file_id}.{safe_ext}"
 
 
 def ensure_firebase_initialized():
@@ -62,21 +65,6 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
-def load_opendata_template() -> dict:
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(OPENDATA_TEMPLATE_PATH)
-
-    if not blob.exists():
-        raise HTTPException(status_code=404, detail=f"{OPENDATA_TEMPLATE_PATH} not found")
-
-    text = blob.download_as_text(encoding="utf-8")
-    try:
-        return json.loads(text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"invalid template json: {e}")
-
-
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
 
@@ -88,33 +76,120 @@ def safe_int(v: Any, default: int) -> int:
         return default
 
 
-def get_fetch_max_total(tpl: dict) -> int:
-    fetch_cfg = tpl.get("fetch") or {}
-    ds = tpl.get("dataset_search") or {}
-    params = ds.get("params") or {}
+def _template_error(message: str) -> HTTPException:
+    return HTTPException(status_code=500, detail=f"invalid opendata template: {message}")
 
-    n = safe_int(fetch_cfg.get("max_total", params.get("rows", 10)), 10)
-    return max(1, n)
+
+def require_dict(obj: Any, path: str) -> dict:
+    if not isinstance(obj, dict):
+        raise _template_error(f"{path} must be an object")
+    return obj
+
+
+def require_non_empty_string(obj: Any, path: str) -> str:
+    value = normalize_text(obj)
+    if not value:
+        raise _template_error(f"{path} is required")
+    return value
+
+
+def require_non_negative_int(obj: Any, path: str) -> int:
+    try:
+        value = int(obj)
+    except Exception:
+        raise _template_error(f"{path} must be an integer")
+    if value < 0:
+        raise _template_error(f"{path} must be >= 0")
+    return value
+
+
+def require_positive_int(obj: Any, path: str) -> int:
+    try:
+        value = int(obj)
+    except Exception:
+        raise _template_error(f"{path} must be an integer")
+    if value <= 0:
+        raise _template_error(f"{path} must be > 0")
+    return value
+
+
+def validate_opendata_template(tpl: dict) -> dict:
+    root = require_dict(tpl, "template")
+
+    dataset_search = require_dict(root.get("dataset_search"), "dataset_search")
+    endpoint = require_non_empty_string(dataset_search.get("endpoint"), "dataset_search.endpoint")
+    params = require_dict(dataset_search.get("params"), "dataset_search.params")
+    rows = require_positive_int(params.get("rows"), "dataset_search.params.rows")
+    start = require_non_negative_int(params.get("start"), "dataset_search.params.start")
+
+    fetch = require_dict(root.get("fetch"), "fetch")
+    max_total = require_positive_int(fetch.get("max_total"), "fetch.max_total")
+
+    resource_filter = require_dict(root.get("resource_filter"), "resource_filter")
+    formats = resource_filter.get("formats")
+    if not isinstance(formats, list) or len(formats) == 0:
+        raise _template_error("resource_filter.formats must be a non-empty array")
+
+    normalized_formats: list[str] = []
+    for idx, fmt in enumerate(formats):
+        value = normalize_text(fmt).lower()
+        if not value:
+            raise _template_error(f"resource_filter.formats[{idx}] must be a non-empty string")
+        normalized_formats.append(value)
+
+    validated = dict(root)
+    validated["dataset_search"] = {
+        "endpoint": endpoint,
+        "params": {
+            **params,
+            "rows": rows,
+            "start": start,
+        },
+    }
+    validated["fetch"] = {
+        "max_total": max_total,
+    }
+    validated["resource_filter"] = {
+        "formats": normalized_formats,
+    }
+    return validated
+
+
+def load_opendata_template() -> dict:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(OPENDATA_TEMPLATE_PATH)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"{OPENDATA_TEMPLATE_PATH} not found")
+
+    text = blob.download_as_text(encoding="utf-8")
+    try:
+        raw = json.loads(text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"invalid template json: {e}")
+
+    return validate_opendata_template(raw)
+
+
+def get_fetch_max_total(tpl: dict) -> int:
+    fetch_cfg = require_dict(tpl.get("fetch"), "fetch")
+    return require_positive_int(fetch_cfg.get("max_total"), "fetch.max_total")
 
 
 def get_resource_filter_formats(tpl: dict) -> list[str]:
-    rf = tpl.get("resource_filter") or {}
-    formats = rf.get("formats") or []
-    if not isinstance(formats, list):
-        return []
+    resource_filter = require_dict(tpl.get("resource_filter"), "resource_filter")
+    formats = resource_filter.get("formats")
+    if not isinstance(formats, list) or len(formats) == 0:
+        raise _template_error("resource_filter.formats must be a non-empty array")
 
-    out = []
-    for x in formats:
-        v = str(x).strip().lower()
-        if v:
-            out.append(v)
+    out: list[str] = []
+    for idx, x in enumerate(formats):
+        v = normalize_text(x).lower()
+        if not v:
+            raise _template_error(f"resource_filter.formats[{idx}] must be a non-empty string")
+        out.append(v)
     return out
-
-
-def get_resource_limit(tpl: dict) -> int:
-    rf = tpl.get("resource_filter") or {}
-    n = safe_int(rf.get("limit_resources", 0), 0)
-    return max(0, n)
 
 
 def _fetch_json(url: str, params: dict | None = None) -> Tuple[dict, str]:
@@ -149,28 +224,19 @@ def _normalize_ckan_result(payload: dict) -> object:
 
 
 def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
-    ds = tpl.get("dataset_search") or {}
-    endpoint = ds.get("endpoint")
-    params = dict(ds.get("params") or {})
-
-    if not endpoint:
-        raise HTTPException(status_code=500, detail="template missing dataset_search.endpoint")
+    ds = require_dict(tpl.get("dataset_search"), "dataset_search")
+    endpoint = require_non_empty_string(ds.get("endpoint"), "dataset_search.endpoint")
+    params = require_dict(ds.get("params"), "dataset_search.params")
 
     max_total = get_fetch_max_total(tpl)
 
-    rows = safe_int(params.get("rows", 10), 10)
-    rows = max(1, rows)
-
-    start = safe_int(params.get("start", 0), 0)
-    start = max(0, start)
+    rows = require_positive_int(params.get("rows"), "dataset_search.params.rows")
+    start = require_non_negative_int(params.get("start"), "dataset_search.params.start")
 
     requested_url_last = endpoint
     collected: List[dict] = []
 
-    max_scan_pages = 10
-    scanned_pages = 0
-
-    while len(collected) < max_total and scanned_pages < max_scan_pages:
+    while len(collected) < max_total:
         p = dict(params)
         p["rows"] = rows
         p["start"] = start
@@ -206,7 +272,6 @@ def _dataset_search_all_from_template(tpl: dict) -> Tuple[List[dict], str]:
             break
 
         start += rows
-        scanned_pages += 1
 
     return collected, requested_url_last
 
@@ -223,17 +288,14 @@ def resource_meta_ext(resource: dict) -> str:
     fmt = normalize_text(resource.get("format")).lower()
     if fmt:
         return fmt
-    return guess_ext_from_url(normalize_text(resource.get("url")))
+    return normalize_text(guess_ext_from_url(normalize_text(resource.get("url")))).lower()
 
 
 def resource_allowed_by_template(resource: dict, tpl: dict, source_path: str, content_type: str = "") -> bool:
     allowed_formats = set(get_resource_filter_formats(tpl))
-    if not allowed_formats:
-        return True
-
     fmt = normalize_text(resource.get("format")).lower()
-    kind = detect_resource_kind(resource, source_path, content_type)
-    meta_ext = resource_meta_ext(resource)
+    kind = normalize_text(detect_resource_kind(resource, source_path, content_type)).lower()
+    meta_ext = normalize_text(resource_meta_ext(resource)).lower()
 
     return fmt in allowed_formats or kind in allowed_formats or meta_ext in allowed_formats
 
@@ -244,41 +306,19 @@ def filter_allowed_resources(ds: dict, tpl: dict) -> List[dict]:
         return []
 
     allowed_formats = set(get_resource_filter_formats(tpl))
-    limit_resources = get_resource_limit(tpl)
-
     matched: List[dict] = []
 
     for resource in resources:
         if not isinstance(resource, dict):
             continue
 
-        ext = resource_meta_ext(resource)
-        if allowed_formats and ext not in allowed_formats:
-            continue
+        ext = normalize_text(resource_meta_ext(resource)).lower()
+        fmt = normalize_text(resource.get("format")).lower()
 
-        matched.append(resource)
-
-        if limit_resources > 0 and len(matched) >= limit_resources:
-            break
+        if ext in allowed_formats or fmt in allowed_formats:
+            matched.append(resource)
 
     return matched
-
-
-def choose_resource_for_dataset(ds: dict, tpl: dict) -> tuple[Optional[dict], Optional[str]]:
-    resources = filter_allowed_resources(ds, tpl)
-    if not resources:
-        return None, None
-
-    preferred_order = get_resource_filter_formats(tpl) or ["csv", "json", "pdf"]
-
-    for preferred in preferred_order:
-        for resource in resources:
-            ext = resource_meta_ext(resource)
-            if ext == preferred:
-                return resource, ext
-
-    first = resources[0]
-    return first, resource_meta_ext(first)
 
 
 def guess_original_name(resource: dict, final_url: str, ext: str, logical_name: str) -> str:
@@ -295,33 +335,23 @@ def guess_original_name(resource: dict, final_url: str, ext: str, logical_name: 
 
 
 def summarize_dataset_from_api(ds: dict, tpl: dict) -> Optional[dict]:
-    resource, ext = choose_resource_for_dataset(ds, tpl)
-    if not resource or not ext:
+    resources = filter_allowed_resources(ds, tpl)
+    if not resources:
         return None
 
     title = dataset_title_of(ds)
-    source_url = normalize_text(resource.get("url"))
+    first_resource = resources[0]
+    source_url = normalize_text(first_resource.get("url"))
 
     return {
         "dataset_id": dataset_id_of(ds),
         "title": title,
-        "ext": ext,
+        "child_count": len(resources),
         "source_url": source_url,
-        "original_name": guess_original_name(resource, source_url, ext, title),
     }
 
 
-def ensure_original_name_column(cur: sqlite3.Cursor) -> None:
-    cur.execute("PRAGMA table_info(opendata_documents)")
-    cols = cur.fetchall()
-    col_names = {str(col[1]) for col in cols}
-    if "original_name" not in col_names:
-        cur.execute("ALTER TABLE opendata_documents ADD COLUMN original_name TEXT")
-
-
 def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict, created_at: str) -> None:
-    ensure_original_name_column(cur)
-
     for ds in datasets:
         dataset_id = dataset_id_of(ds)
         if not dataset_id:
@@ -332,9 +362,8 @@ def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict,
             continue
 
         title = summary["title"]
-        ext = summary["ext"]
+        child_count = summary["child_count"]
         source_url = summary["source_url"]
-        original_name = summary["original_name"]
 
         cur.execute(
             """
@@ -352,50 +381,42 @@ def upsert_dataset_headers(cur: sqlite3.Cursor, datasets: List[dict], tpl: dict,
             cur.execute(
                 """
                 UPDATE opendata_documents
-                SET logical_name = ?,
-                    original_name = ?,
-                    source_key = ?,
+                SET source_key = ?,
                     source_url = ?,
-                    ext = ?
+                    child_count = ?
                 WHERE source_id = ?
                 """,
-                (title, original_name, dataset_id, source_url, ext, source_id),
+                (title, source_url, child_count, source_id),
             )
         else:
             cur.execute(
                 """
                 INSERT INTO opendata_documents
-                  (source_id, status, logical_name, original_name, source_key, source_item_id, source_url, ext, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (source_id, status, child_count, source_key, source_item_id, source_url, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(ulid.new()),
                     "new",
+                    child_count,
                     title,
-                    original_name,
-                    dataset_id,
                     dataset_id,
                     source_url,
-                    ext,
                     created_at,
                 ),
             )
 
 
 def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
-    ensure_original_name_column(cur)
-
     cur.execute(
         """
         SELECT
           source_id,
           status,
-          logical_name,
-          original_name,
+          child_count,
           source_key,
           source_item_id,
           source_url,
-          ext,
           created_at
         FROM opendata_documents
         ORDER BY created_at DESC
@@ -409,23 +430,58 @@ def list_registered_datasets(cur: sqlite3.Cursor) -> List[dict]:
             {
                 "source_id": row[0],
                 "status": row[1],
-                "title": row[2],
-                "original_name": row[3],
-                "source_key": row[4],
-                "dataset_id": row[5],
-                "source_url": row[6],
-                "ext": row[7],
-                "created_at": row[8],
+                "child_count": row[2],
+                "title": row[3],
+                "dataset_id": row[4],
+                "source_url": row[5],
+                "created_at": row[6],
             }
         )
     return out
 
 
-def download_selected_resource(ds: dict, tpl: dict) -> tuple[bytes, str, str, str]:
-    resource, ext = choose_resource_for_dataset(ds, tpl)
-    if not resource or not ext:
-        raise HTTPException(status_code=400, detail="登録対象データがありません")
+def list_document_files(cur: sqlite3.Cursor, source_id: str) -> List[dict]:
+    cur.execute(
+        """
+        SELECT
+          file_id,
+          source_id,
+          file_no,
+          logical_name,
+          original_name,
+          source_url,
+          gcs_path,
+          ext,
+          file_size,
+          created_at
+        FROM opendata_document_files
+        WHERE source_id = ?
+        ORDER BY file_no
+        """,
+        (source_id,),
+    )
 
+    rows = cur.fetchall()
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "file_id": row[0],
+                "source_id": row[1],
+                "file_no": row[2],
+                "logical_name": row[3],
+                "original_name": row[4],
+                "source_url": row[5],
+                "gcs_path": row[6],
+                "ext": row[7],
+                "file_size": row[8],
+                "created_at": row[9],
+            }
+        )
+    return out
+
+
+def download_resource(resource: dict, tpl: dict, logical_name: str) -> tuple[bytes, str, str, str]:
     source_url = normalize_text(resource.get("url"))
     if not source_url:
         raise HTTPException(status_code=400, detail="resource url not found")
@@ -434,12 +490,22 @@ def download_selected_resource(ds: dict, tpl: dict) -> tuple[bytes, str, str, st
     if not resource_allowed_by_template(resource, tpl, final_url, content_type):
         raise HTTPException(status_code=400, detail="resource format not allowed")
 
-    detected_ext = detect_resource_kind(resource, final_url, content_type) or ext or guess_ext_from_url(final_url)
-    detected_ext = normalize_text(detected_ext).lower()
-    if detected_ext not in ALLOWED_EXTS:
-        raise HTTPException(status_code=400, detail=f"unsupported resource kind: {detected_ext}")
+    allowed_formats = set(get_resource_filter_formats(tpl))
 
-    original_name = guess_original_name(resource, final_url, detected_ext, dataset_title_of(ds))
+    detected_ext = (
+        detect_resource_kind(resource, final_url, content_type)
+        or resource_meta_ext(resource)
+        or guess_ext_from_url(final_url)
+    )
+    detected_ext = normalize_text(detected_ext).lower()
+
+    if detected_ext not in allowed_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"許可されていない形式です: {detected_ext}"
+        )
+
+    original_name = guess_original_name(resource, final_url, detected_ext, logical_name)
     return binary, final_url, detected_ext, original_name
 
 
@@ -460,7 +526,7 @@ def _fetch_datasets_impl(authorization: str | None):
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_opendata_fetch.db"
+    local_db_path = get_local_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     created_at = now_iso()
@@ -494,6 +560,10 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
     if not ds:
         raise HTTPException(status_code=404, detail="dataset not found")
 
+    resources = filter_allowed_resources(ds, tpl)
+    if not resources:
+        raise HTTPException(status_code=400, detail="登録対象データがありません")
+
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
@@ -505,20 +575,19 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_opendata_expand_{dataset_id}.db"
+    local_db_path = get_local_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     created_at = now_iso()
-    binary, final_url, ext, original_name = download_selected_resource(ds, tpl)
+    logical_name = dataset_title_of(ds)
 
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
-        ensure_original_name_column(cur)
 
         cur.execute(
             """
-            SELECT source_id, status, logical_name
+            SELECT source_id, status
             FROM opendata_documents
             WHERE source_item_id = ?
             LIMIT 1
@@ -529,36 +598,77 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
         if not row:
             raise HTTPException(status_code=404, detail="dataset not registered in opendata_documents")
 
-        source_id, prev_status, logical_name = row
-        object_path = opendata_object_path(uid, source_id, ext)
+        source_id, prev_status = row
 
-        blob = bucket.blob(object_path)
-        blob.upload_from_string(binary)
+        cur.execute("DELETE FROM opendata_document_files WHERE source_id = ?", (source_id,))
+        conn.commit()
+
+        saved_files = []
+        file_no = 0
+
+        for resource in resources:
+            try:
+                binary, final_url, ext, original_name = download_resource(resource, tpl, logical_name)
+            except Exception:
+                continue
+
+            file_no += 1
+            file_id = str(ulid.new())
+            gcs_path = opendata_child_object_path(uid, source_id, file_id, ext)
+
+            blob = bucket.blob(gcs_path)
+            blob.upload_from_string(binary)
+
+            cur.execute(
+                """
+                INSERT INTO opendata_document_files
+                  (file_id, source_id, file_no, logical_name, original_name, source_url, gcs_path, ext, file_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    source_id,
+                    file_no,
+                    logical_name,
+                    original_name,
+                    final_url,
+                    gcs_path,
+                    ext,
+                    len(binary),
+                    created_at,
+                ),
+            )
+
+            saved_files.append(
+                {
+                    "file_id": file_id,
+                    "file_no": file_no,
+                    "logical_name": logical_name,
+                    "original_name": original_name,
+                    "source_url": final_url,
+                    "gcs_path": gcs_path,
+                    "ext": ext,
+                    "file_size": len(binary),
+                    "created_at": created_at,
+                }
+            )
+
+        new_status = "done" if saved_files else "error"
+        top_source_url = saved_files[0]["source_url"] if saved_files else normalize_text(ds.get("url"))
 
         cur.execute(
             """
             UPDATE opendata_documents
             SET status = ?,
-                original_name = ?,
+                child_count = ?,
+                source_key = ?,
                 source_url = ?,
-                ext = ?,
                 created_at = ?
             WHERE source_id = ?
             """,
-            ("done", original_name, final_url, ext, created_at, source_id),
+            (new_status, len(saved_files), logical_name, top_source_url, created_at, source_id),
         )
         conn.commit()
-
-        cur.execute(
-            """
-            SELECT source_id, status, logical_name, original_name, source_url, ext, created_at
-            FROM opendata_documents
-            WHERE source_id = ?
-            LIMIT 1
-            """,
-            (source_id,),
-        )
-        saved = cur.fetchone()
     finally:
         conn.close()
 
@@ -567,15 +677,13 @@ def _expand_dataset_impl(dataset_id: str, authorization: str | None):
     return {
         "mode": "expand_dataset",
         "dataset_id": dataset_id,
-        "source_id": saved[0] if saved else None,
-        "status": saved[1] if saved else None,
-        "logical_name": saved[2] if saved else logical_name,
-        "original_name": saved[3] if saved else original_name,
-        "source_url": saved[4] if saved else final_url,
-        "ext": saved[5] if saved else ext,
-        "gcs_path": opendata_object_path(uid, source_id, ext),
+        "source_id": source_id,
+        "status": new_status,
+        "title": logical_name,
+        "child_count": len(saved_files),
         "previous_status": prev_status,
-        "created_at": saved[6] if saved else created_at,
+        "created_at": created_at,
+        "files": saved_files,
     }
 
 
@@ -593,7 +701,7 @@ def _list_documents_impl(authorization: str | None):
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_opendata_documents.db"
+    local_db_path = get_local_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     conn = sqlite3.connect(local_db_path)
@@ -610,7 +718,7 @@ def _list_documents_impl(authorization: str | None):
     }
 
 
-def _download_url_impl(source_id: str, authorization: str | None):
+def _document_files_impl(source_id: str, authorization: str | None):
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
@@ -621,41 +729,84 @@ def _download_url_impl(source_id: str, authorization: str | None):
     if not db_blob.exists():
         raise HTTPException(status_code=400, detail=f"ank.db not found. path={db_gcs_path}")
 
-    local_db_path = f"/tmp/ank_{uid}_opendata_download_{source_id}.db"
+    local_db_path = get_local_db_path(uid)
     db_blob.download_to_filename(local_db_path)
 
     conn = sqlite3.connect(local_db_path)
     try:
         cur = conn.cursor()
-        ensure_original_name_column(cur)
         cur.execute(
             """
-            SELECT source_id, ext, original_name, status
+            SELECT source_id, status, child_count, source_key, source_item_id, source_url, created_at
             FROM opendata_documents
             WHERE source_id = ?
             LIMIT 1
             """,
             (source_id,),
         )
+        doc = cur.fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"document not found: source_id={source_id}")
+
+        files = list_document_files(cur, source_id)
+    finally:
+        conn.close()
+
+    return {
+        "mode": "document_files",
+        "document": {
+            "source_id": doc[0],
+            "status": doc[1],
+            "child_count": doc[2],
+            "title": doc[3],
+            "dataset_id": doc[4],
+            "source_url": doc[5],
+            "created_at": doc[6],
+        },
+        "file_count": len(files),
+        "files": files,
+    }
+
+
+def _download_url_impl(file_id: str, authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(status_code=400, detail=f"ank.db not found. path={db_gcs_path}")
+
+    local_db_path = get_local_db_path(uid)
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT file_id, original_name, gcs_path, ext
+            FROM opendata_document_files
+            WHERE file_id = ?
+            LIMIT 1
+            """,
+            (file_id,),
+        )
         row = cur.fetchone()
     finally:
         conn.close()
 
     if not row:
-        raise HTTPException(status_code=404, detail=f"document not found: source_id={source_id}")
+        raise HTTPException(status_code=404, detail=f"file not found: file_id={file_id}")
 
-    saved_source_id, ext, original_name, status = row
-
-    if str(status).lower() != "done":
-        raise HTTPException(status_code=400, detail=f"document is not ready. status={status}")
-
-    object_path = opendata_object_path(uid, saved_source_id, ext)
-    blob = bucket.blob(object_path)
+    saved_file_id, original_name, gcs_path, ext = row
+    blob = bucket.blob(gcs_path)
 
     if not blob.exists():
-        raise HTTPException(status_code=404, detail=f"stored file not found: path={object_path}")
+        raise HTTPException(status_code=404, detail=f"stored file not found: path={gcs_path}")
 
-    # ▼ここが変更本体（署名URL→直接返却）
     data = blob.download_as_bytes()
 
     media_type_map = {
@@ -664,14 +815,12 @@ def _download_url_impl(source_id: str, authorization: str | None):
         "json": "application/json; charset=utf-8",
     }
     media_type = media_type_map.get((ext or "").lower(), "application/octet-stream")
-    filename = original_name or f"{saved_source_id}.{ext}"
+    filename = original_name or f"{saved_file_id}.{ext}"
 
     return Response(
         content=data,
         media_type=media_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -711,9 +860,17 @@ def opendata_documents_get(
     return _list_documents_impl(authorization)
 
 
-@router.get("/download_url")
-def opendata_download_url_get(
+@router.get("/document_files")
+def opendata_document_files_get(
     source_id: str,
     authorization: str | None = Header(default=None),
 ):
-    return _download_url_impl(source_id, authorization)
+    return _document_files_impl(source_id, authorization)
+
+
+@router.get("/download_url")
+def opendata_download_url_get(
+    file_id: str,
+    authorization: str | None = Header(default=None),
+):
+    return _download_url_impl(file_id, authorization)
