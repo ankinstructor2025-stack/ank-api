@@ -65,6 +65,7 @@ from .knowledge_generate_common import (
     try_acquire_job_lock,
     upload_local_db,
     user_db_path,
+    replace_local_db_from_blob,
 )
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
@@ -1102,8 +1103,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
     lock_key = build_lock_key(uid, SOURCE_TYPE)
 
     try:
-        if not os.path.exists(local_db_path):
-            db_blob.download_to_filename(local_db_path)
+        replace_local_db_from_blob(db_blob, local_db_path)
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
@@ -1329,7 +1329,7 @@ def create_opendata_job(
         )
 
     local_db_path = local_user_db_path(uid)
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         qa_template_text = load_template_text(BUCKET_NAME, OPENDATA_QA_PROMPT_PATH)
@@ -1504,7 +1504,7 @@ def run_opendata_job(
         )
 
     local_db_path = local_user_db_path(uid)
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         job_row = fetch_job_row(local_db_path, body.job_id)
@@ -1629,7 +1629,7 @@ def get_opendata_job_status(
     except Exception as e:
         logger.warning("failed to clear local db cache: %s", e)
 
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         payload = build_status_payload_from_db(local_db_path, job_id)

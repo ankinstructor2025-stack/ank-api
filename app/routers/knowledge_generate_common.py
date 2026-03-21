@@ -173,49 +173,27 @@ def open_user_db(local_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(local_db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+def replace_local_db_from_blob(db_blob: storage.Blob, local_db_path: str) -> None:
+    local_dir = os.path.dirname(local_db_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+
+    if os.path.exists(local_db_path):
+        os.remove(local_db_path)
+
+    db_blob.download_to_filename(local_db_path)
+
 
 
 def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
     if not os.path.exists(local_db_path):
         raise FileNotFoundError(f"local db not found: {local_db_path}")
 
-    snapshot_path = f"{local_db_path}.upload.sqlite"
-
-    src_conn = None
-    dst_conn = None
-
-    try:
-        src_conn = sqlite3.connect(local_db_path, timeout=30)
-        src_conn.row_factory = sqlite3.Row
-        src_conn.execute("PRAGMA busy_timeout = 30000")
-
-        journal_mode = src_conn.execute("PRAGMA journal_mode").fetchone()[0]
-        logger.info("upload_local_db journal_mode=%s path=%s", journal_mode, local_db_path)
-
-        if str(journal_mode).lower() == "wal":
-            src_conn.execute("PRAGMA wal_checkpoint(FULL)")
-            logger.info("upload_local_db wal checkpoint done: %s", local_db_path)
-
-        dst_conn = sqlite3.connect(snapshot_path, timeout=30)
-        src_conn.backup(dst_conn)
-        dst_conn.commit()
-
-    finally:
-        if dst_conn is not None:
-            dst_conn.close()
-        if src_conn is not None:
-            src_conn.close()
-
-    db_blob.upload_from_filename(snapshot_path)
+    db_blob.upload_from_filename(local_db_path)
     logger.info("db uploaded to gcs: %s", db_blob.name)
-
-    try:
-        os.remove(snapshot_path)
-    except Exception:
-        logger.warning("failed to remove snapshot file: %s", snapshot_path)
 
 
 def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
@@ -440,46 +418,3 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         return cur.fetchone()
     finally:
         conn.close()
-
-from typing import Any
-import json
-
-
-def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
-    lines: list[str] = []
-
-    if isinstance(value, dict):
-        for k, v in value.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            lines.extend(flatten_json_like(v, key))
-        return lines
-
-    if isinstance(value, list):
-        for idx, item in enumerate(value):
-            key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
-            lines.extend(flatten_json_like(item, key))
-        return lines
-
-    text = normalize_text(str(value) if value is not None else "")
-    if not text:
-        return []
-
-    if prefix:
-        return [f"{prefix}: {text}"]
-    return [text]
-
-
-def extract_json_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        lines = flatten_json_like(value)
-        return "\n".join(lines).strip() if lines else ""
-
-    text = normalize_text(str(value))
-    parsed = load_json_safe(text)
-    if parsed is None:
-        return text
-
-    lines = flatten_json_like(parsed)
-    return "\n".join(lines).strip() if lines else text

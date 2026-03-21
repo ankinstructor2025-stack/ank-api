@@ -31,6 +31,7 @@ from .knowledge_generate_common import (
     get_running_lock_job_id,
     fetch_job_row,
     fetch_next_new_job_item,
+    replace_local_db_from_blob,
 )
 
 
@@ -975,8 +976,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
         print("size =", os.path.getsize(local_db_path))
 
     try:
-        if not os.path.exists(local_db_path):
-            db_blob.download_to_filename(local_db_path)
+        replace_local_db_from_blob(db_blob, local_db_path)
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
@@ -1321,7 +1321,7 @@ def create_kokkai_job(
         )
 
     local_db_path = local_user_db_path(uid)
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
@@ -1452,7 +1452,7 @@ def run_kokkai_job(
         )
 
     local_db_path = local_user_db_path(uid)
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         job_row = fetch_job_row(local_db_path, body.job_id)
@@ -1576,7 +1576,7 @@ def get_kokkai_job_status(
     except Exception as e:
         logger.warning("failed to clear local db cache: %s", e)
 
-    db_blob.download_to_filename(local_db_path)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         payload = build_status_payload_from_db(local_db_path, job_id)
