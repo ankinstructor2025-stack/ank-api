@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import logging
@@ -68,6 +69,7 @@ from .knowledge_generate_common import (
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
+from .content_splitter_pdf import split_pdf_records
 
 
 logger = logging.getLogger(__name__)
@@ -171,20 +173,25 @@ LOCK_TTL_SECONDS = 60 * 60 * 6
 
 
 
-def fetch_opendata_source_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
+def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
     try:
         cur = conn.execute(
             """
             SELECT
-                row_id,
-                row_index,
-                source_item_id,
-                content
-            FROM row_data
-            WHERE source_type = 'opendata'
-              AND file_id = ?
-            ORDER BY row_index
+                file_id,
+                source_id,
+                file_no,
+                logical_name,
+                original_name,
+                source_url,
+                gcs_path,
+                ext,
+                file_size,
+                created_at
+            FROM opendata_document_files
+            WHERE source_id = ?
+            ORDER BY file_no, file_id
             """,
             (source_id,),
         )
@@ -535,51 +542,81 @@ def insert_plain_items_from_llm_result(
 
 def insert_opendata_contents(
     conn: sqlite3.Connection,
+    bucket: storage.Bucket,
     job_id: str,
     job_item_id: str,
     source_id: str,
-    source_rows: list[sqlite3.Row],
+    file_rows: list[sqlite3.Row],
 ) -> int:
     inserted_count = 0
     now = now_iso()
+    sort_no = 1
 
-    for idx, row in enumerate(source_rows, start=1):
-        content_text = extract_row_text(row["content"])
-        if not content_text:
+    for file_row in file_rows:
+        ext = normalize_text(file_row["ext"]).lower()
+        if ext != "pdf":
             continue
 
-        conn.execute(
-            """
-            INSERT INTO knowledge_contents (
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                content_type,
-                content_text,
-                sort_no,
-                created_at,
-                updated_at
+        gcs_path = file_row["gcs_path"]
+        if not gcs_path:
+            continue
+
+        blob = bucket.blob(gcs_path)
+        if not blob.exists():
+            logger.warning("opendata file not found in gcs: %s", gcs_path)
+            continue
+
+        try:
+            binary = blob.download_as_bytes()
+            pages = split_pdf_records(binary)
+        except Exception as e:
+            logger.warning("pdf split failed: file_id=%s error=%s", file_row["file_id"], e)
+            continue
+
+        for page in pages:
+            text = normalize_text(page.get("text"))
+            if not text:
+                continue
+
+            page_no = int(page.get("page") or 0)
+            source_item_id = f"{file_row['file_id']}#page={page_no}"
+            row_id = f"{file_row['file_id']}:{page_no}"
+
+            content_text = f"[FILE] {file_row['original_name'] or ''}\n[PAGE] {page_no}\n{text}"
+
+            conn.execute(
+                """
+                INSERT INTO knowledge_contents (
+                    job_id,
+                    job_item_id,
+                    source_type,
+                    source_id,
+                    source_item_id,
+                    row_id,
+                    content_type,
+                    content_text,
+                    sort_no,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    job_item_id,
+                    SOURCE_TYPE,
+                    source_id,
+                    source_item_id,
+                    row_id,
+                    "row",
+                    content_text,
+                    sort_no,
+                    now,
+                    now,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                job_item_id,
-                SOURCE_TYPE,
-                source_id,
-                row["source_item_id"],
-                row["row_id"],
-                "row",
-                content_text,
-                idx,
-                now,
-                now,
-            ),
-        )
-        inserted_count += 1
+            inserted_count += 1
+            sort_no += 1
 
     return inserted_count
 
@@ -635,6 +672,7 @@ def create_job_record(
 
 def prepare_job_item(
     local_db_path: str,
+    bucket: storage.Bucket,
     job_id: str,
     item: "KnowledgeTargetItem",
     requested_at: str,
@@ -644,9 +682,9 @@ def prepare_job_item(
     if not source_id:
         raise HTTPException(status_code=400, detail="parent_source_id is required")
 
-    source_rows = fetch_opendata_source_rows(local_db_path, source_id)
-    if not source_rows:
-        raise HTTPException(status_code=400, detail=f"row_data not found: {source_id}")
+    file_rows = fetch_opendata_file_rows(local_db_path, source_id)
+    if not file_rows:
+        raise HTTPException(status_code=400, detail=f"opendata_document_files not found: {source_id}")
 
     job_item_id = new_id()
 
@@ -688,12 +726,25 @@ def prepare_job_item(
             ),
         )
 
-        insert_opendata_contents(
+        inserted_rows = insert_opendata_contents(
             conn=conn,
+            bucket=bucket,
             job_id=job_id,
             job_item_id=job_item_id,
             source_id=source_id,
-            source_rows=source_rows,
+            file_rows=file_rows,
+        )
+
+        if inserted_rows <= 0:
+            raise HTTPException(status_code=400, detail=f"pdf text not found: {source_id}")
+
+        conn.execute(
+            """
+            UPDATE knowledge_job_items
+            SET row_count = ?
+            WHERE job_item_id = ?
+            """,
+            (inserted_rows, job_item_id),
         )
 
         conn.commit()
@@ -1312,6 +1363,7 @@ def create_opendata_job(
         for item in unique_items:
             prepared = prepare_job_item(
                 local_db_path=local_db_path,
+                bucket=bucket,
                 job_id=job_id,
                 item=item,
                 requested_at=requested_at,
