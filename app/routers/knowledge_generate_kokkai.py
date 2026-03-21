@@ -977,14 +977,6 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
     try:
         if not os.path.exists(local_db_path):
             db_blob.download_to_filename(local_db_path)
-            conn = sqlite3.connect(local_db_path)
-            try:
-                rows = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                ).fetchall()
-                print("tables =", [r[0] for r in rows])
-            finally:
-                conn.close()
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
@@ -1330,14 +1322,6 @@ def create_kokkai_job(
 
     local_db_path = local_user_db_path(uid)
     db_blob.download_to_filename(local_db_path)
-    conn = sqlite3.connect(local_db_path)
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        print("tables =", [r[0] for r in rows])
-    finally:
-        conn.close()
 
     try:
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
@@ -1469,14 +1453,6 @@ def run_kokkai_job(
 
     local_db_path = local_user_db_path(uid)
     db_blob.download_to_filename(local_db_path)
-    conn = sqlite3.connect(local_db_path)
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        print("tables =", [r[0] for r in rows])
-    finally:
-        conn.close()
 
     try:
         job_row = fetch_job_row(local_db_path, body.job_id)
@@ -1601,14 +1577,6 @@ def get_kokkai_job_status(
         logger.warning("failed to clear local db cache: %s", e)
 
     db_blob.download_to_filename(local_db_path)
-    conn = sqlite3.connect(local_db_path)
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        print("tables =", [r[0] for r in rows])
-    finally:
-        conn.close()
 
     try:
         payload = build_status_payload_from_db(local_db_path, job_id)
