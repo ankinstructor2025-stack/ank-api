@@ -1171,6 +1171,31 @@ def increment_job_item_chunk_done(
 
     upload_local_db(db_blob, local_db_path)
 
+
+def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.Row]:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                issue_id,
+                speech_id,
+                status,
+                speaker,
+                speech,
+                created_at,
+                updated_at
+            FROM kokkai_document_rows
+            WHERE issue_id = ?
+            ORDER BY COALESCE(speech_order, 0), speech_id
+            """,
+            (issue_id,),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
 class KnowledgeTargetItem(BaseModel):
     source_type: Optional[str] = Field(default=SOURCE_TYPE, description="kokkai")
     parent_source_id: Optional[str] = None
