@@ -967,6 +967,13 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
     local_db_path = local_user_db_path(uid)
     lock_key = build_lock_key(uid, SOURCE_TYPE)
 
+    print("=== run_kokkai_job_background START ===")
+    print("job_id =", job_id)
+    print("local_db_path =", local_db_path)
+    print("exists =", os.path.exists(local_db_path))
+    if os.path.exists(local_db_path):
+        print("size =", os.path.getsize(local_db_path))
+
     try:
         if not os.path.exists(local_db_path):
             db_blob.download_to_filename(local_db_path)
