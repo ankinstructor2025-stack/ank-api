@@ -1392,6 +1392,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
 
             try:
                 mark_job_item_running(local_db_path, current_job_item_id)
+                upload_local_db(db_blob, local_db_path)
 
                 result = process_kokkai_job_item(
                     local_db_path=local_db_path,
