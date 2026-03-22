@@ -19,6 +19,7 @@ from .knowledge_generate_common import (
     user_db_path,
     local_user_db_path,
     build_status_payload_from_db,
+    build_source_status_payload_from_db,
     get_uid_from_auth_header,
     normalize_text,
     extract_row_text,
@@ -1076,6 +1077,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                     total_error_count=total_error_count,
                     error_message=None,
                 )
+                update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload_from_db(local_db_path, job_id, phase="extract_knowledge", current_item_id=current_job_item_id, current_label=result.get("parent_label"), message="item done", chunk_total=len(result.get("qa_prompt_texts") or []) + len(result.get("plain_prompt_texts") or []), chunk_done=len(result.get("qa_prompt_texts") or []) + len(result.get("plain_prompt_texts") or [])))
                 progress_callback(message="item done")
 
             except Exception as e:

@@ -48,6 +48,7 @@ class KnowledgeJobStatusResponse(BaseModel):
 
 from .knowledge_generate_common import (
     build_status_payload_from_db,
+    build_source_status_payload_from_db,
     build_lock_key,
     fetch_job_row,
     fetch_next_new_job_item,
@@ -804,34 +805,6 @@ def build_prompts_for_existing_job_item(
         conn.close()
 
 
-def update_job_item_chunk_totals(
-    local_db_path: str,
-    job_item_id: str,
-    qa_chunk_total: int,
-    plain_chunk_total: int,
-) -> None:
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN")
-        conn.execute(
-            """
-            UPDATE knowledge_job_items
-            SET qa_chunk_total = ?,
-                qa_chunk_done = COALESCE(qa_chunk_done, 0),
-                plain_chunk_total = ?,
-                plain_chunk_done = COALESCE(plain_chunk_done, 0)
-            WHERE job_item_id = ?
-            """,
-            (qa_chunk_total, plain_chunk_total, job_item_id),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
 def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
     conn = open_user_db(local_db_path)
     try:
@@ -1465,13 +1438,6 @@ def create_opendata_job(
                 plain_template_text=plain_template_text,
             )
 
-            update_job_item_chunk_totals(
-                local_db_path=local_db_path,
-                job_item_id=prepared["job_item_id"],
-                qa_chunk_total=int(prompts["qa_chunk_total"] or 0),
-                plain_chunk_total=int(prompts["plain_chunk_total"] or 0),
-            )
-
             prompt_previews.append(
                 PromptPreviewItem(
                     job_item_id=prepared["job_item_id"],
@@ -1536,38 +1502,6 @@ def create_opendata_job(
     except Exception as e:
         logger.exception("create_opendata_job failed")
         raise HTTPException(status_code=500, detail=f"create_opendata_job failed: {type(e).__name__}: {e}")
-
-
-def increment_job_item_chunk_done(
-    local_db_path: str,
-    job_item_id: str,
-    prompt_type: str,
-    db_blob: storage.Blob,
-) -> None:
-    if prompt_type not in ("qa", "plain"):
-        raise ValueError(f"invalid prompt_type: {prompt_type}")
-
-    column = "qa_chunk_done" if prompt_type == "qa" else "plain_chunk_done"
-
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN")
-        conn.execute(
-            f"""
-            UPDATE knowledge_job_items
-            SET {column} = COALESCE({column}, 0) + 1
-            WHERE job_item_id = ?
-            """,
-            (job_item_id,),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    upload_local_db(db_blob, local_db_path)
 
 
 @router.post("/run", response_model=KnowledgeJobCreateResponse)

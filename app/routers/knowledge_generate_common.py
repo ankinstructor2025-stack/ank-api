@@ -492,3 +492,37 @@ def get_generation_status_source(bucket_name: str, uid: str, source_type: str) -
         raise ValueError(f"invalid source_type: {source_type}")
     payload = read_generation_status(bucket_name, uid)
     return payload["sources"][source_type]
+
+
+def build_source_status_payload_from_db(
+    local_db_path: str,
+    job_id: str,
+    *,
+    phase: str | None = None,
+    current_item_id: str | None = None,
+    current_label: str | None = None,
+    message: str | None = None,
+    error_message: str | None = None,
+    chunk_total: int = 0,
+    chunk_done: int = 0,
+) -> dict[str, Any]:
+    payload = build_status_payload_from_db(local_db_path, job_id)
+    items = payload.get("items") or []
+    done_count = sum(1 for item in items if item.get("status") == "done")
+    error_count = sum(1 for item in items if item.get("status") == "error")
+    waiting_count = sum(1 for item in items if item.get("status") in ("new", "running"))
+    payload.update(
+        {
+            "phase": phase,
+            "done_count": done_count,
+            "error_count": error_count,
+            "waiting_count": waiting_count,
+            "current_item_id": current_item_id,
+            "current_label": current_label,
+            "message": message,
+            "error_message": error_message if error_message is not None else payload.get("error_message"),
+            "total_chunks": int(chunk_total or 0),
+            "processed_chunks": int(chunk_done or 0),
+        }
+    )
+    return payload
