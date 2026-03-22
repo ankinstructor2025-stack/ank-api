@@ -130,51 +130,46 @@ def is_html_like_url(url: str) -> bool:
 
 
 def load_public_url_config() -> dict[str, Any]:
-    blob_path = get_public_url_blob_path()
-
     try:
         client = storage.Client()
         bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(blob_path)
+        blob = bucket.blob(f"{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}")
 
         if not blob.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"config not found: gs://{BUCKET_NAME}/{blob_path}"
+                detail=f"config not found: gs://{BUCKET_NAME}/{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}"
             )
 
         text = blob.download_as_text(encoding="utf-8")
         data = json.loads(text)
+
         if not isinstance(data, dict):
-            raise HTTPException(status_code=500, detail="public_url.json root must be object")
+            raise HTTPException(status_code=500, detail="invalid json structure")
+
         return data
 
     except HTTPException:
         raise
     except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"invalid json in gs://{BUCKET_NAME}/{blob_path}: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"invalid json: {e}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"failed to load public_url config: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"failed to load config: {e}")
 
 
 def get_public_url_source(config: dict[str, Any], source_key: str) -> dict[str, Any]:
-    sources = config.get("sources") or []
+    sources = config.get("sources")
+
     if not isinstance(sources, list):
-        raise HTTPException(status_code=500, detail="public_url.json: sources must be array")
+        raise HTTPException(status_code=500, detail="sources not found in config")
 
-    for source in sources:
-        if not isinstance(source, dict):
+    for s in sources:
+        if not isinstance(s, dict):
             continue
-        if str(source.get("source_key") or "").strip() == source_key:
-            return source
+        if str(s.get("source_key") or "").strip() == source_key:
+            return s
 
-    raise HTTPException(status_code=400, detail=f"unsupported source_key: {source_key}")
+    raise HTTPException(status_code=404, detail=f"source_key not found: {source_key}")
 
 
 def load_crawl_rule(config: dict[str, Any]) -> CrawlRule:
