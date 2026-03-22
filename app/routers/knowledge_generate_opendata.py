@@ -1180,9 +1180,6 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     uid,
                     phase="extract_knowledge",
                     message=message,
-                    dataset_id=current_parent_source_id,
-                    dataset_name=current_parent_label,
-                    row_count=current_row_count,
                     knowledge_count=total_qa_count + total_plain_count,
                     qa_current=int(processed_qa_chunks or 0),
                     qa_total=int(total_qa_chunks or 0),
@@ -1226,9 +1223,6 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     uid,
                     phase="extract_knowledge",
                     message="item done",
-                    dataset_id=current_parent_source_id,
-                    dataset_name=current_parent_label,
-                    row_count=current_row_count,
                     knowledge_count=total_qa_count + total_plain_count,
                 )
 
