@@ -15,7 +15,6 @@ from google.cloud import storage
 import firebase_admin
 from firebase_admin import auth as fb_auth
 
-
 logger = logging.getLogger(__name__)
 JST = ZoneInfo("Asia/Tokyo")
 LOCK_TTL_SECONDS = 60 * 60 * 6
@@ -33,16 +32,15 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
+def knowledge_generate_path(uid: str) -> str:
+    return f"users/{uid}/knowledge_generate.json"
+
+
 def local_user_db_path(uid: str) -> str:
     return f"/tmp/ank_{uid}.db"
 
 
 def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
-    qa_chunk_total = int(row["qa_chunk_total"] or 0)
-    qa_chunk_done = int(row["qa_chunk_done"] or 0)
-    plain_chunk_total = int(row["plain_chunk_total"] or 0)
-    plain_chunk_done = int(row["plain_chunk_done"] or 0)
-
     return {
         "job_item_id": row["job_item_id"],
         "parent_source_id": row["parent_source_id"],
@@ -53,13 +51,8 @@ def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
         "row_count": int(row["row_count"] or 0),
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
-        "qa_chunk_total": qa_chunk_total,
-        "qa_chunk_done": qa_chunk_done,
-        "plain_chunk_total": plain_chunk_total,
-        "plain_chunk_done": plain_chunk_done,
-        "chunk_total": qa_chunk_total + plain_chunk_total,
-        "chunk_done": qa_chunk_done + plain_chunk_done,
     }
+
 
 def ensure_firebase_initialized() -> None:
     if firebase_admin._apps:
@@ -94,61 +87,64 @@ def normalize_text(text: str | None) -> str:
     return " ".join(str(text).split()).strip()
 
 
-def load_json_safe(text: str) -> dict | list | None:
+def load_json_safe(text: str | None) -> Any | None:
+    if text is None:
+        return None
+    src = str(text).strip()
+    if not src:
+        return None
     try:
-        return json.loads(text)
+        return json.loads(src)
     except Exception:
         return None
 
 
 def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
     lines: list[str] = []
-
     if isinstance(value, dict):
         for k, v in value.items():
             key = f"{prefix}.{k}" if prefix else str(k)
             lines.extend(flatten_json_like(v, key))
         return lines
-
     if isinstance(value, list):
         for idx, item in enumerate(value):
             key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
             lines.extend(flatten_json_like(item, key))
         return lines
-
     text = normalize_text(str(value) if value is not None else "")
     if not text:
         return []
-
-    if prefix:
-        return [f"{prefix}: {text}"]
-    return [text]
+    return [f"{prefix}: {text}"] if prefix else [text]
 
 
 def extract_row_text(content_raw: str | None) -> str:
     src = (content_raw or "").strip()
     if not src:
         return ""
-
     parsed = load_json_safe(src)
     if parsed is None:
         return normalize_text(src)
-
     lines = flatten_json_like(parsed)
     if not lines:
         return normalize_text(src)
-
     return "\n".join(lines).strip()
+
+
+def extract_json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        lines = flatten_json_like(value)
+        return "\n".join(lines).strip() if lines else ""
+    return extract_row_text(str(value))
 
 
 def load_template_text(bucket_name: str, path: str) -> str:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(path)
-
     if not blob.exists():
         raise HTTPException(status_code=404, detail=f"{path} not found")
-
     return blob.download_as_bytes().decode("utf-8").strip()
 
 
@@ -156,10 +152,8 @@ def load_chunk_config(bucket_name: str, config_path: str) -> dict:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(config_path)
-
     if not blob.exists():
         raise HTTPException(status_code=404, detail=f"{config_path} not found")
-
     try:
         obj = json.loads(blob.download_as_bytes().decode("utf-8"))
         if not isinstance(obj, dict):
@@ -180,18 +174,24 @@ def replace_local_db_from_blob(db_blob: storage.Blob, local_db_path: str) -> Non
     local_dir = os.path.dirname(local_db_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
-
-    if os.path.exists(local_db_path):
-        os.remove(local_db_path)
-
-    db_blob.download_to_filename(local_db_path)
-
+    temp_path = f"{local_db_path}.download"
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    db_blob.download_to_filename(temp_path)
+    conn = sqlite3.connect(temp_path)
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        result = row[0] if row else None
+        if result != "ok":
+            raise RuntimeError(f"sqlite quick_check failed: {result}")
+    finally:
+        conn.close()
+    os.replace(temp_path, local_db_path)
 
 
 def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
     if not os.path.exists(local_db_path):
         raise FileNotFoundError(f"local db not found: {local_db_path}")
-
     db_blob.upload_from_filename(local_db_path)
     logger.info("db uploaded to gcs: %s", db_blob.name)
 
@@ -314,10 +314,6 @@ def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
                 status,
                 knowledge_count,
                 error_message,
-                qa_chunk_total,
-                qa_chunk_done,
-                plain_chunk_total,
-                plain_chunk_done,
                 created_at,
                 started_at,
                 finished_at
@@ -336,15 +332,7 @@ def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, A
     job_row = fetch_job_row(local_db_path, job_id)
     if not job_row:
         raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
-
-    item_rows = fetch_job_items(local_db_path, job_id)
-    items = [row_to_status_item(row) for row in item_rows]
-
-    total_qa_chunks = sum(int(item["qa_chunk_total"] or 0) for item in items)
-    done_qa_chunks = sum(int(item["qa_chunk_done"] or 0) for item in items)
-    total_plain_chunks = sum(int(item["plain_chunk_total"] or 0) for item in items)
-    done_plain_chunks = sum(int(item["plain_chunk_done"] or 0) for item in items)
-
+    items = [row_to_status_item(row) for row in fetch_job_items(local_db_path, job_id)]
     return {
         "job_id": job_row["job_id"],
         "status": job_row["status"] or "",
@@ -356,12 +344,12 @@ def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, A
         "started_at": job_row["started_at"],
         "finished_at": job_row["finished_at"],
         "error_message": job_row["error_message"],
-        "total_qa_chunks": total_qa_chunks,
-        "processed_qa_chunks": done_qa_chunks,
-        "total_plain_chunks": total_plain_chunks,
-        "processed_plain_chunks": done_plain_chunks,
-        "total_chunks": total_qa_chunks + total_plain_chunks,
-        "processed_chunks": done_qa_chunks + done_plain_chunks,
+        "total_qa_chunks": 0,
+        "processed_qa_chunks": 0,
+        "total_plain_chunks": 0,
+        "processed_plain_chunks": 0,
+        "total_chunks": 0,
+        "processed_chunks": 0,
         "items": items,
     }
 
@@ -420,53 +408,87 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         conn.close()
 
 
-def load_json_safe(text: str) -> Any | None:
-    if text is None:
-        return None
-    text = str(text).strip()
-    if not text:
-        return None
+def default_generate_source_payload() -> dict[str, Any]:
+    return {
+        "job_id": None,
+        "status": "idle",
+        "phase": None,
+        "selected_count": 0,
+        "done_count": 0,
+        "error_count": 0,
+        "waiting_count": 0,
+        "qa_count": 0,
+        "plain_count": 0,
+        "current_item_id": None,
+        "current_label": None,
+        "message": None,
+        "error_message": None,
+        "requested_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "total_qa_chunks": 0,
+        "processed_qa_chunks": 0,
+        "total_plain_chunks": 0,
+        "processed_plain_chunks": 0,
+        "total_chunks": 0,
+        "processed_chunks": 0,
+        "items": [],
+    }
+
+
+def _normalize_generation_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    sources = payload.get("sources")
+    if not isinstance(sources, dict):
+        sources = {}
+    payload["sources"] = sources
+    for key in ("kokkai", "opendata", "file_upload"):
+        current = sources.get(key)
+        if not isinstance(current, dict):
+            current = {}
+        merged = default_generate_source_payload()
+        merged.update(current)
+        sources[key] = merged
+    payload.setdefault("updated_at", None)
+    return payload
+
+
+def read_generation_status(bucket_name: str, uid: str) -> dict[str, Any]:
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(knowledge_generate_path(uid))
+    if not blob.exists():
+        raise HTTPException(status_code=500, detail=f"knowledge_generate.json not found: gs://{bucket_name}/{knowledge_generate_path(uid)}")
     try:
-        return json.loads(text)
-    except Exception:
-        return None
+        payload = json.loads(blob.download_as_bytes().decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to parse knowledge_generate.json: {e}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="knowledge_generate.json root must be object")
+    return _normalize_generation_status_payload(payload)
 
 
-def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
-    lines: list[str] = []
-
-    if isinstance(value, dict):
-        for k, v in value.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            lines.extend(flatten_json_like(v, key))
-        return lines
-
-    if isinstance(value, list):
-        for idx, item in enumerate(value):
-            key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
-            lines.extend(flatten_json_like(item, key))
-        return lines
-
-    text = normalize_text(str(value) if value is not None else "")
-    if not text:
-        return []
-
-    if prefix:
-        return [f"{prefix}: {text}"]
-    return [text]
+def write_generation_status(bucket_name: str, uid: str, payload: dict[str, Any]) -> None:
+    payload = _normalize_generation_status_payload(dict(payload))
+    payload["updated_at"] = now_iso()
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(knowledge_generate_path(uid))
+    blob.upload_from_string(json.dumps(payload, ensure_ascii=False, indent=2), content_type="application/json; charset=utf-8")
 
 
-def extract_json_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        lines = flatten_json_like(value)
-        return "\n".join(lines).strip() if lines else ""
+def update_generation_status_source(bucket_name: str, uid: str, source_type: str, source_payload: dict[str, Any]) -> dict[str, Any]:
+    if source_type not in ("kokkai", "opendata", "file_upload"):
+        raise ValueError(f"invalid source_type: {source_type}")
+    payload = read_generation_status(bucket_name, uid)
+    merged = default_generate_source_payload()
+    merged.update(source_payload or {})
+    payload["sources"][source_type] = merged
+    write_generation_status(bucket_name, uid, payload)
+    return merged
 
-    text = normalize_text(str(value))
-    parsed = load_json_safe(text)
-    if parsed is None:
-        return text
 
-    lines = flatten_json_like(parsed)
-    return "\n".join(lines).strip() if lines else text
+def get_generation_status_source(bucket_name: str, uid: str, source_type: str) -> dict[str, Any]:
+    if source_type not in ("kokkai", "opendata", "file_upload"):
+        raise ValueError(f"invalid source_type: {source_type}")
+    payload = read_generation_status(bucket_name, uid)
+    return payload["sources"][source_type]
