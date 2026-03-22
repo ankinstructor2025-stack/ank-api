@@ -10,61 +10,30 @@ from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
-class KnowledgeJobStatusItem(BaseModel):
-    job_item_id: str
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    status: str
-    knowledge_count: int = 0
-    error_message: Optional[str] = None
-    row_count: int = 0
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    qa_chunk_total: int = 0
-    qa_chunk_done: int = 0
-    plain_chunk_total: int = 0
-    plain_chunk_done: int = 0
-    chunk_total: int = 0
-    chunk_done: int = 0
-
-class KnowledgeJobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    selected_count: int = 0
-    qa_count: int = 0
-    plain_count: int = 0
-    error_count: int = 0
-    requested_at: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    error_message: Optional[str] = None
-    total_qa_chunks: int = 0
-    processed_qa_chunks: int = 0
-    total_plain_chunks: int = 0
-    processed_plain_chunks: int = 0
-    total_chunks: int = 0
-    processed_chunks: int = 0
-    items: List[KnowledgeJobStatusItem] = Field(default_factory=list)
-
 from .knowledge_generate_common import (
-    fetch_job_items,
+    build_status_payload_from_db,
+    build_source_status_payload_from_db,
+    build_lock_key,
+    fetch_job_row,
     fetch_next_new_job_item,
+    extract_row_text,
+    get_running_lock_job_id,
     get_uid_from_auth_header,
     load_chunk_config,
     load_template_text,
     local_user_db_path,
     new_id,
+    normalize_text,
     now_iso,
     open_user_db,
+    release_job_lock,
+    try_acquire_job_lock,
     upload_local_db,
     user_db_path,
     replace_local_db_from_blob,
-    set_job_running,
-    set_job_done,
-    set_job_error,
-    try_read_status_payload,
+    get_generation_status_source,
+    update_generation_status_source,
 )
-
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
@@ -82,6 +51,27 @@ OPENDATA_QA_PROMPT_PATH = "template/opendata_qa_prompt.txt"
 OPENDATA_PLAIN_PROMPT_PATH = "template/opendata_plain_prompt.txt"
 OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
+
+class KnowledgeJobStatusResponse(BaseModel):
+    updated_at: Optional[str] = None
+    job_id: Optional[str] = None
+    source_type: Optional[str] = None
+    status: str = "idle"
+    phase: Optional[str] = None
+    message: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    dataset_id: Optional[str] = None
+    dataset_name: Optional[str] = None
+    row_count: int = 0
+    knowledge_count: int = 0
+    qa_current: int = 0
+    qa_total: int = 0
+    plain_current: int = 0
+    plain_total: int = 0
+    chunk_current: int = 0
+    chunk_total: int = 0
 
 def get_required_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
     opendata_conf = chunk_config.get("opendata")
@@ -118,92 +108,58 @@ def get_required_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> Ch
 
     return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line.strip() for line in text.split("\n")]
-    merged = "\n".join(line for line in lines if line)
-    return merged.strip()
 
 
-def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_id,
-                source_type,
-                source_name,
-                request_type,
-                status,
-                selected_count,
-                qa_count,
-                plain_count,
-                error_count,
-                requested_at,
-                started_at,
-                finished_at,
-                error_message
-            FROM knowledge_jobs
-            WHERE job_id = ?
-            LIMIT 1
-            """,
-            (job_id,),
-        )
-        return cur.fetchone()
-    finally:
-        conn.close()
 
 
-def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "job_item_id": row["job_item_id"],
-        "parent_source_id": row["parent_source_id"],
-        "parent_label": row["parent_label"],
-        "status": row["status"] or "",
-        "knowledge_count": int(row["knowledge_count"] or 0),
-        "error_message": row["error_message"],
-        "row_count": int(row["row_count"] or 0),
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-        "qa_chunk_total": 0,
-        "qa_chunk_done": 0,
-        "plain_chunk_total": 0,
-        "plain_chunk_done": 0,
-        "chunk_total": 0,
-        "chunk_done": 0,
-    }
 
 
-def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
-    job_row = fetch_job_row(local_db_path, job_id)
-    if not job_row:
-        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
 
-    item_rows = fetch_job_items(local_db_path, job_id)
-    items = [row_to_status_item(row) for row in item_rows]
 
-    return {
-        "job_id": str(job_row["job_id"]),
-        "status": job_row["status"] or "",
-        "selected_count": int(job_row["selected_count"] or 0),
-        "qa_count": int(job_row["qa_count"] or 0),
-        "plain_count": int(job_row["plain_count"] or 0),
-        "error_count": int(job_row["error_count"] or 0),
-        "requested_at": job_row["requested_at"],
-        "started_at": job_row["started_at"],
-        "finished_at": job_row["finished_at"],
-        "error_message": job_row["error_message"],
-        "total_qa_chunks": 0,
-        "processed_qa_chunks": 0,
-        "total_plain_chunks": 0,
-        "processed_plain_chunks": 0,
-        "total_chunks": 0,
-        "processed_chunks": 0,
-        "items": items,
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+LOCK_TTL_SECONDS = 60 * 60 * 6
+
+
+
+
+
+
+
+
+
+
 
 
 def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
@@ -231,6 +187,12 @@ def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3
         return cur.fetchall()
     finally:
         conn.close()
+
+
+
+
+
+
 
 
 def fetch_opendata_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
@@ -998,44 +960,6 @@ def update_job_summary(
         conn.close()
 
 
-def build_source_status_payload(
-    local_db_path: str,
-    job_id: str,
-    *,
-    phase: str | None = None,
-    current_item_id: str | None = None,
-    current_label: str | None = None,
-    message: str | None = None,
-    error_message: str | None = None,
-    total_qa_chunks: int = 0,
-    processed_qa_chunks: int = 0,
-    total_plain_chunks: int = 0,
-    processed_plain_chunks: int = 0,
-) -> dict[str, Any]:
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    items = payload.get("items") or []
-    done_count = sum(1 for item in items if item.get("status") == "done")
-    error_count = sum(1 for item in items if item.get("status") == "error")
-    waiting_count = sum(1 for item in items if item.get("status") in ("new", "running"))
-    payload.update({
-        "phase": phase,
-        "done_count": done_count,
-        "error_count": error_count,
-        "waiting_count": waiting_count,
-        "current_item_id": current_item_id,
-        "current_label": current_label,
-        "message": message,
-        "error_message": error_message if error_message is not None else payload.get("error_message"),
-        "total_qa_chunks": int(total_qa_chunks or 0),
-        "processed_qa_chunks": int(processed_qa_chunks or 0),
-        "total_plain_chunks": int(total_plain_chunks or 0),
-        "processed_plain_chunks": int(processed_plain_chunks or 0),
-        "total_chunks": int(total_qa_chunks or 0) + int(total_plain_chunks or 0),
-        "processed_chunks": int(processed_qa_chunks or 0) + int(processed_plain_chunks or 0),
-    })
-    return payload
-
-
 def process_opendata_job_item(
     local_db_path: str,
     job_id: str,
@@ -1196,16 +1120,6 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             )
             return
 
-        if job_row["status"] == "done":
-            set_job_done(
-                bucket,
-                uid,
-                job_id,
-                phase="extract_knowledge",
-                message="already done",
-            )
-            return
-
         qa_template_text = load_template_text(BUCKET_NAME, OPENDATA_QA_PROMPT_PATH)
         plain_template_text = load_template_text(BUCKET_NAME, OPENDATA_PLAIN_PROMPT_PATH)
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
@@ -1217,6 +1131,27 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
+        job_items = []
+        conn = open_user_db(local_db_path)
+        try:
+            cur = conn.execute(
+                """
+                SELECT ji.parent_source_id, ji.parent_label, ji.row_count
+                FROM knowledge_job_items ji
+                WHERE ji.job_id = ?
+                ORDER BY ji.created_at, ji.job_item_id
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            first_item = cur.fetchone()
+        finally:
+            conn.close()
+
+        dataset_id = first_item["parent_source_id"] if first_item else None
+        dataset_name = first_item["parent_label"] if first_item else None
+        row_count = int(first_item["row_count"] or 0) if first_item else 0
+
         set_job_running(
             bucket,
             uid,
@@ -1224,6 +1159,12 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             SOURCE_TYPE,
             phase="extract_knowledge",
             message="background started",
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            qa_total=0,
+            plain_total=0,
+            chunk_total=0,
         )
 
         while True:
@@ -1233,23 +1174,20 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
 
             current_job_item_id = row["job_item_id"]
             current_parent_label = row["parent_label"]
+            current_parent_source_id = row["parent_source_id"]
+            current_row_count = int(row["row_count"] or 0)
             mark_job_item_running(local_db_path, current_job_item_id)
 
-            def progress_callback(
-                *,
-                total_qa_chunks=0,
-                processed_qa_chunks=0,
-                total_plain_chunks=0,
-                processed_plain_chunks=0,
-                message=None,
-            ):
-                set_job_running(
+            def progress_callback(*, total_qa_chunks=0, processed_qa_chunks=0, total_plain_chunks=0, processed_plain_chunks=0, message=None):
+                set_job_progress(
                     bucket,
                     uid,
-                    job_id,
-                    SOURCE_TYPE,
                     phase="extract_knowledge",
                     message=message,
+                    dataset_id=current_parent_source_id,
+                    dataset_name=current_parent_label,
+                    row_count=current_row_count,
+                    knowledge_count=total_qa_count + total_plain_count,
                     qa_current=int(processed_qa_chunks or 0),
                     qa_total=int(total_qa_chunks or 0),
                     plain_current=int(processed_plain_chunks or 0),
@@ -1287,12 +1225,15 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                     error_message=None,
                 )
 
-                progress_callback(
-                    total_qa_chunks=result.get("qa_count", 0),
-                    processed_qa_chunks=result.get("qa_count", 0),
-                    total_plain_chunks=result.get("plain_count", 0),
-                    processed_plain_chunks=result.get("plain_count", 0),
+                set_job_progress(
+                    bucket,
+                    uid,
+                    phase="extract_knowledge",
                     message="item done",
+                    dataset_id=current_parent_source_id,
+                    dataset_name=current_parent_label,
+                    row_count=current_row_count,
+                    knowledge_count=total_qa_count + total_plain_count,
                 )
 
             except Exception as e:
@@ -1347,15 +1288,14 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             total_error_count=total_error_count,
             error_message=None,
         )
-
         upload_local_db(db_blob, local_db_path)
-
         set_job_done(
             bucket,
             uid,
             job_id,
             phase="extract_knowledge",
             message="completed",
+            knowledge_count=total_qa_count + total_plain_count,
         )
 
     except Exception as e:
@@ -1591,8 +1531,8 @@ def run_opendata_job(
         if running_job_id == body.job_id:
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(current_status.get("selected_count") or 0),
-                created_item_count=len(current_status.get("items") or []),
+                selected_count=0,
+                created_item_count=0,
                 status="running",
                 prompt_previews=[],
                 debug_items=[],
@@ -1613,18 +1553,18 @@ def run_opendata_job(
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         if job_row["status"] == "done":
-            payload = build_status_payload_from_db(local_db_path, body.job_id)
             set_job_done(
                 bucket,
                 uid,
                 body.job_id,
                 phase="extract_knowledge",
                 message="already done",
+                knowledge_count=int(job_row["qa_count"] or 0) + int(job_row["plain_count"] or 0),
             )
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(payload["selected_count"] or 0),
-                created_item_count=len(payload["items"]),
+                selected_count=0,
+                created_item_count=0,
                 status="done",
                 prompt_previews=[],
                 debug_items=[],
@@ -1653,15 +1593,15 @@ def run_opendata_job(
             SOURCE_TYPE,
             phase="extract_knowledge",
             message="job started",
+            knowledge_count=total_qa_count + total_plain_count,
         )
 
-        payload = build_status_payload_from_db(local_db_path, body.job_id)
         background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=int(payload["selected_count"] or 0),
-            created_item_count=len(payload["items"]),
+            selected_count=0,
+            created_item_count=0,
             status="running",
             prompt_previews=[],
             debug_items=[],
@@ -1687,23 +1627,12 @@ def get_opendata_job_status(
     bucket = client.bucket(BUCKET_NAME)
 
     try:
-        source_payload = try_read_status_payload(bucket, uid)
-        if source_payload.get("job_id") == job_id and source_payload.get("status") not in (None, "idle"):
-            return KnowledgeJobStatusResponse(**source_payload)
+        payload = try_read_status_payload(bucket, uid)
+        if payload.get("job_id") == job_id:
+            return KnowledgeJobStatusResponse(**payload)
     except HTTPException:
         raise
     except Exception as e:
         logger.warning("failed to read knowledge_generate.json: %s", e)
 
-    db_gcs_path = user_db_path(uid)
-    db_blob = bucket.blob(db_gcs_path)
-    if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
-        )
-
-    local_db_path = local_user_db_path(uid)
-    replace_local_db_from_blob(db_blob, local_db_path)
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    return KnowledgeJobStatusResponse(**payload)
+    raise HTTPException(status_code=404, detail=f"status not found: {job_id}")

@@ -417,44 +417,6 @@ def clear_job_status(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
     return payload
 
 
-# ---------- compatibility wrappers ----------
-
-def build_status_payload_from_db(
-    local_db_path: str,
-    job_id: str,
-    *,
-    bucket: storage.Bucket | None = None,
-    uid: str | None = None,
-    source_type: str | None = None,
-) -> dict[str, Any]:
-    if bucket is None or uid is None:
-        raise HTTPException(
-            status_code=500,
-            detail="build_status_payload_from_db now requires bucket and uid",
-        )
-    return try_read_status_payload(bucket, uid)
-
-
-def fetch_other_running_job_id(
-    local_db_path: str,
-    source_type: str,
-    job_id: str,
-    *,
-    bucket: storage.Bucket | None = None,
-    uid: str | None = None,
-) -> str | None:
-    if bucket is None or uid is None:
-        raise HTTPException(
-            status_code=500,
-            detail="fetch_other_running_job_id now requires bucket and uid",
-        )
-    status = try_read_status_payload(bucket, uid)
-    current_job_id = status.get("job_id")
-    if status.get("status") == "running" and current_job_id and current_job_id != job_id:
-        return str(current_job_id)
-    return None
-
-
 # ---------- db helpers kept for job items ----------
 def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
