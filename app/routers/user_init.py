@@ -10,8 +10,8 @@ router = APIRouter()
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
-# GCS上のテンプレDB（あなたの現状に合わせて）
 TEMPLATE_DB_PATH = "template/template.sqlite"
+TEMPLATE_JSON_PATH = "template/knowledge_generate.json"
 
 # ユーザDBの保存先（デモはこれ固定が一番ラク）
 def user_db_path(uid: str) -> str:
@@ -74,14 +74,42 @@ def ensure_user_db_in_gcs(uid: str) -> dict:
     return {"created": True, "db_gcs_path": dest_path}
 
 
+def ensure_user_json_in_gcs(uid: str) -> dict:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    dest_path = f"users/{uid}/knowledge_generate.json"
+    dest_blob = bucket.blob(dest_path)
+
+    # 既にある → 何もしない
+    if dest_blob.exists():
+        return {"created": False, "json_gcs_path": dest_path}
+
+    # テンプレ確認
+    src_blob = bucket.blob(TEMPLATE_JSON_PATH)
+    if not src_blob.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Template JSON not found: gs://{BUCKET_NAME}/{TEMPLATE_JSON_PATH}"
+        )
+
+    bucket.copy_blob(src_blob, bucket, new_name=dest_path)
+
+    return {"created": True, "json_gcs_path": dest_path}
+
+
 @router.post("/user/init")
 def user_init(authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
-    r = ensure_user_db_in_gcs(uid)
+
+    r_db = ensure_user_db_in_gcs(uid)
+    r_json = ensure_user_json_in_gcs(uid)
 
     return {
         "ok": True,
         "user_id": uid,
-        "created": r["created"],
-        "db_gcs_path": r["db_gcs_path"],
+        "db_created": r_db["created"],
+        "json_created": r_json["created"],
+        "db_gcs_path": r_db["db_gcs_path"],
+        "json_gcs_path": r_json["json_gcs_path"],
     }
