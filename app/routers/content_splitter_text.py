@@ -16,26 +16,19 @@ LONG_DIGITS_RE = re.compile(r"\d{20,}")
 
 def safe_decode(binary: bytes) -> str:
     """
-    日本語テキスト向けのデコード。
+    日本語テキスト向けの安全なデコード。
     優先順:
       1. utf-8
       2. shift_jis
       3. cp932
-    どれでも読めない場合は補完せず例外にする。
+      4. utf-8(ignore)
     """
-    last_error: Exception | None = None
     for encoding in ("utf-8", "shift_jis", "cp932"):
         try:
             return binary.decode(encoding)
-        except Exception as e:
-            last_error = e
-    raise UnicodeDecodeError(
-        "multi",
-        binary,
-        0,
-        min(len(binary), 1),
-        f"failed to decode with utf-8, shift_jis, cp932: {last_error}",
-    )
+        except Exception:
+            pass
+    return binary.decode("utf-8", errors="ignore")
 
 
 def clean_text(text: str) -> str:

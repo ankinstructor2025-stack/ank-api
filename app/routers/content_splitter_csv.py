@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from typing import Any
+from typing import Any, Optional
 
 
 CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]")
@@ -12,26 +12,19 @@ MULTI_SPACES_RE = re.compile(r"[ \t]+")
 
 def safe_decode(binary: bytes) -> str:
     """
-    日本語ファイル向けのデコード。
+    日本語ファイル向けの安全なデコード。
     優先順:
       1. utf-8
       2. shift_jis
       3. cp932
-    どれでも読めない場合は補完せず例外にする。
+      4. utf-8(ignore)
     """
-    last_error: Exception | None = None
     for encoding in ("utf-8", "shift_jis", "cp932"):
         try:
             return binary.decode(encoding)
-        except Exception as e:
-            last_error = e
-    raise UnicodeDecodeError(
-        "multi",
-        binary,
-        0,
-        min(len(binary), 1),
-        f"failed to decode with utf-8, shift_jis, cp932: {last_error}",
-    )
+        except Exception:
+            pass
+    return binary.decode("utf-8", errors="ignore")
 
 
 def clean_csv_cell(value: Any) -> str:
@@ -50,13 +43,16 @@ def clean_csv_cell(value: Any) -> str:
     return text.strip()
 
 
-def count_csv_rows_from_binary(binary: bytes, encoding: str = "utf-8") -> int:
-    text = safe_decode(binary)
-    reader = csv.DictReader(io.StringIO(text))
-    count = 0
-    for _ in reader:
-        count += 1
-    return count
+def count_csv_rows_from_binary(binary: bytes, encoding: str = "utf-8") -> Optional[int]:
+    try:
+        text = safe_decode(binary)
+        reader = csv.DictReader(io.StringIO(text))
+        count = 0
+        for _ in reader:
+            count += 1
+        return count
+    except Exception:
+        return None
 
 
 def split_csv_records(

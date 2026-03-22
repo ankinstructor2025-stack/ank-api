@@ -45,12 +45,9 @@ def split_pdf_records(binary: bytes, max_rows: int = 2000) -> list[dict[str, Any
 
     for index, page in enumerate(reader.pages, start=1):
         try:
-            raw_text = page.extract_text()
-        except Exception as e:
-            raise RuntimeError(f"PDF text extraction failed at page {index}") from e
-
-        if raw_text is None:
-            raise RuntimeError(f"PDF text extraction returned empty text at page {index}")
+            raw_text = page.extract_text() or ""
+        except Exception:
+            raw_text = ""
 
         text = clean_pdf_text(raw_text)
         pages.append(
