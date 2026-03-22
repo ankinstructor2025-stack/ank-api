@@ -9,29 +9,29 @@ from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
-
+from .knowledge_generate_common import (
+    fetch_job_row,
+    fetch_next_new_job_item,
+    fetch_job_items,
+    get_uid_from_auth_header,
+    load_chunk_config,
+    load_template_text,
+    local_user_db_path,
+    new_id,
+    now_iso,
+    open_user_db,
+    upload_local_db,
+    user_db_path,
+    replace_local_db_from_blob,
+    try_read_status_payload,
+    set_job_running,
+    set_job_progress,
+    set_job_done,
+    set_job_error,
+)
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_kokkai_prompt_text
-from .knowledge_generate_common import (
-    now_iso,
-    new_id,
-    user_db_path,
-    local_user_db_path,
-    get_uid_from_auth_header,
-    load_chunk_config,
-    open_user_db,
-    upload_local_db,
-    fetch_job_items,
-    fetch_next_new_job_item,
-    replace_local_db_from_blob,
-    set_source_running,
-    set_source_finished,
-    set_source_error,
-    try_read_status_payload,
-    load_template_text,
-)
-
 
 logger = logging.getLogger(__name__)
 
@@ -44,93 +44,30 @@ KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
 KOKKAI_PLAIN_PROMPT_PATH = "template/kokkai_plain_prompt.txt"
 OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
-
 DEFAULT_KOKKAI_QA_PROMPT = ""
 DEFAULT_KOKKAI_PLAIN_PROMPT = ""
 
 
-class KnowledgeTargetItem(BaseModel):
-    parent_source_id: str
-    parent_key1: Optional[str] = None
-    parent_key2: Optional[str] = None
-    parent_label: Optional[str] = None
-    row_count: int = 0
-
-
-class KnowledgeJobCreateRequest(BaseModel):
-    source_name: Optional[str] = None
-    request_type: str = "extract_knowledge"
-    preview_only: bool = False
-    selected_items: List[KnowledgeTargetItem] = Field(default_factory=list)
-
-
-class KnowledgeRunRequest(BaseModel):
-    job_id: str
-
-
-class KnowledgePromptPreview(BaseModel):
-    job_item_id: Optional[str] = None
-    prompt_type: Optional[str] = None
-    prompt_text: Optional[str] = None
-
-
-class KnowledgeDebugItem(BaseModel):
-    job_item_id: Optional[str] = None
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    qa_debug: Optional[dict[str, Any]] = None
-    plain_debug: Optional[dict[str, Any]] = None
-
-
-class KnowledgeJobCreateResponse(BaseModel):
-    job_id: str
-    selected_count: int = 0
-    created_item_count: int = 0
-    status: str
-    prompt_previews: List[KnowledgePromptPreview] = Field(default_factory=list)
-    debug_items: List[KnowledgeDebugItem] = Field(default_factory=list)
-
-
-class KnowledgeJobStatusItem(BaseModel):
-    job_item_id: str
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    status: str
-    knowledge_count: int = 0
-    error_message: Optional[str] = None
-    row_count: int = 0
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    qa_chunk_total: int = 0
-    qa_chunk_done: int = 0
-    plain_chunk_total: int = 0
-    plain_chunk_done: int = 0
-    chunk_total: int = 0
-    chunk_done: int = 0
-
-
 class KnowledgeJobStatusResponse(BaseModel):
+    updated_at: Optional[str] = None
     job_id: Optional[str] = None
-    status: str
-    selected_count: int = 0
-    qa_count: int = 0
-    plain_count: int = 0
-    error_count: int = 0
-    requested_at: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    error_message: Optional[str] = None
+    source_type: Optional[str] = None
+    status: str = "idle"
     phase: Optional[str] = None
     message: Optional[str] = None
-    total_qa_chunks: int = 0
-    processed_qa_chunks: int = 0
-    total_plain_chunks: int = 0
-    processed_plain_chunks: int = 0
-    total_chunks: int = 0
-    processed_chunks: int = 0
-    current_item_id: Optional[str] = None
-    current_label: Optional[str] = None
-    items: List[KnowledgeJobStatusItem] = Field(default_factory=list)
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    dataset_id: Optional[str] = None
+    dataset_name: Optional[str] = None
+    row_count: int = 0
+    knowledge_count: int = 0
+    qa_current: int = 0
+    qa_total: int = 0
+    plain_current: int = 0
+    plain_total: int = 0
+    chunk_current: int = 0
+    chunk_total: int = 0
 
 
 def normalize_text(value: Any) -> str:
@@ -140,10 +77,6 @@ def normalize_text(value: Any) -> str:
     lines = [line.strip() for line in text.split("\n")]
     merged = "\n".join(line for line in lines if line)
     return merged.strip()
-
-
-def extract_row_text(value: Any) -> str:
-    return normalize_text(value)
 
 
 def load_template_text_with_default(template_path: str, default_template: str) -> str:
@@ -156,72 +89,40 @@ def load_template_text_with_default(template_path: str, default_template: str) -
         raise
 
 
-def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_id, source_type, source_name, request_type, status,
-                selected_count, qa_count, plain_count, error_count,
-                requested_at, started_at, finished_at, error_message
-            FROM knowledge_jobs
-            WHERE job_id = ?
-            LIMIT 1
-            """,
-            (job_id,),
+def get_required_kokkai_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
+    kokkai_conf = chunk_config.get("kokkai")
+    if not isinstance(kokkai_conf, dict):
+        raise HTTPException(status_code=500, detail="openai_chunk.json: kokkai section not found")
+
+    conf = kokkai_conf.get(prompt_type)
+    if not isinstance(conf, dict):
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type} section not found")
+
+    missing = [key for key in ("max_chars", "max_items", "overlap_items") if key not in conf]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"openai_chunk.json: kokkai.{prompt_type} missing keys: {', '.join(missing)}",
         )
-        return cur.fetchone()
-    finally:
-        conn.close()
 
+    try:
+        max_chars = int(conf["max_chars"])
+        max_items = int(conf["max_items"])
+        overlap_items = int(conf["overlap_items"])
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"openai_chunk.json: invalid kokkai.{prompt_type} values: {e}",
+        )
 
-def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "job_item_id": row["job_item_id"],
-        "parent_source_id": row["parent_source_id"],
-        "parent_label": row["parent_label"],
-        "status": row["status"] or "",
-        "knowledge_count": int(row["knowledge_count"] or 0),
-        "error_message": row["error_message"],
-        "row_count": int(row["row_count"] or 0),
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-        "qa_chunk_total": 0, "qa_chunk_done": 0,
-        "plain_chunk_total": 0, "plain_chunk_done": 0,
-        "chunk_total": 0, "chunk_done": 0,
-    }
+    if max_chars <= 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.max_chars must be > 0")
+    if max_items <= 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.max_items must be > 0")
+    if overlap_items < 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.overlap_items must be >= 0")
 
-
-def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
-    job_row = fetch_job_row(local_db_path, job_id)
-    if not job_row:
-        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
-    item_rows = fetch_job_items(local_db_path, job_id)
-    items = [row_to_status_item(row) for row in item_rows]
-    return {
-        "job_id": str(job_row["job_id"]),
-        "status": job_row["status"] or "",
-        "selected_count": int(job_row["selected_count"] or 0),
-        "qa_count": int(job_row["qa_count"] or 0),
-        "plain_count": int(job_row["plain_count"] or 0),
-        "error_count": int(job_row["error_count"] or 0),
-        "requested_at": job_row["requested_at"],
-        "started_at": job_row["started_at"],
-        "finished_at": job_row["finished_at"],
-        "error_message": job_row["error_message"],
-        "phase": None,
-        "message": None,
-        "total_qa_chunks": 0,
-        "processed_qa_chunks": 0,
-        "total_plain_chunks": 0,
-        "processed_plain_chunks": 0,
-        "total_chunks": 0,
-        "processed_chunks": 0,
-        "current_item_id": None,
-        "current_label": None,
-        "items": items,
-    }
+    return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
 
 def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.Row]:
@@ -232,6 +133,8 @@ def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.
             SELECT
                 issue_id,
                 speech_id,
+                speech_order,
+                speaker,
                 speech
             FROM kokkai_document_rows
             WHERE issue_id = ?
@@ -244,36 +147,6 @@ def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.
         conn.close()
 
 
-def get_kokkai_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
-    kokkai_conf = chunk_config.get("kokkai")
-    if not isinstance(kokkai_conf, dict):
-        raise HTTPException(status_code=500, detail="openai_chunk.json: kokkai section not found")
-
-    conf = kokkai_conf.get(prompt_type)
-    if not isinstance(conf, dict):
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type} section not found")
-
-    missing = [key for key in ("max_chars", "max_items", "overlap_items") if key not in conf]
-    if missing:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type} missing keys: {', '.join(missing)}")
-
-    try:
-        max_chars = int(conf["max_chars"])
-        max_items = int(conf["max_items"])
-        overlap_items = int(conf["overlap_items"])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: invalid kokkai.{prompt_type} values: {e}")
-
-    if max_chars <= 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.max_chars must be > 0")
-    if max_items <= 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.max_items must be > 0")
-    if overlap_items < 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: kokkai.{prompt_type}.overlap_items must be >= 0")
-
-    return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
-
-
 def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
     cur = conn.execute(
         """
@@ -281,6 +154,9 @@ def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sq
             ji.job_item_id,
             ji.parent_source_id,
             ji.parent_label,
+            ji.parent_key1,
+            ji.parent_key2,
+            ji.row_count,
             d.name_of_house,
             d.name_of_meeting,
             d.logical_name
@@ -319,24 +195,17 @@ def fetch_kokkai_content_rows(conn: sqlite3.Connection, job_item_id: str) -> lis
 def build_kokkai_prompt_texts(
     conn: sqlite3.Connection,
     job_item_id: str,
-    template_path: str,
-    default_template: str,
+    template_text: str,
     chunk_conf: ChunkConfig,
 ) -> list[str]:
     item = fetch_kokkai_job_item_meta(conn, job_item_id)
     rows = fetch_kokkai_content_rows(conn, job_item_id)
 
-    chunks = build_chunks(
-        rows,
-        chunk_conf,
-        allowed_content_types={"row"},
-    )
-
+    chunks = build_chunks(rows, chunk_conf, allowed_content_types={"row"})
     if not chunks:
         raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
 
-    prompt_template = load_template_text_with_default(template_path, default_template)
-
+    prompt_template = template_text.strip()
     prompt_texts: list[str] = []
     for chunk in chunks:
         prompt_texts.append(
@@ -344,13 +213,12 @@ def build_kokkai_prompt_texts(
                 job_item_id=job_item_id,
                 prompt_template=prompt_template,
                 chunk=chunk,
-                name_of_house=item["name_of_house"],
-                name_of_meeting=item["name_of_meeting"],
-                logical_name=item["logical_name"],
+                name_of_house=item["name_of_house"] or "",
+                name_of_meeting=item["name_of_meeting"] or "",
+                logical_name=item["logical_name"] or "",
                 parent_label=item["parent_label"],
             )
         )
-
     return prompt_texts
 
 
@@ -362,60 +230,36 @@ def join_prompt_previews(prompt_texts: list[str]) -> str:
 
 
 def merge_qa_chunk_results(job_item_id: str, chunk_results: list[dict]) -> dict:
-    merged: dict[str, Any] = {
-        "job_item_id": job_item_id,
-        "qa_list": [],
-        "chunk_count": len(chunk_results),
-    }
-
+    merged: dict[str, Any] = {"job_item_id": job_item_id, "qa_list": [], "chunk_count": len(chunk_results)}
     for idx, result in enumerate(chunk_results, start=1):
         if not isinstance(result, dict):
             continue
-
         result_job_item_id = result.get("job_item_id")
         if result_job_item_id not in (None, "", job_item_id):
             raise Exception(f"qa job_item_id mismatch at chunk {idx}")
-
         qa_list = result.get("qa_list") or []
         if not isinstance(qa_list, list):
             raise Exception(f"qa_list is not list at chunk {idx}")
-
         merged["qa_list"].extend(qa_list)
-
     return merged
 
 
 def merge_plain_chunk_results(job_item_id: str, chunk_results: list[dict]) -> dict:
-    merged: dict[str, Any] = {
-        "job_item_id": job_item_id,
-        "plain_list": [],
-        "chunk_count": len(chunk_results),
-    }
-
+    merged: dict[str, Any] = {"job_item_id": job_item_id, "plain_list": [], "chunk_count": len(chunk_results)}
     for idx, result in enumerate(chunk_results, start=1):
         if not isinstance(result, dict):
             continue
-
         result_job_item_id = result.get("job_item_id")
         if result_job_item_id not in (None, "", job_item_id):
             raise Exception(f"plain job_item_id mismatch at chunk {idx}")
-
         plain_list = result.get("plain_list") or []
         if not isinstance(plain_list, list):
             raise Exception(f"plain_list is not list at chunk {idx}")
-
         merged["plain_list"].extend(plain_list)
-
     return merged
 
 
-def insert_qa_items_from_llm_result(
-    conn: sqlite3.Connection,
-    job_id: str,
-    job_item_id: str,
-    source_id: str,
-    llm_result: dict,
-) -> int:
+def insert_qa_items_from_llm_result(conn: sqlite3.Connection, job_id: str, job_item_id: str, source_id: str, llm_result: dict) -> int:
     qa_list = llm_result.get("qa_list") or []
     if not isinstance(qa_list, list):
         raise Exception("qa_list is not list")
@@ -427,97 +271,42 @@ def insert_qa_items_from_llm_result(
     for qa in qa_list:
         if not isinstance(qa, dict):
             continue
-
         question_raw = normalize_text(qa.get("question"))
         answer_raw = normalize_text(qa.get("answer"))
-
         if not question_raw or not answer_raw:
             continue
 
         content_raw = f"[Q]\n{question_raw}\n\n[A]\n{answer_raw}"
-
         conn.execute(
             """
             INSERT INTO knowledge_items (
-                knowledge_id,
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                knowledge_type,
-                title,
-                question,
-                answer,
-                content,
-                question_normalize,
-                answer_normalize,
-                content_normalize,
-                question_vector,
-                answer_vector,
-                content_vector,
-                summary,
-                keywords,
-                language,
-                sort_no,
-                status,
-                review_status,
-                created_at,
-                updated_at
+                knowledge_id, job_id, job_item_id, source_type, source_id,
+                source_item_id, row_id, knowledge_type, title,
+                question, answer, content,
+                question_normalize, answer_normalize, content_normalize,
+                question_vector, answer_vector, content_vector,
+                summary, keywords, language, sort_no,
+                status, review_status, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                new_id(),
-                job_id,
-                job_item_id,
-                SOURCE_TYPE,
-                source_id,
-                None,
-                None,
-                "qa",
-                None,
-                question_raw,
-                answer_raw,
-                content_raw,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "ja",
-                sort_no,
-                "active",
-                "new",
-                now,
-                now,
+                new_id(), job_id, job_item_id, SOURCE_TYPE, source_id,
+                None, None, "qa", None,
+                question_raw, answer_raw, content_raw,
+                None, None, None,
+                None, None, None,
+                None, None, "ja", sort_no,
+                "active", "new", now, now,
             ),
         )
-
         inserted_count += 1
         sort_no += 1
-
-    logger.info(
-        "insert_qa_items_from_llm_result: job_item_id=%s qa_count=%s",
-        job_item_id,
-        inserted_count,
-    )
     return inserted_count
 
 
-def insert_plain_items_from_llm_result(
-    conn: sqlite3.Connection,
-    job_id: str,
-    job_item_id: str,
-    source_id: str,
-    llm_result: dict,
-) -> int:
+def insert_plain_items_from_llm_result(conn: sqlite3.Connection, job_id: str, job_item_id: str, source_id: str, llm_result: dict) -> int:
     plain_list = llm_result.get("plain_list") or []
-
     if not isinstance(plain_list, list):
         raise Exception("plain_list is not list")
 
@@ -528,7 +317,6 @@ def insert_plain_items_from_llm_result(
     for item in plain_list:
         if not isinstance(item, dict):
             continue
-
         content_raw = normalize_text(item.get("content"))
         if not content_raw:
             continue
@@ -536,73 +324,28 @@ def insert_plain_items_from_llm_result(
         conn.execute(
             """
             INSERT INTO knowledge_items (
-                knowledge_id,
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                knowledge_type,
-                title,
-                question,
-                answer,
-                content,
-                question_normalize,
-                answer_normalize,
-                content_normalize,
-                question_vector,
-                answer_vector,
-                content_vector,
-                summary,
-                keywords,
-                language,
-                sort_no,
-                status,
-                review_status,
-                created_at,
-                updated_at
+                knowledge_id, job_id, job_item_id, source_type, source_id,
+                source_item_id, row_id, knowledge_type, title,
+                question, answer, content,
+                question_normalize, answer_normalize, content_normalize,
+                question_vector, answer_vector, content_vector,
+                summary, keywords, language, sort_no,
+                status, review_status, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                new_id(),
-                job_id,
-                job_item_id,
-                SOURCE_TYPE,
-                source_id,
-                None,
-                None,
-                "plain",
-                None,
-                None,
-                None,
-                content_raw,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "ja",
-                sort_no,
-                "active",
-                "new",
-                now,
-                now,
+                new_id(), job_id, job_item_id, SOURCE_TYPE, source_id,
+                None, None, "plain", None,
+                None, None, content_raw,
+                None, None, None,
+                None, None, None,
+                None, None, "ja", sort_no,
+                "active", "new", now, now,
             ),
         )
-
         inserted_count += 1
         sort_no += 1
-
-    logger.info(
-        "insert_plain_items_from_llm_result: job_item_id=%s plain_count=%s",
-        job_item_id,
-        inserted_count,
-    )
     return inserted_count
 
 
@@ -615,29 +358,30 @@ def insert_kokkai_contents(
 ) -> int:
     inserted_count = 0
     now = now_iso()
+    sort_no = 1
 
-    for idx, row in enumerate(source_rows, start=1):
-        speech_text = extract_row_text(row["speech"])
+    for row in source_rows:
+        speech_text = normalize_text(row["speech"])
         if not speech_text:
             continue
 
-        source_item_id = row["speech_id"]
+        speaker = normalize_text(row["speaker"])
+        speech_order = int(row["speech_order"] or 0)
+        source_item_id = str(row["speech_id"])
         row_id = f"{row['issue_id']}:{row['speech_id']}"
+
+        content_text = speech_text
+        if speaker:
+            content_text = f"[SPEAKER] {speaker}\n{content_text}"
+        if speech_order:
+            content_text = f"[SPEECH_ORDER] {speech_order}\n{content_text}"
 
         conn.execute(
             """
             INSERT INTO knowledge_contents (
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                content_type,
-                content_text,
-                sort_no,
-                created_at,
-                updated_at
+                job_id, job_item_id, source_type, source_id,
+                source_item_id, row_id, content_type, content_text,
+                sort_no, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -649,44 +393,31 @@ def insert_kokkai_contents(
                 source_item_id,
                 row_id,
                 "row",
-                speech_text,
-                idx,
+                content_text,
+                sort_no,
                 now,
                 now,
             ),
         )
         inserted_count += 1
+        sort_no += 1
 
     return inserted_count
 
 
-def create_job_record(
-    local_db_path: str,
-    body: "KnowledgeJobCreateRequest",
-    selected_count: int,
-) -> tuple[str, str]:
+def create_job_record(local_db_path: str, body: "KnowledgeJobCreateRequest", selected_count: int) -> tuple[str, str]:
     job_id = new_id()
     requested_at = now_iso()
 
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             INSERT INTO knowledge_jobs (
-                job_id,
-                source_type,
-                source_name,
-                request_type,
-                status,
-                selected_count,
-                qa_count,
-                plain_count,
-                error_count,
-                requested_at,
-                started_at,
-                finished_at,
-                error_message
+                job_id, source_type, source_name, request_type, status,
+                selected_count, qa_count, plain_count, error_count,
+                requested_at, started_at, finished_at, error_message
             )
             VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
             """,
@@ -728,25 +459,14 @@ def prepare_job_item(
 
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-
+        conn.execute("BEGIN")
         conn.execute(
             """
             INSERT INTO knowledge_job_items (
-                job_item_id,
-                job_id,
-                source_type,
-                parent_source_id,
-                parent_key1,
-                parent_key2,
-                parent_label,
-                row_count,
-                status,
-                knowledge_count,
-                error_message,
-                created_at,
-                started_at,
-                finished_at
+                job_item_id, job_id, source_type,
+                parent_source_id, parent_key1, parent_key2, parent_label,
+                row_count, status, knowledge_count, error_message,
+                created_at, started_at, finished_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL, NULL)
             """,
@@ -771,9 +491,8 @@ def prepare_job_item(
             issue_id=issue_id,
             source_rows=source_rows,
         )
-
         if inserted_rows <= 0:
-            raise HTTPException(status_code=400, detail=f"speech not found: {issue_id}")
+            raise HTTPException(status_code=400, detail=f"speech text not found: {issue_id}")
 
         conn.execute(
             """
@@ -783,14 +502,8 @@ def prepare_job_item(
             """,
             (inserted_rows, job_item_id),
         )
-
         conn.commit()
-
-        return {
-            "job_item_id": job_item_id,
-            "source_id": issue_id,
-        }
-
+        return {"job_item_id": job_item_id, "source_id": issue_id}
     except Exception:
         conn.rollback()
         raise
@@ -803,27 +516,14 @@ def build_prompts_for_existing_job_item(
     job_item_id: str,
     qa_chunk_conf: ChunkConfig,
     plain_chunk_conf: ChunkConfig,
+    qa_template_text: str,
+    plain_template_text: str,
 ) -> dict[str, Any]:
     conn = open_user_db(local_db_path)
     try:
         meta = fetch_kokkai_job_item_meta(conn, job_item_id)
-
-        qa_prompt_texts = build_kokkai_prompt_texts(
-            conn=conn,
-            job_item_id=job_item_id,
-            template_path=KOKKAI_QA_PROMPT_PATH,
-            default_template=DEFAULT_KOKKAI_QA_PROMPT,
-            chunk_conf=qa_chunk_conf,
-        )
-
-        plain_prompt_texts = build_kokkai_prompt_texts(
-            conn=conn,
-            job_item_id=job_item_id,
-            template_path=KOKKAI_PLAIN_PROMPT_PATH,
-            default_template=DEFAULT_KOKKAI_PLAIN_PROMPT,
-            chunk_conf=plain_chunk_conf,
-        )
-
+        qa_prompt_texts = build_kokkai_prompt_texts(conn, job_item_id, qa_template_text, qa_chunk_conf)
+        plain_prompt_texts = build_kokkai_prompt_texts(conn, job_item_id, plain_template_text, plain_chunk_conf)
         return {
             "job_item_id": job_item_id,
             "source_id": meta["parent_source_id"],
@@ -841,7 +541,7 @@ def build_prompts_for_existing_job_item(
 def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -860,62 +560,29 @@ def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
         conn.close()
 
 
-def finalize_job_item_success(
-    local_db_path: str,
-    job_id: str,
-    job_item_id: str,
-    source_id: str,
-    qa_llm_result: dict,
-    plain_llm_result: dict,
-    preview_only: bool,
-) -> tuple[int, int]:
+def finalize_job_item_success(local_db_path: str, job_id: str, job_item_id: str, source_id: str, qa_llm_result: dict, plain_llm_result: dict, preview_only: bool) -> tuple[int, int]:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-
+        conn.execute("BEGIN")
         qa_count = 0
         plain_count = 0
-
         if not preview_only:
-            qa_count = insert_qa_items_from_llm_result(
-                conn=conn,
-                job_id=job_id,
-                job_item_id=job_item_id,
-                source_id=source_id,
-                llm_result=qa_llm_result,
-            )
-
-            plain_count = insert_plain_items_from_llm_result(
-                conn=conn,
-                job_id=job_id,
-                job_item_id=job_item_id,
-                source_id=source_id,
-                llm_result=plain_llm_result,
-            )
-
-        finished_at = now_iso()
-        item_status = "done"
+            qa_count = insert_qa_items_from_llm_result(conn, job_id, job_item_id, source_id, qa_llm_result)
+            plain_count = insert_plain_items_from_llm_result(conn, job_id, job_item_id, source_id, plain_llm_result)
 
         conn.execute(
             """
             UPDATE knowledge_job_items
-            SET status = ?,
+            SET status = 'done',
                 knowledge_count = ?,
                 finished_at = ?,
                 error_message = NULL
             WHERE job_item_id = ?
             """,
-            (
-                item_status,
-                qa_count + plain_count,
-                finished_at,
-                job_item_id,
-            ),
+            (qa_count + plain_count, now_iso(), job_item_id),
         )
-
         conn.commit()
         return qa_count, plain_count
-
     except Exception:
         conn.rollback()
         raise
@@ -923,14 +590,10 @@ def finalize_job_item_success(
         conn.close()
 
 
-def finalize_job_item_error(
-    local_db_path: str,
-    job_item_id: str,
-    error_message: str,
-) -> None:
+def finalize_job_item_error(local_db_path: str, job_item_id: str, error_message: str) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -939,11 +602,7 @@ def finalize_job_item_error(
                 error_message = ?
             WHERE job_item_id = ?
             """,
-            (
-                now_iso(),
-                error_message,
-                job_item_id,
-            ),
+            (now_iso(), error_message, job_item_id),
         )
         conn.commit()
     except Exception:
@@ -953,19 +612,10 @@ def finalize_job_item_error(
         conn.close()
 
 
-def update_job_summary(
-    local_db_path: str,
-    job_id: str,
-    requested_at: str,
-    status: str,
-    total_qa_count: int,
-    total_plain_count: int,
-    total_error_count: int,
-    error_message: str | None = None,
-) -> None:
+def update_job_summary(local_db_path: str, job_id: str, requested_at: str, status: str, total_qa_count: int, total_plain_count: int, total_error_count: int, error_message: str | None = None) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_jobs
@@ -974,10 +624,7 @@ def update_job_summary(
                 plain_count = ?,
                 error_count = ?,
                 error_message = ?,
-                started_at = CASE
-                    WHEN ? = 'running' THEN COALESCE(started_at, ?)
-                    ELSE started_at
-                END,
+                started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
                 finished_at = CASE
                     WHEN ? IN ('done', 'error') THEN ?
                     WHEN ? = 'running' THEN NULL
@@ -1007,50 +654,14 @@ def update_job_summary(
         conn.close()
 
 
-def build_source_status_payload(
-    local_db_path: str,
-    job_id: str,
-    *,
-    phase: str | None = None,
-    current_item_id: str | None = None,
-    current_label: str | None = None,
-    message: str | None = None,
-    error_message: str | None = None,
-    total_qa_chunks: int = 0,
-    processed_qa_chunks: int = 0,
-    total_plain_chunks: int = 0,
-    processed_plain_chunks: int = 0,
-) -> dict[str, Any]:
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    items = payload.get("items") or []
-    done_count = sum(1 for item in items if item.get("status") == "done")
-    error_count = sum(1 for item in items if item.get("status") == "error")
-    waiting_count = sum(1 for item in items if item.get("status") in ("new", "running"))
-    payload.update({
-        "phase": phase,
-        "done_count": done_count,
-        "error_count": error_count,
-        "waiting_count": waiting_count,
-        "current_item_id": current_item_id,
-        "current_label": current_label,
-        "message": message,
-        "error_message": error_message if error_message is not None else payload.get("error_message"),
-        "total_qa_chunks": int(total_qa_chunks or 0),
-        "processed_qa_chunks": int(processed_qa_chunks or 0),
-        "total_plain_chunks": int(total_plain_chunks or 0),
-        "processed_plain_chunks": int(processed_plain_chunks or 0),
-        "total_chunks": int(total_qa_chunks or 0) + int(total_plain_chunks or 0),
-        "processed_chunks": int(processed_qa_chunks or 0) + int(processed_plain_chunks or 0),
-    })
-    return payload
-
-
 def process_kokkai_job_item(
     local_db_path: str,
     job_id: str,
     job_item_id: str,
     qa_chunk_conf: ChunkConfig,
     plain_chunk_conf: ChunkConfig,
+    qa_template_text: str,
+    plain_template_text: str,
     preview_only: bool,
     progress_callback=None,
 ) -> dict[str, Any]:
@@ -1059,6 +670,8 @@ def process_kokkai_job_item(
         job_item_id=job_item_id,
         qa_chunk_conf=qa_chunk_conf,
         plain_chunk_conf=plain_chunk_conf,
+        qa_template_text=qa_template_text,
+        plain_template_text=plain_template_text,
     )
 
     source_id = prepared["source_id"]
@@ -1082,13 +695,6 @@ def process_kokkai_job_item(
         qa_llm_result_for_debug = None
         plain_llm_result_for_debug = None
     else:
-        logger.info(
-            "llm start: job_item_id=%s qa_chunks=%s plain_chunks=%s",
-            job_item_id,
-            total_qa_chunks,
-            total_plain_chunks,
-        )
-
         qa_chunk_results = []
         for idx, prompt_text in enumerate(qa_prompt_texts, start=1):
             result_list = run_chunked_llm_json([prompt_text], "LLM KOKKAI QA")
@@ -1103,12 +709,8 @@ def process_kokkai_job_item(
                     processed_plain_chunks=0,
                     message=f"qa chunk {idx}/{total_qa_chunks}",
                 )
-
         qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
-        qa_llm_result_for_debug = {
-            "chunk_results": qa_chunk_results,
-            "merged_result": qa_llm_result,
-        }
+        qa_llm_result_for_debug = {"chunk_results": qa_chunk_results, "merged_result": qa_llm_result}
 
         plain_chunk_results = []
         for idx, prompt_text in enumerate(plain_prompt_texts, start=1):
@@ -1124,12 +726,8 @@ def process_kokkai_job_item(
                     processed_plain_chunks=idx,
                     message=f"plain chunk {idx}/{total_plain_chunks}",
                 )
-
         plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
-        plain_llm_result_for_debug = {
-            "chunk_results": plain_chunk_results,
-            "merged_result": plain_llm_result,
-        }
+        plain_llm_result_for_debug = {"chunk_results": plain_chunk_results, "merged_result": plain_llm_result}
 
     qa_count, plain_count = finalize_job_item_success(
         local_db_path=local_db_path,
@@ -1163,7 +761,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
         logger.error("ank.db not found in background: %s", db_gcs_path)
-        set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"ank.db not found: {db_gcs_path}", phase="extract_knowledge", message="ank.db not found")
+        set_job_error(bucket, uid, job_id, f"ank.db not found: {db_gcs_path}", phase="extract_knowledge", message="ank.db not found")
         return
 
     local_db_path = local_user_db_path(uid)
@@ -1173,27 +771,57 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
-            set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"knowledge_jobs not found: {job_id}", phase="extract_knowledge", message="knowledge_jobs not found")
+            set_job_error(bucket, uid, job_id, f"knowledge_jobs not found: {job_id}", phase="extract_knowledge", message="knowledge_jobs not found")
             return
-
         if job_row["source_type"] != SOURCE_TYPE:
-            set_source_error(bucket, uid, SOURCE_TYPE, job_id, "invalid source_type", phase="extract_knowledge", message="invalid source_type")
+            set_job_error(bucket, uid, job_id, "invalid source_type", phase="extract_knowledge", message="invalid source_type")
             return
 
-        if job_row["status"] == "done":
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="already done"))
-            return
-
+        qa_template_text = load_template_text_with_default(KOKKAI_QA_PROMPT_PATH, DEFAULT_KOKKAI_QA_PROMPT)
+        plain_template_text = load_template_text_with_default(KOKKAI_PLAIN_PROMPT_PATH, DEFAULT_KOKKAI_PLAIN_PROMPT)
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
-        qa_chunk_conf = get_kokkai_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_kokkai_chunk_conf(chunk_config, "plain")
+        qa_chunk_conf = get_required_kokkai_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_required_kokkai_chunk_conf(chunk_config, "plain")
 
         requested_at = job_row["requested_at"] or now_iso()
         total_qa_count = int(job_row["qa_count"] or 0)
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="background started")
+        conn = open_user_db(local_db_path)
+        try:
+            cur = conn.execute(
+                """
+                SELECT ji.parent_source_id, ji.parent_label, ji.row_count
+                FROM knowledge_job_items ji
+                WHERE ji.job_id = ?
+                ORDER BY ji.created_at, ji.job_item_id
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            first_item = cur.fetchone()
+        finally:
+            conn.close()
+
+        dataset_id = first_item["parent_source_id"] if first_item else None
+        dataset_name = first_item["parent_label"] if first_item else None
+        row_count = int(first_item["row_count"] or 0) if first_item else 0
+
+        set_job_running(
+            bucket,
+            uid,
+            job_id,
+            SOURCE_TYPE,
+            phase="extract_knowledge",
+            message="background started",
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            qa_total=0,
+            plain_total=0,
+            chunk_total=0,
+        )
 
         while True:
             row = fetch_next_new_job_item(local_db_path, job_id)
@@ -1201,11 +829,22 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                 break
 
             current_job_item_id = row["job_item_id"]
-            current_parent_label = row["parent_label"]
             mark_job_item_running(local_db_path, current_job_item_id)
 
             def progress_callback(*, total_qa_chunks=0, processed_qa_chunks=0, total_plain_chunks=0, processed_plain_chunks=0, message=None):
-                set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message=message)
+                set_job_progress(
+                    bucket,
+                    uid,
+                    phase="extract_knowledge",
+                    message=message,
+                    knowledge_count=total_qa_count + total_plain_count,
+                    qa_current=int(processed_qa_chunks or 0),
+                    qa_total=int(total_qa_chunks or 0),
+                    plain_current=int(processed_plain_chunks or 0),
+                    plain_total=int(total_plain_chunks or 0),
+                    chunk_current=int(processed_qa_chunks or 0) + int(processed_plain_chunks or 0),
+                    chunk_total=int(total_qa_chunks or 0) + int(total_plain_chunks or 0),
+                )
 
             try:
                 progress_callback(message="item running")
@@ -1215,6 +854,8 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                     job_item_id=current_job_item_id,
                     qa_chunk_conf=qa_chunk_conf,
                     plain_chunk_conf=plain_chunk_conf,
+                    qa_template_text=qa_template_text,
+                    plain_template_text=plain_template_text,
                     preview_only=False,
                     progress_callback=progress_callback,
                 )
@@ -1232,8 +873,14 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                     total_error_count=total_error_count,
                     error_message=None,
                 )
-                progress_callback(message="item done")
 
+                set_job_progress(
+                    bucket,
+                    uid,
+                    phase="extract_knowledge",
+                    message="item done",
+                    knowledge_count=total_qa_count + total_plain_count,
+                )
             except Exception as e:
                 logger.exception("run_kokkai_job_background item failed: job_id=%s job_item_id=%s", job_id, current_job_item_id)
                 try:
@@ -1256,7 +903,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                 except Exception:
                     logger.exception("failed to update job summary error: job_id=%s", job_id)
 
-                set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="item failed")
+                set_job_error(bucket, uid, job_id, str(e), phase="extract_knowledge", message="item failed")
                 return
 
         update_job_summary(
@@ -1270,19 +917,80 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
-        set_source_finished(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="completed")
-
+        set_job_done(
+            bucket,
+            uid,
+            job_id,
+            phase="extract_knowledge",
+            message="completed",
+            knowledge_count=total_qa_count + total_plain_count,
+        )
     except Exception as e:
         logger.exception("run_kokkai_job_background failed: job_id=%s", job_id)
-        set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="background failed")
+        set_job_error(bucket, uid, job_id, str(e), phase="extract_knowledge", message="background failed")
 
 
-@router.post("/run", response_model=KnowledgeJobCreateResponse)
-def run_kokkai_job(
-    body: KnowledgeRunRequest,
-    background_tasks: BackgroundTasks,
-    authorization: str | None = Header(default=None),
-):
+class KnowledgeTargetItem(BaseModel):
+    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="kokkai")
+    parent_source_id: Optional[str] = None
+    parent_key1: Optional[str] = None
+    parent_key2: Optional[str] = None
+    parent_label: Optional[str] = None
+    row_count: int = 0
+
+
+class KnowledgeJobCreateRequest(BaseModel):
+    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="kokkai")
+    source_name: Optional[str] = None
+    request_type: str = "extract_knowledge"
+    items: List[KnowledgeTargetItem]
+    preview_only: bool = False
+
+
+class PromptPreviewItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    prompt_type: str
+    prompt_text: str
+
+
+class KnowledgeDebugItem(BaseModel):
+    job_item_id: str
+    parent_label: Optional[str] = None
+    status: str
+    qa_count: int = 0
+    plain_count: int = 0
+    error_message: Optional[str] = None
+    llm_result: Optional[Any] = None
+
+
+class KnowledgeJobCreateResponse(BaseModel):
+    job_id: str
+    selected_count: int
+    created_item_count: int
+    status: str
+    prompt_previews: List[PromptPreviewItem] = []
+    debug_items: List[KnowledgeDebugItem] = []
+
+
+class KnowledgeRunRequest(BaseModel):
+    job_id: str
+
+
+def validate_request(body: KnowledgeJobCreateRequest) -> None:
+    if body.source_type not in (None, "", SOURCE_TYPE):
+        raise HTTPException(status_code=400, detail=f"source_type must be '{SOURCE_TYPE}'")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="items is empty")
+    for item in body.items:
+        if item.source_type not in (None, "", SOURCE_TYPE):
+            raise HTTPException(status_code=400, detail=f"item.source_type must be '{SOURCE_TYPE}'")
+
+
+@router.post("/job", response_model=KnowledgeJobCreateResponse)
+def create_kokkai_job(body: KnowledgeJobCreateRequest, authorization: str | None = Header(default=None)):
+    validate_request(body)
     uid = get_uid_from_auth_header(authorization)
 
     client = storage.Client()
@@ -1291,19 +999,132 @@ def run_kokkai_job(
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
-        )
+        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
 
-    current_source = try_read_status_payload(bucket, uid, SOURCE_TYPE)
-    if current_source.get("status") == "running":
-        running_job_id = current_source.get("job_id")
+    local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(db_blob, local_db_path)
+
+    try:
+        qa_template_text = load_template_text_with_default(KOKKAI_QA_PROMPT_PATH, DEFAULT_KOKKAI_QA_PROMPT)
+        plain_template_text = load_template_text_with_default(KOKKAI_PLAIN_PROMPT_PATH, DEFAULT_KOKKAI_PLAIN_PROMPT)
+        chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
+        qa_chunk_conf = get_required_kokkai_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_required_kokkai_chunk_conf(chunk_config, "plain")
+
+        unique_items: List[KnowledgeTargetItem] = []
+        seen_keys = set()
+        for item in body.items:
+            key = (SOURCE_TYPE, item.parent_source_id or "", item.parent_key1 or "", item.parent_key2 or "")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_items.append(item)
+
+        selected_count = len(unique_items)
+        job_id, requested_at = create_job_record(local_db_path, body, selected_count)
+
+        prompt_previews: List[PromptPreviewItem] = []
+        debug_items: List[KnowledgeDebugItem] = []
+        created_item_count = 0
+
+        for item in unique_items:
+            prepared = prepare_job_item(
+                local_db_path=local_db_path,
+                job_id=job_id,
+                item=item,
+                requested_at=requested_at,
+                preview_only=body.preview_only,
+            )
+            prompts = build_prompts_for_existing_job_item(
+                local_db_path=local_db_path,
+                job_item_id=prepared["job_item_id"],
+                qa_chunk_conf=qa_chunk_conf,
+                plain_chunk_conf=plain_chunk_conf,
+                qa_template_text=qa_template_text,
+                plain_template_text=plain_template_text,
+            )
+
+            prompt_previews.append(
+                PromptPreviewItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_source_id=item.parent_source_id,
+                    parent_label=item.parent_label,
+                    prompt_type="qa",
+                    prompt_text=join_prompt_previews(prompts["qa_prompt_texts"]),
+                )
+            )
+            prompt_previews.append(
+                PromptPreviewItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_source_id=item.parent_source_id,
+                    parent_label=item.parent_label,
+                    prompt_type="plain",
+                    prompt_text=join_prompt_previews(prompts["plain_prompt_texts"]),
+                )
+            )
+            debug_items.append(
+                KnowledgeDebugItem(
+                    job_item_id=prepared["job_item_id"],
+                    parent_label=item.parent_label,
+                    status="done" if body.preview_only else "new",
+                    qa_count=0,
+                    plain_count=0,
+                    error_message=None,
+                    llm_result=None,
+                )
+            )
+            created_item_count += 1
+
+        initial_status = "done" if body.preview_only else "new"
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status=initial_status,
+            total_qa_count=0,
+            total_plain_count=0,
+            total_error_count=0,
+            error_message=None,
+        )
+        upload_local_db(db_blob, local_db_path)
+
+        return KnowledgeJobCreateResponse(
+            job_id=job_id,
+            selected_count=selected_count,
+            created_item_count=created_item_count,
+            status=initial_status,
+            prompt_previews=prompt_previews,
+            debug_items=debug_items,
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("create_kokkai_job failed")
+        raise HTTPException(status_code=500, detail=f"create_kokkai_job failed: {type(e).__name__}: {e}")
+
+
+@router.post("/run", response_model=KnowledgeJobCreateResponse)
+def run_kokkai_job(body: KnowledgeRunRequest, background_tasks: BackgroundTasks, authorization: str | None = Header(default=None)):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
+
+    current_status = try_read_status_payload(bucket, uid)
+    if current_status.get("status") == "running":
+        running_job_id = current_status.get("job_id")
         if running_job_id == body.job_id:
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(current_source.get("selected_count") or 0),
-                created_item_count=len(current_source.get("items") or []),
+                selected_count=0,
+                created_item_count=0,
                 status="running",
                 prompt_previews=[],
                 debug_items=[],
@@ -1321,12 +1142,18 @@ def run_kokkai_job(
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         if job_row["status"] == "done":
-            payload = build_status_payload_from_db(local_db_path, body.job_id)
-            set_source_finished(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="already done")
+            set_job_done(
+                bucket,
+                uid,
+                body.job_id,
+                phase="extract_knowledge",
+                message="already done",
+                knowledge_count=int(job_row["qa_count"] or 0) + int(job_row["plain_count"] or 0),
+            )
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(payload["selected_count"] or 0),
-                created_item_count=len(payload["items"]),
+                selected_count=0,
+                created_item_count=0,
                 status="done",
                 prompt_previews=[],
                 debug_items=[],
@@ -1348,20 +1175,17 @@ def run_kokkai_job(
             error_message=None,
         )
 
-        set_source_running(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="job started")
-
-        payload = build_status_payload_from_db(local_db_path, body.job_id)
+        set_job_running(bucket, uid, body.job_id, SOURCE_TYPE, phase="extract_knowledge", message="job started")
         background_tasks.add_task(run_kokkai_job_background, uid, body.job_id)
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=int(payload["selected_count"] or 0),
-            created_item_count=len(payload["items"]),
+            selected_count=0,
+            created_item_count=0,
             status="running",
             prompt_previews=[],
             debug_items=[],
         )
-
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
     except HTTPException:
@@ -1372,31 +1196,19 @@ def run_kokkai_job(
 
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
-def get_kokkai_job_status(
-    job_id: str = Query(...),
-    authorization: str | None = Header(default=None),
-):
+def get_kokkai_job_status(job_id: str = Query(...), authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
 
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
     try:
-        client = storage.Client()
-        bucket = client.bucket(BUCKET_NAME)
-        source_payload = try_read_status_payload(bucket, uid, SOURCE_TYPE)
-        if source_payload.get("job_id") == job_id and source_payload.get("status") not in (None, "idle"):
-            return KnowledgeJobStatusResponse(**source_payload)
+        payload = try_read_status_payload(bucket, uid)
+        if payload.get("job_id") == job_id:
+            return KnowledgeJobStatusResponse(**payload)
     except HTTPException:
         raise
     except Exception as e:
         logger.warning("failed to read knowledge_generate.json: %s", e)
 
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    db_gcs_path = user_db_path(uid)
-    db_blob = bucket.blob(db_gcs_path)
-    if not db_blob.exists():
-        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
-
-    local_db_path = local_user_db_path(uid)
-    replace_local_db_from_blob(db_blob, local_db_path)
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    return KnowledgeJobStatusResponse(**payload)
+    raise HTTPException(status_code=404, detail=f"status not found: {job_id}")
