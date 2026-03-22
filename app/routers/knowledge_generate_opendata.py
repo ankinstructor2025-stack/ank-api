@@ -44,32 +44,27 @@ class KnowledgeJobStatusResponse(BaseModel):
     processed_plain_chunks: int = 0
     total_chunks: int = 0
     processed_chunks: int = 0
-    items: List[KnowledgeJobStatusItem] = []
+    items: List[KnowledgeJobStatusItem] = Field(default_factory=list)
 
 from .knowledge_generate_common import (
-    build_status_payload_from_db,
-    build_source_status_payload_from_db,
-    build_lock_key,
-    fetch_job_row,
+    fetch_job_items,
     fetch_next_new_job_item,
-    extract_row_text,
-    get_running_lock_job_id,
     get_uid_from_auth_header,
     load_chunk_config,
     load_template_text,
     local_user_db_path,
     new_id,
-    normalize_text,
     now_iso,
     open_user_db,
-    release_job_lock,
-    try_acquire_job_lock,
     upload_local_db,
     user_db_path,
     replace_local_db_from_blob,
-    get_generation_status_source,
-    update_generation_status_source,
+    set_source_running,
+    set_source_finished,
+    set_source_error,
+    try_read_status_payload,
 )
+
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
@@ -123,58 +118,92 @@ def get_required_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> Ch
 
     return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    merged = "\n".join(line for line in lines if line)
+    return merged.strip()
 
 
+def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                job_id,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
 
 
+def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "job_item_id": row["job_item_id"],
+        "parent_source_id": row["parent_source_id"],
+        "parent_label": row["parent_label"],
+        "status": row["status"] or "",
+        "knowledge_count": int(row["knowledge_count"] or 0),
+        "error_message": row["error_message"],
+        "row_count": int(row["row_count"] or 0),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "qa_chunk_total": 0,
+        "qa_chunk_done": 0,
+        "plain_chunk_total": 0,
+        "plain_chunk_done": 0,
+        "chunk_total": 0,
+        "chunk_done": 0,
+    }
 
 
+def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
+    job_row = fetch_job_row(local_db_path, job_id)
+    if not job_row:
+        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
 
+    item_rows = fetch_job_items(local_db_path, job_id)
+    items = [row_to_status_item(row) for row in item_rows]
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-LOCK_TTL_SECONDS = 60 * 60 * 6
-
-
-
-
-
-
-
-
-
-
+    return {
+        "job_id": str(job_row["job_id"]),
+        "status": job_row["status"] or "",
+        "selected_count": int(job_row["selected_count"] or 0),
+        "qa_count": int(job_row["qa_count"] or 0),
+        "plain_count": int(job_row["plain_count"] or 0),
+        "error_count": int(job_row["error_count"] or 0),
+        "requested_at": job_row["requested_at"],
+        "started_at": job_row["started_at"],
+        "finished_at": job_row["finished_at"],
+        "error_message": job_row["error_message"],
+        "total_qa_chunks": 0,
+        "processed_qa_chunks": 0,
+        "total_plain_chunks": 0,
+        "processed_plain_chunks": 0,
+        "total_chunks": 0,
+        "processed_chunks": 0,
+        "items": items,
+    }
 
 
 def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
@@ -202,12 +231,6 @@ def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3
         return cur.fetchall()
     finally:
         conn.close()
-
-
-
-
-
-
 
 
 def fetch_opendata_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
@@ -1135,14 +1158,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
         logger.error("ank.db not found in background: %s", db_gcs_path)
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-            "job_id": job_id,
-            "status": "error",
-            "phase": "extract_knowledge",
-            "message": "ank.db not found",
-            "error_message": f"ank.db not found: {db_gcs_path}",
-            "finished_at": now_iso(),
-        })
+        set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"ank.db not found: {db_gcs_path}", phase="extract_knowledge", message="ank.db not found")
         return
 
     local_db_path = local_user_db_path(uid)
@@ -1152,29 +1168,15 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-                "job_id": job_id,
-                "status": "error",
-                "phase": "extract_knowledge",
-                "message": "knowledge_jobs not found",
-                "error_message": f"knowledge_jobs not found: {job_id}",
-                "finished_at": now_iso(),
-            })
+            set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"knowledge_jobs not found: {job_id}", phase="extract_knowledge", message="knowledge_jobs not found")
             return
 
         if job_row["source_type"] != SOURCE_TYPE:
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-                "job_id": job_id,
-                "status": "error",
-                "phase": "extract_knowledge",
-                "message": "invalid source_type",
-                "error_message": "invalid source_type",
-                "finished_at": now_iso(),
-            })
+            set_source_error(bucket, uid, SOURCE_TYPE, job_id, "invalid source_type", phase="extract_knowledge", message="invalid source_type")
             return
 
         if job_row["status"] == "done":
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="already done"))
+            set_source_finished(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="already done")
             return
 
         qa_template_text = load_template_text(BUCKET_NAME, OPENDATA_QA_PROMPT_PATH)
@@ -1188,7 +1190,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="background started"))
+        set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="background started")
 
         while True:
             row = fetch_next_new_job_item(local_db_path, job_id)
@@ -1200,23 +1202,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             mark_job_item_running(local_db_path, current_job_item_id)
 
             def progress_callback(*, total_qa_chunks=0, processed_qa_chunks=0, total_plain_chunks=0, processed_plain_chunks=0, message=None):
-                update_generation_status_source(
-                    BUCKET_NAME,
-                    uid,
-                    SOURCE_TYPE,
-                    build_source_status_payload(
-                        local_db_path,
-                        job_id,
-                        phase="extract_knowledge",
-                        current_item_id=current_job_item_id,
-                        current_label=current_parent_label,
-                        message=message,
-                        total_qa_chunks=total_qa_chunks,
-                        processed_qa_chunks=processed_qa_chunks,
-                        total_plain_chunks=total_plain_chunks,
-                        processed_plain_chunks=processed_plain_chunks,
-                    ),
-                )
+                set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message=message)
 
             try:
                 progress_callback(message="item running")
@@ -1269,10 +1255,7 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                 except Exception:
                     logger.exception("failed to update job summary error: job_id=%s", job_id)
 
-                payload = build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", current_item_id=current_job_item_id, current_label=current_parent_label, message="item failed", error_message=str(e))
-                payload["status"] = "error"
-                payload["finished_at"] = now_iso()
-                update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, payload)
+                set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="item failed")
                 return
 
         update_job_summary(
@@ -1286,26 +1269,15 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
-        final_payload = build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="completed")
-        final_payload["status"] = "done"
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, final_payload)
+        set_source_finished(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="completed")
 
     except Exception as e:
         logger.exception("run_opendata_job_background failed: job_id=%s", job_id)
         try:
-            payload = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
+            pass
         except Exception:
-            payload = {}
-        payload = dict(payload or {})
-        payload.update({
-            "job_id": job_id,
-            "status": "error",
-            "phase": "extract_knowledge",
-            "message": "background failed",
-            "error_message": str(e),
-            "finished_at": now_iso(),
-        })
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, payload)
+            pass
+        set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="background failed")
 
 
 class KnowledgeTargetItem(BaseModel):
@@ -1523,7 +1495,7 @@ def run_opendata_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    current_source = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
+    current_source = try_read_status_payload(bucket, uid, SOURCE_TYPE)
     if current_source.get("status") == "running":
         running_job_id = current_source.get("job_id")
         if running_job_id == body.job_id:
@@ -1549,9 +1521,7 @@ def run_opendata_job(
 
         if job_row["status"] == "done":
             payload = build_status_payload_from_db(local_db_path, body.job_id)
-            done_payload = build_source_status_payload(local_db_path, body.job_id, phase="extract_knowledge", message="already done")
-            done_payload["status"] = "done"
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, done_payload)
+            set_source_finished(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="already done")
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
                 selected_count=int(payload["selected_count"] or 0),
@@ -1577,9 +1547,7 @@ def run_opendata_job(
             error_message=None,
         )
 
-        running_payload = build_source_status_payload(local_db_path, body.job_id, phase="extract_knowledge", message="job started")
-        running_payload["status"] = "running"
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, running_payload)
+        set_source_running(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="job started")
 
         payload = build_status_payload_from_db(local_db_path, body.job_id)
         background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
@@ -1610,7 +1578,7 @@ def get_opendata_job_status(
     uid = get_uid_from_auth_header(authorization)
 
     try:
-        source_payload = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
+        source_payload = try_read_status_payload(client.bucket(BUCKET_NAME), uid, SOURCE_TYPE)
         if source_payload.get("job_id") == job_id and source_payload.get("status") not in (None, "idle"):
             return KnowledgeJobStatusResponse(**source_payload)
     except HTTPException:

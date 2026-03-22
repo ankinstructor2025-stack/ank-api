@@ -18,24 +18,18 @@ from .knowledge_generate_common import (
     new_id,
     user_db_path,
     local_user_db_path,
-    build_status_payload_from_db,
-    build_source_status_payload_from_db,
     get_uid_from_auth_header,
-    normalize_text,
-    extract_row_text,
-    load_template_text,
-    get_generation_status_source,
-    update_generation_status_source,
     load_chunk_config,
     open_user_db,
     upload_local_db,
-    build_lock_key,
-    try_acquire_job_lock,
-    release_job_lock,
-    get_running_lock_job_id,
-    fetch_job_row,
+    fetch_job_items,
     fetch_next_new_job_item,
     replace_local_db_from_blob,
+    set_source_running,
+    set_source_finished,
+    set_source_error,
+    try_read_status_payload,
+    load_template_text,
 )
 
 
@@ -49,6 +43,206 @@ SOURCE_TYPE = "kokkai"
 KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
 KOKKAI_PLAIN_PROMPT_PATH = "template/kokkai_plain_prompt.txt"
 OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
+
+
+DEFAULT_KOKKAI_QA_PROMPT = ""
+DEFAULT_KOKKAI_PLAIN_PROMPT = ""
+
+
+class KnowledgeTargetItem(BaseModel):
+    parent_source_id: str
+    parent_key1: Optional[str] = None
+    parent_key2: Optional[str] = None
+    parent_label: Optional[str] = None
+    row_count: int = 0
+
+
+class KnowledgeJobCreateRequest(BaseModel):
+    source_name: Optional[str] = None
+    request_type: str = "extract_knowledge"
+    preview_only: bool = False
+    selected_items: List[KnowledgeTargetItem] = Field(default_factory=list)
+
+
+class KnowledgeRunRequest(BaseModel):
+    job_id: str
+
+
+class KnowledgePromptPreview(BaseModel):
+    job_item_id: Optional[str] = None
+    prompt_type: Optional[str] = None
+    prompt_text: Optional[str] = None
+
+
+class KnowledgeDebugItem(BaseModel):
+    job_item_id: Optional[str] = None
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    qa_debug: Optional[dict[str, Any]] = None
+    plain_debug: Optional[dict[str, Any]] = None
+
+
+class KnowledgeJobCreateResponse(BaseModel):
+    job_id: str
+    selected_count: int = 0
+    created_item_count: int = 0
+    status: str
+    prompt_previews: List[KnowledgePromptPreview] = Field(default_factory=list)
+    debug_items: List[KnowledgeDebugItem] = Field(default_factory=list)
+
+
+class KnowledgeJobStatusItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    status: str
+    knowledge_count: int = 0
+    error_message: Optional[str] = None
+    row_count: int = 0
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    qa_chunk_total: int = 0
+    qa_chunk_done: int = 0
+    plain_chunk_total: int = 0
+    plain_chunk_done: int = 0
+    chunk_total: int = 0
+    chunk_done: int = 0
+
+
+class KnowledgeJobStatusResponse(BaseModel):
+    job_id: Optional[str] = None
+    status: str
+    selected_count: int = 0
+    qa_count: int = 0
+    plain_count: int = 0
+    error_count: int = 0
+    requested_at: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    error_message: Optional[str] = None
+    phase: Optional[str] = None
+    message: Optional[str] = None
+    total_qa_chunks: int = 0
+    processed_qa_chunks: int = 0
+    total_plain_chunks: int = 0
+    processed_plain_chunks: int = 0
+    total_chunks: int = 0
+    processed_chunks: int = 0
+    current_item_id: Optional[str] = None
+    current_label: Optional[str] = None
+    items: List[KnowledgeJobStatusItem] = Field(default_factory=list)
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    merged = "\n".join(line for line in lines if line)
+    return merged.strip()
+
+
+def extract_row_text(value: Any) -> str:
+    return normalize_text(value)
+
+
+def load_template_text_with_default(template_path: str, default_template: str) -> str:
+    try:
+        text = load_template_text(BUCKET_NAME, template_path)
+        return text if text else (default_template or "")
+    except HTTPException as e:
+        if e.status_code == 404:
+            return default_template or ""
+        raise
+
+
+def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                job_id, source_type, source_name, request_type, status,
+                selected_count, qa_count, plain_count, error_count,
+                requested_at, started_at, finished_at, error_message
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "job_item_id": row["job_item_id"],
+        "parent_source_id": row["parent_source_id"],
+        "parent_label": row["parent_label"],
+        "status": row["status"] or "",
+        "knowledge_count": int(row["knowledge_count"] or 0),
+        "error_message": row["error_message"],
+        "row_count": int(row["row_count"] or 0),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "qa_chunk_total": 0, "qa_chunk_done": 0,
+        "plain_chunk_total": 0, "plain_chunk_done": 0,
+        "chunk_total": 0, "chunk_done": 0,
+    }
+
+
+def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
+    job_row = fetch_job_row(local_db_path, job_id)
+    if not job_row:
+        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
+    item_rows = fetch_job_items(local_db_path, job_id)
+    items = [row_to_status_item(row) for row in item_rows]
+    return {
+        "job_id": str(job_row["job_id"]),
+        "status": job_row["status"] or "",
+        "selected_count": int(job_row["selected_count"] or 0),
+        "qa_count": int(job_row["qa_count"] or 0),
+        "plain_count": int(job_row["plain_count"] or 0),
+        "error_count": int(job_row["error_count"] or 0),
+        "requested_at": job_row["requested_at"],
+        "started_at": job_row["started_at"],
+        "finished_at": job_row["finished_at"],
+        "error_message": job_row["error_message"],
+        "phase": None,
+        "message": None,
+        "total_qa_chunks": 0,
+        "processed_qa_chunks": 0,
+        "total_plain_chunks": 0,
+        "processed_plain_chunks": 0,
+        "total_chunks": 0,
+        "processed_chunks": 0,
+        "current_item_id": None,
+        "current_label": None,
+        "items": items,
+    }
+
+
+def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.Row]:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                issue_id,
+                speech_id,
+                speech
+            FROM kokkai_document_rows
+            WHERE issue_id = ?
+            ORDER BY speech_order, speech_id
+            """,
+            (issue_id,),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
 
 def get_kokkai_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
     kokkai_conf = chunk_config.get("kokkai")
@@ -141,7 +335,7 @@ def build_kokkai_prompt_texts(
     if not chunks:
         raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
 
-    prompt_template = load_template_text(template_path, default_template)
+    prompt_template = load_template_text_with_default(template_path, default_template)
 
     prompt_texts: list[str] = []
     for chunk in chunks:
@@ -969,14 +1163,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
         logger.error("ank.db not found in background: %s", db_gcs_path)
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-            "job_id": job_id,
-            "status": "error",
-            "phase": "extract_knowledge",
-            "message": "ank.db not found",
-            "error_message": f"ank.db not found: {db_gcs_path}",
-            "finished_at": now_iso(),
-        })
+        set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"ank.db not found: {db_gcs_path}", phase="extract_knowledge", message="ank.db not found")
         return
 
     local_db_path = local_user_db_path(uid)
@@ -986,33 +1173,17 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
 
         job_row = fetch_job_row(local_db_path, job_id)
         if not job_row:
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-                "job_id": job_id,
-                "status": "error",
-                "phase": "extract_knowledge",
-                "message": "knowledge_jobs not found",
-                "error_message": f"knowledge_jobs not found: {job_id}",
-                "finished_at": now_iso(),
-            })
+            set_source_error(bucket, uid, SOURCE_TYPE, job_id, f"knowledge_jobs not found: {job_id}", phase="extract_knowledge", message="knowledge_jobs not found")
             return
 
         if job_row["source_type"] != SOURCE_TYPE:
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, {
-                "job_id": job_id,
-                "status": "error",
-                "phase": "extract_knowledge",
-                "message": "invalid source_type",
-                "error_message": "invalid source_type",
-                "finished_at": now_iso(),
-            })
+            set_source_error(bucket, uid, SOURCE_TYPE, job_id, "invalid source_type", phase="extract_knowledge", message="invalid source_type")
             return
 
         if job_row["status"] == "done":
             update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="already done"))
             return
 
-        qa_template_text = load_template_text(BUCKET_NAME, KOKKAI_QA_PROMPT_PATH)
-        plain_template_text = load_template_text(BUCKET_NAME, KOKKAI_PLAIN_PROMPT_PATH)
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
         qa_chunk_conf = get_kokkai_chunk_conf(chunk_config, "qa")
         plain_chunk_conf = get_kokkai_chunk_conf(chunk_config, "plain")
@@ -1022,7 +1193,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="background started"))
+        set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="background started")
 
         while True:
             row = fetch_next_new_job_item(local_db_path, job_id)
@@ -1034,23 +1205,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
             mark_job_item_running(local_db_path, current_job_item_id)
 
             def progress_callback(*, total_qa_chunks=0, processed_qa_chunks=0, total_plain_chunks=0, processed_plain_chunks=0, message=None):
-                update_generation_status_source(
-                    BUCKET_NAME,
-                    uid,
-                    SOURCE_TYPE,
-                    build_source_status_payload(
-                        local_db_path,
-                        job_id,
-                        phase="extract_knowledge",
-                        current_item_id=current_job_item_id,
-                        current_label=current_parent_label,
-                        message=message,
-                        total_qa_chunks=total_qa_chunks,
-                        processed_qa_chunks=processed_qa_chunks,
-                        total_plain_chunks=total_plain_chunks,
-                        processed_plain_chunks=processed_plain_chunks,
-                    ),
-                )
+                set_source_running(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message=message)
 
             try:
                 progress_callback(message="item running")
@@ -1077,7 +1232,6 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                     total_error_count=total_error_count,
                     error_message=None,
                 )
-                update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, build_source_status_payload_from_db(local_db_path, job_id, phase="extract_knowledge", current_item_id=current_job_item_id, current_label=result.get("parent_label"), message="item done", chunk_total=len(result.get("qa_prompt_texts") or []) + len(result.get("plain_prompt_texts") or []), chunk_done=len(result.get("qa_prompt_texts") or []) + len(result.get("plain_prompt_texts") or [])))
                 progress_callback(message="item done")
 
             except Exception as e:
@@ -1102,10 +1256,7 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
                 except Exception:
                     logger.exception("failed to update job summary error: job_id=%s", job_id)
 
-                payload = build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", current_item_id=current_job_item_id, current_label=current_parent_label, message="item failed", error_message=str(e))
-                payload["status"] = "error"
-                payload["finished_at"] = now_iso()
-                update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, payload)
+                set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="item failed")
                 return
 
         update_job_summary(
@@ -1119,27 +1270,11 @@ def run_kokkai_job_background(uid: str, job_id: str) -> None:
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
-        final_payload = build_source_status_payload(local_db_path, job_id, phase="extract_knowledge", message="completed")
-        final_payload["status"] = "done"
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, final_payload)
+        set_source_finished(bucket, uid, SOURCE_TYPE, job_id, phase="extract_knowledge", message="completed")
 
     except Exception as e:
         logger.exception("run_kokkai_job_background failed: job_id=%s", job_id)
-        payload = None
-        try:
-            payload = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
-        except Exception:
-            payload = {}
-        payload = dict(payload or {})
-        payload.update({
-            "job_id": job_id,
-            "status": "error",
-            "phase": "extract_knowledge",
-            "message": "background failed",
-            "error_message": str(e),
-            "finished_at": now_iso(),
-        })
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, payload)
+        set_source_error(bucket, uid, SOURCE_TYPE, job_id, str(e), phase="extract_knowledge", message="background failed")
 
 
 @router.post("/run", response_model=KnowledgeJobCreateResponse)
@@ -1161,7 +1296,7 @@ def run_kokkai_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    current_source = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
+    current_source = try_read_status_payload(bucket, uid, SOURCE_TYPE)
     if current_source.get("status") == "running":
         running_job_id = current_source.get("job_id")
         if running_job_id == body.job_id:
@@ -1187,9 +1322,7 @@ def run_kokkai_job(
 
         if job_row["status"] == "done":
             payload = build_status_payload_from_db(local_db_path, body.job_id)
-            done_payload = build_source_status_payload(local_db_path, body.job_id, phase="extract_knowledge", message="already done")
-            done_payload["status"] = "done"
-            update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, done_payload)
+            set_source_finished(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="already done")
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
                 selected_count=int(payload["selected_count"] or 0),
@@ -1215,9 +1348,7 @@ def run_kokkai_job(
             error_message=None,
         )
 
-        running_payload = build_source_status_payload(local_db_path, body.job_id, phase="extract_knowledge", message="job started")
-        running_payload["status"] = "running"
-        update_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE, running_payload)
+        set_source_running(bucket, uid, SOURCE_TYPE, body.job_id, phase="extract_knowledge", message="job started")
 
         payload = build_status_payload_from_db(local_db_path, body.job_id)
         background_tasks.add_task(run_kokkai_job_background, uid, body.job_id)
@@ -1248,7 +1379,9 @@ def get_kokkai_job_status(
     uid = get_uid_from_auth_header(authorization)
 
     try:
-        source_payload = get_generation_status_source(BUCKET_NAME, uid, SOURCE_TYPE)
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        source_payload = try_read_status_payload(bucket, uid, SOURCE_TYPE)
         if source_payload.get("job_id") == job_id and source_payload.get("status") not in (None, "idle"):
             return KnowledgeJobStatusResponse(**source_payload)
     except HTTPException:

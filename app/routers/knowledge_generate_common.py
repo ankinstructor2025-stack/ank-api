@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
-import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from typing import Any
-
-from fastapi import HTTPException
-from google.cloud import storage
+from zoneinfo import ZoneInfo
 
 import firebase_admin
+from fastapi import HTTPException
 from firebase_admin import auth as fb_auth
+from google.cloud import storage
 
 logger = logging.getLogger(__name__)
 JST = ZoneInfo("Asia/Tokyo")
-LOCK_TTL_SECONDS = 60 * 60 * 6
+STATUS_JSON_FILENAME = "knowledge_generate.json"
 
+
+# ---------- basic helpers ----------
 
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
@@ -32,27 +33,36 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
-def knowledge_generate_path(uid: str) -> str:
-    return f"users/{uid}/knowledge_generate.json"
+def user_status_path(uid: str) -> str:
+    return f"users/{uid}/{STATUS_JSON_FILENAME}"
 
 
 def local_user_db_path(uid: str) -> str:
     return f"/tmp/ank_{uid}.db"
 
 
-def row_to_status_item(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "job_item_id": row["job_item_id"],
-        "parent_source_id": row["parent_source_id"],
-        "parent_label": row["parent_label"],
-        "status": row["status"] or "",
-        "knowledge_count": int(row["knowledge_count"] or 0),
-        "error_message": row["error_message"],
-        "row_count": int(row["row_count"] or 0),
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-    }
+def local_status_json_path(uid: str) -> str:
+    return f"/tmp/knowledge_generate_{uid}.json"
 
+
+def load_json_safe(text: str | bytes | None) -> Any | None:
+    if text is None:
+        return None
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8")
+        except Exception:
+            return None
+    text = str(text).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+# ---------- auth helpers ----------
 
 def ensure_firebase_initialized() -> None:
     if firebase_admin._apps:
@@ -81,79 +91,27 @@ def get_uid_from_auth_header(authorization: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
-def normalize_text(text: str | None) -> str:
-    if not text:
-        return ""
-    return " ".join(str(text).split()).strip()
-
-
-def load_json_safe(text: str | None) -> Any | None:
-    if text is None:
-        return None
-    src = str(text).strip()
-    if not src:
-        return None
-    try:
-        return json.loads(src)
-    except Exception:
-        return None
-
-
-def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
-    lines: list[str] = []
-    if isinstance(value, dict):
-        for k, v in value.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            lines.extend(flatten_json_like(v, key))
-        return lines
-    if isinstance(value, list):
-        for idx, item in enumerate(value):
-            key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
-            lines.extend(flatten_json_like(item, key))
-        return lines
-    text = normalize_text(str(value) if value is not None else "")
-    if not text:
-        return []
-    return [f"{prefix}: {text}"] if prefix else [text]
-
-
-def extract_row_text(content_raw: str | None) -> str:
-    src = (content_raw or "").strip()
-    if not src:
-        return ""
-    parsed = load_json_safe(src)
-    if parsed is None:
-        return normalize_text(src)
-    lines = flatten_json_like(parsed)
-    if not lines:
-        return normalize_text(src)
-    return "\n".join(lines).strip()
-
-
-def extract_json_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        lines = flatten_json_like(value)
-        return "\n".join(lines).strip() if lines else ""
-    return extract_row_text(str(value))
-
+# ---------- gcs text/json helpers ----------
 
 def load_template_text(bucket_name: str, path: str) -> str:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(path)
+
     if not blob.exists():
         raise HTTPException(status_code=404, detail=f"{path} not found")
+
     return blob.download_as_bytes().decode("utf-8").strip()
 
 
-def load_chunk_config(bucket_name: str, config_path: str) -> dict:
+def load_chunk_config(bucket_name: str, config_path: str) -> dict[str, Any]:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(config_path)
+
     if not blob.exists():
         raise HTTPException(status_code=404, detail=f"{config_path} not found")
+
     try:
         obj = json.loads(blob.download_as_bytes().decode("utf-8"))
         if not isinstance(obj, dict):
@@ -162,6 +120,8 @@ def load_chunk_config(bucket_name: str, config_path: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to parse {config_path}: {e}")
 
+
+# ---------- db file helpers ----------
 
 def open_user_db(local_db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(local_db_path, timeout=30)
@@ -174,129 +134,292 @@ def replace_local_db_from_blob(db_blob: storage.Blob, local_db_path: str) -> Non
     local_dir = os.path.dirname(local_db_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
-    temp_path = f"{local_db_path}.download"
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-    db_blob.download_to_filename(temp_path)
-    conn = sqlite3.connect(temp_path)
-    try:
-        row = conn.execute("PRAGMA quick_check").fetchone()
-        result = row[0] if row else None
-        if result != "ok":
-            raise RuntimeError(f"sqlite quick_check failed: {result}")
-    finally:
-        conn.close()
-    os.replace(temp_path, local_db_path)
+
+    if os.path.exists(local_db_path):
+        os.remove(local_db_path)
+
+    db_blob.download_to_filename(local_db_path)
 
 
 def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
     if not os.path.exists(local_db_path):
         raise FileNotFoundError(f"local db not found: {local_db_path}")
+
     db_blob.upload_from_filename(local_db_path)
     logger.info("db uploaded to gcs: %s", db_blob.name)
 
 
-def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS job_locks (
-            lock_key TEXT PRIMARY KEY,
-            job_id TEXT NOT NULL,
-            locked_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
+# ---------- status json helpers ----------
+
+def default_source_status() -> dict[str, Any]:
+    return {
+        "job_id": None,
+        "status": "idle",
+        "phase": None,
+        "message": None,
+        "error_message": None,
+        "started_at": None,
+        "finished_at": None,
+    }
+
+
+def default_status_payload() -> dict[str, Any]:
+    return {
+        "updated_at": None,
+        "sources": {
+            "kokkai": default_source_status(),
+            "opendata": default_source_status(),
+            "file_upload": default_source_status(),
+        },
+    }
+
+
+def _validate_status_payload_shape(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="status json root must be object")
+
+    sources = payload.get("sources")
+    if not isinstance(sources, dict):
+        raise HTTPException(status_code=500, detail="status json 'sources' must be object")
+
+    return payload
+
+
+def load_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
+    blob = bucket.blob(user_status_path(uid))
+    if not blob.exists():
+        return default_status_payload()
+
+    payload = load_json_safe(blob.download_as_bytes())
+    if payload is None:
+        raise HTTPException(status_code=500, detail=f"invalid json: {user_status_path(uid)}")
+
+    return _validate_status_payload_shape(payload)
+
+
+def save_status_payload(bucket: storage.Bucket, uid: str, payload: dict[str, Any]) -> None:
+    payload = _validate_status_payload_shape(payload)
+    payload["updated_at"] = now_iso()
+
+    blob = bucket.blob(user_status_path(uid))
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        content_type="application/json; charset=utf-8",
     )
 
 
-def build_lock_key(uid: str, source_type: str) -> str:
-    return f"{uid}:{source_type}"
+def ensure_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
+    payload = load_status_payload(bucket, uid)
+    blob = bucket.blob(user_status_path(uid))
+    if not blob.exists():
+        save_status_payload(bucket, uid, payload)
+    return payload
 
 
-def try_acquire_job_lock(local_db_path: str, lock_key: str, job_id: str) -> bool:
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        ensure_job_locks_table(conn)
-        now = now_iso()
-        expires_at = datetime.fromisoformat(now).timestamp() + LOCK_TTL_SECONDS
-        expires_iso = datetime.fromtimestamp(expires_at, tz=JST).isoformat()
-        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
-        try:
-            conn.execute(
-                "INSERT INTO job_locks (lock_key, job_id, locked_at, expires_at) VALUES (?, ?, ?, ?)",
-                (lock_key, job_id, now, expires_iso),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            return False
-    finally:
-        conn.close()
+def get_source_status_or_error(payload: dict[str, Any], source_type: str) -> dict[str, Any]:
+    sources = payload.get("sources", {})
+    if source_type not in sources:
+        return {
+            "job_id": None,
+            "status": "error",
+            "phase": None,
+            "message": None,
+            "error_message": f"source_type '{source_type}' not found in status json",
+            "started_at": None,
+            "finished_at": None,
+        }
+
+    source = sources.get(source_type)
+    if not isinstance(source, dict):
+        return {
+            "job_id": None,
+            "status": "error",
+            "phase": None,
+            "message": None,
+            "error_message": f"source_type '{source_type}' is not object in status json",
+            "started_at": None,
+            "finished_at": None,
+        }
+
+    merged = default_source_status()
+    merged.update(source)
+    return merged
 
 
-def release_job_lock(local_db_path: str, lock_key: str, job_id: str | None = None) -> None:
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        ensure_job_locks_table(conn)
-        if job_id:
-            conn.execute("DELETE FROM job_locks WHERE lock_key = ? AND job_id = ?", (lock_key, job_id))
-        else:
-            conn.execute("DELETE FROM job_locks WHERE lock_key = ?", (lock_key,))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def try_read_status_payload(bucket: storage.Bucket, uid: str, source_type: str) -> dict[str, Any]:
+    status = get_source_status_or_error(load_status_payload(bucket, uid), source_type)
+    return {
+        "job_id": status.get("job_id"),
+        "status": status.get("status"),
+        "phase": status.get("phase"),
+        "message": status.get("message"),
+        "error_message": status.get("error_message"),
+        "started_at": status.get("started_at"),
+        "finished_at": status.get("finished_at"),
+    }
 
 
-def get_running_lock_job_id(local_db_path: str, lock_key: str) -> str | None:
-    conn = open_user_db(local_db_path)
-    try:
-        ensure_job_locks_table(conn)
-        now = now_iso()
-        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
-        conn.commit()
-        cur = conn.execute("SELECT job_id FROM job_locks WHERE lock_key = ? LIMIT 1", (lock_key,))
-        row = cur.fetchone()
-        return row["job_id"] if row else None
-    finally:
-        conn.close()
+def _update_source_status(
+    bucket: storage.Bucket,
+    uid: str,
+    source_type: str,
+    *,
+    job_id: str | None = None,
+    status: str | None = None,
+    phase: str | None = None,
+    message: str | None = None,
+    error_message: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> dict[str, Any]:
+    payload = ensure_status_payload(bucket, uid)
+    sources = payload["sources"]
+
+    if source_type not in sources or not isinstance(sources[source_type], dict):
+        raise HTTPException(status_code=500, detail=f"source_type '{source_type}' not found in status json")
+
+    current = default_source_status()
+    current.update(sources[source_type])
+
+    if job_id is not None:
+        current["job_id"] = job_id
+    if status is not None:
+        current["status"] = status
+    if phase is not None:
+        current["phase"] = phase
+    if message is not None:
+        current["message"] = message
+    if error_message is not None:
+        current["error_message"] = error_message
+    if started_at is not None:
+        current["started_at"] = started_at
+    if finished_at is not None:
+        current["finished_at"] = finished_at
+
+    sources[source_type] = current
+    save_status_payload(bucket, uid, payload)
+    return current
 
 
-def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_id,
-                source_type,
-                source_name,
-                request_type,
-                status,
-                selected_count,
-                qa_count,
-                plain_count,
-                error_count,
-                requested_at,
-                started_at,
-                finished_at,
-                error_message
-            FROM knowledge_jobs
-            WHERE job_id = ?
-            LIMIT 1
-            """,
-            (job_id,),
+def set_source_running(
+    bucket: storage.Bucket,
+    uid: str,
+    source_type: str,
+    job_id: str,
+    *,
+    phase: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    return _update_source_status(
+        bucket,
+        uid,
+        source_type,
+        job_id=job_id,
+        status="running",
+        phase=phase,
+        message=message,
+        error_message=None,
+        started_at=now_iso(),
+        finished_at=None,
+    )
+
+
+def set_source_finished(
+    bucket: storage.Bucket,
+    uid: str,
+    source_type: str,
+    job_id: str,
+    *,
+    phase: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    return _update_source_status(
+        bucket,
+        uid,
+        source_type,
+        job_id=job_id,
+        status="finished",
+        phase=phase,
+        message=message,
+        error_message=None,
+        finished_at=now_iso(),
+    )
+
+
+def set_source_error(
+    bucket: storage.Bucket,
+    uid: str,
+    source_type: str,
+    job_id: str | None,
+    error_message: str,
+    *,
+    phase: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    return _update_source_status(
+        bucket,
+        uid,
+        source_type,
+        job_id=job_id,
+        status="error",
+        phase=phase,
+        message=message,
+        error_message=error_message,
+        finished_at=now_iso(),
+    )
+
+
+def clear_source_status(bucket: storage.Bucket, uid: str, source_type: str) -> dict[str, Any]:
+    payload = ensure_status_payload(bucket, uid)
+    sources = payload["sources"]
+
+    if source_type not in sources or not isinstance(sources[source_type], dict):
+        raise HTTPException(status_code=500, detail=f"source_type '{source_type}' not found in status json")
+
+    sources[source_type] = default_source_status()
+    save_status_payload(bucket, uid, payload)
+    return sources[source_type]
+
+
+# ---------- compatibility wrappers ----------
+
+def build_status_payload_from_db(
+    local_db_path: str,
+    job_id: str,
+    *,
+    bucket: storage.Bucket | None = None,
+    uid: str | None = None,
+    source_type: str | None = None,
+) -> dict[str, Any]:
+    if bucket is None or uid is None or source_type is None:
+        raise HTTPException(
+            status_code=500,
+            detail="build_status_payload_from_db now requires bucket, uid and source_type",
         )
-        return cur.fetchone()
-    finally:
-        conn.close()
+    return try_read_status_payload(bucket, uid, source_type)
 
 
+def fetch_other_running_job_id(
+    local_db_path: str,
+    source_type: str,
+    job_id: str,
+    *,
+    bucket: storage.Bucket | None = None,
+    uid: str | None = None,
+) -> str | None:
+    if bucket is None or uid is None:
+        raise HTTPException(
+            status_code=500,
+            detail="fetch_other_running_job_id now requires bucket and uid",
+        )
+    status = try_read_status_payload(bucket, uid, source_type)
+    current_job_id = status.get("job_id")
+    if status.get("status") == "running" and current_job_id and current_job_id != job_id:
+        return str(current_job_id)
+    return None
+
+
+# ---------- db helpers kept for job items ----------
 def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
     try:
@@ -324,53 +447,6 @@ def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
             (job_id,),
         )
         return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def build_status_payload_from_db(local_db_path: str, job_id: str) -> dict[str, Any]:
-    job_row = fetch_job_row(local_db_path, job_id)
-    if not job_row:
-        raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
-    items = [row_to_status_item(row) for row in fetch_job_items(local_db_path, job_id)]
-    return {
-        "job_id": job_row["job_id"],
-        "status": job_row["status"] or "",
-        "selected_count": int(job_row["selected_count"] or 0),
-        "qa_count": int(job_row["qa_count"] or 0),
-        "plain_count": int(job_row["plain_count"] or 0),
-        "error_count": int(job_row["error_count"] or 0),
-        "requested_at": job_row["requested_at"],
-        "started_at": job_row["started_at"],
-        "finished_at": job_row["finished_at"],
-        "error_message": job_row["error_message"],
-        "total_qa_chunks": 0,
-        "processed_qa_chunks": 0,
-        "total_plain_chunks": 0,
-        "processed_plain_chunks": 0,
-        "total_chunks": 0,
-        "processed_chunks": 0,
-        "items": items,
-    }
-
-
-def fetch_other_running_job_id(local_db_path: str, source_type: str, job_id: str) -> str | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT job_id
-            FROM knowledge_jobs
-            WHERE source_type = ?
-              AND status = 'running'
-              AND job_id <> ?
-            ORDER BY requested_at
-            LIMIT 1
-            """,
-            (source_type, job_id),
-        )
-        row = cur.fetchone()
-        return row["job_id"] if row else None
     finally:
         conn.close()
 
@@ -406,123 +482,3 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         return cur.fetchone()
     finally:
         conn.close()
-
-
-def default_generate_source_payload() -> dict[str, Any]:
-    return {
-        "job_id": None,
-        "status": "idle",
-        "phase": None,
-        "selected_count": 0,
-        "done_count": 0,
-        "error_count": 0,
-        "waiting_count": 0,
-        "qa_count": 0,
-        "plain_count": 0,
-        "current_item_id": None,
-        "current_label": None,
-        "message": None,
-        "error_message": None,
-        "requested_at": None,
-        "started_at": None,
-        "finished_at": None,
-        "total_qa_chunks": 0,
-        "processed_qa_chunks": 0,
-        "total_plain_chunks": 0,
-        "processed_plain_chunks": 0,
-        "total_chunks": 0,
-        "processed_chunks": 0,
-        "items": [],
-    }
-
-
-def _normalize_generation_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    sources = payload.get("sources")
-    if not isinstance(sources, dict):
-        sources = {}
-    payload["sources"] = sources
-    for key in ("kokkai", "opendata", "file_upload"):
-        current = sources.get(key)
-        if not isinstance(current, dict):
-            current = {}
-        merged = default_generate_source_payload()
-        merged.update(current)
-        sources[key] = merged
-    payload.setdefault("updated_at", None)
-    return payload
-
-
-def read_generation_status(bucket_name: str, uid: str) -> dict[str, Any]:
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(knowledge_generate_path(uid))
-    if not blob.exists():
-        raise HTTPException(status_code=500, detail=f"knowledge_generate.json not found: gs://{bucket_name}/{knowledge_generate_path(uid)}")
-    try:
-        payload = json.loads(blob.download_as_bytes().decode("utf-8"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"failed to parse knowledge_generate.json: {e}")
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=500, detail="knowledge_generate.json root must be object")
-    return _normalize_generation_status_payload(payload)
-
-
-def write_generation_status(bucket_name: str, uid: str, payload: dict[str, Any]) -> None:
-    payload = _normalize_generation_status_payload(dict(payload))
-    payload["updated_at"] = now_iso()
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(knowledge_generate_path(uid))
-    blob.upload_from_string(json.dumps(payload, ensure_ascii=False, indent=2), content_type="application/json; charset=utf-8")
-
-
-def update_generation_status_source(bucket_name: str, uid: str, source_type: str, source_payload: dict[str, Any]) -> dict[str, Any]:
-    if source_type not in ("kokkai", "opendata", "file_upload"):
-        raise ValueError(f"invalid source_type: {source_type}")
-    payload = read_generation_status(bucket_name, uid)
-    merged = default_generate_source_payload()
-    merged.update(source_payload or {})
-    payload["sources"][source_type] = merged
-    write_generation_status(bucket_name, uid, payload)
-    return merged
-
-
-def get_generation_status_source(bucket_name: str, uid: str, source_type: str) -> dict[str, Any]:
-    if source_type not in ("kokkai", "opendata", "file_upload"):
-        raise ValueError(f"invalid source_type: {source_type}")
-    payload = read_generation_status(bucket_name, uid)
-    return payload["sources"][source_type]
-
-
-def build_source_status_payload_from_db(
-    local_db_path: str,
-    job_id: str,
-    *,
-    phase: str | None = None,
-    current_item_id: str | None = None,
-    current_label: str | None = None,
-    message: str | None = None,
-    error_message: str | None = None,
-    chunk_total: int = 0,
-    chunk_done: int = 0,
-) -> dict[str, Any]:
-    payload = build_status_payload_from_db(local_db_path, job_id)
-    items = payload.get("items") or []
-    done_count = sum(1 for item in items if item.get("status") == "done")
-    error_count = sum(1 for item in items if item.get("status") == "error")
-    waiting_count = sum(1 for item in items if item.get("status") in ("new", "running"))
-    payload.update(
-        {
-            "phase": phase,
-            "done_count": done_count,
-            "error_count": error_count,
-            "waiting_count": waiting_count,
-            "current_item_id": current_item_id,
-            "current_label": current_label,
-            "message": message,
-            "error_message": error_message if error_message is not None else payload.get("error_message"),
-            "total_chunks": int(chunk_total or 0),
-            "processed_chunks": int(chunk_done or 0),
-        }
-    )
-    return payload
