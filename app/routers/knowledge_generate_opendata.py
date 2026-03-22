@@ -11,34 +11,30 @@ from pydantic import BaseModel, Field
 from google.cloud import storage
 
 from .knowledge_generate_common import (
-    build_status_payload_from_db,
-    build_source_status_payload_from_db,
-    build_lock_key,
     fetch_job_row,
     fetch_next_new_job_item,
-    extract_row_text,
-    get_running_lock_job_id,
     get_uid_from_auth_header,
     load_chunk_config,
     load_template_text,
     local_user_db_path,
     new_id,
-    normalize_text,
     now_iso,
     open_user_db,
-    release_job_lock,
-    try_acquire_job_lock,
     upload_local_db,
     user_db_path,
     replace_local_db_from_blob,
-    get_generation_status_source,
-    update_generation_status_source,
+    try_read_status_payload,
+    set_job_running,
+    set_job_progress,
+    set_job_done,
+    set_job_error,
 )
+
 from .openai_llm_client import run_chunked_llm_json
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
 from .content_splitter_pdf import split_pdf_records
-
+from .content_detector import normalize_text
 
 logger = logging.getLogger(__name__)
 

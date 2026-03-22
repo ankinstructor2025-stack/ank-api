@@ -418,6 +418,22 @@ def clear_job_status(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
 
 
 # ---------- db helpers kept for job items ----------
+def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT *
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            LIMIT 1
+            """,
+            (job_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
 def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
     try:
