@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import re
 from typing import Any, Optional
 
 from openai import OpenAI
