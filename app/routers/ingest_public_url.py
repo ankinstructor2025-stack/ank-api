@@ -164,7 +164,10 @@ def get_public_url_source(config: dict[str, Any], source_key: str) -> dict[str, 
 
 
 def load_crawl_rule(config: dict[str, Any]) -> CrawlRule:
-    crawl_conf = config.get("crawl", {}) or {}
+    crawl_conf = config.get("crawl")
+    if not isinstance(crawl_conf, dict):
+        raise HTTPException(status_code=500, detail="crawl not found in public_url.json")
+
     return CrawlRule(
         same_domain_only=bool(crawl_conf.get("same_domain_only", True)),
         include_root_page=bool(crawl_conf.get("include_root_page", False)),
@@ -503,107 +506,89 @@ def judge_page(
     }
 
 
-def ensure_url_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    cur = conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS url_roots (
-          root_id TEXT PRIMARY KEY,
-          source_type TEXT NOT NULL,
-          root_url TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        )
-        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+        """,
+        (table_name,),
     )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_roots_root_url
-        ON url_roots(root_url)
-        """
+    return cur.fetchone() is not None
+
+
+def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table_name})")
+    rows = cur.fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def require_table_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    required_columns: list[str],
+) -> None:
+    if not table_exists(conn, table_name):
+        raise HTTPException(status_code=500, detail=f"required table not found: {table_name}")
+
+    actual_columns = get_table_columns(conn, table_name)
+    missing = [col for col in required_columns if col not in actual_columns]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"required columns not found in {table_name}: {', '.join(missing)}",
+        )
+
+
+def validate_public_url_schema(conn: sqlite3.Connection) -> None:
+    require_table_columns(
+        conn,
+        "url_roots",
+        [
+            "root_id",
+            "source_type",
+            "root_url",
+            "created_at",
+        ],
     )
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS url_pages (
-          page_id TEXT PRIMARY KEY,
-          root_id TEXT NOT NULL,
-          parent_page_id TEXT,
-          page_url TEXT NOT NULL,
-          depth INTEGER NOT NULL,
-          status TEXT NOT NULL,
-          child_count INTEGER NOT NULL DEFAULT 0,
-          title TEXT,
-          content_type TEXT,
-          http_status INTEGER,
-          fetched_at TEXT,
-          text_length INTEGER NOT NULL DEFAULT 0,
-          link_count INTEGER NOT NULL DEFAULT 0,
-          short_line_ratio REAL NOT NULL DEFAULT 0,
-          score INTEGER NOT NULL DEFAULT 0,
-          decision TEXT,
-          decision_reason TEXT,
-          is_usable INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_root_page_url
-        ON url_pages(root_id, page_url)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_id
-        ON url_pages(root_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_parent_page_id
-        ON url_pages(parent_page_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_depth
-        ON url_pages(root_id, depth)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_decision
-        ON url_pages(root_id, decision)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_is_usable
-        ON url_pages(root_id, is_usable)
-        """
+    require_table_columns(
+        conn,
+        "url_pages",
+        [
+            "page_id",
+            "root_id",
+            "parent_page_id",
+            "page_url",
+            "depth",
+            "status",
+            "child_count",
+            "title",
+            "content_type",
+            "http_status",
+            "fetched_at",
+            "text_length",
+            "link_count",
+            "short_line_ratio",
+            "score",
+            "decision",
+            "decision_reason",
+            "is_usable",
+            "created_at",
+        ],
     )
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS url_page_contents (
-          content_id TEXT PRIMARY KEY,
-          page_id TEXT NOT NULL,
-          content_text TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_page_contents_page_id
-        ON url_page_contents(page_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_page_contents_page_id
-        ON url_page_contents(page_id)
-        """
+    require_table_columns(
+        conn,
+        "url_page_contents",
+        [
+            "content_id",
+            "page_id",
+            "content_text",
+            "created_at",
+        ],
     )
 
 
@@ -1024,7 +1009,7 @@ def get_public_url_sources(
             }
             for s in sources
             if isinstance(s, dict)
-        ]
+        ],
     }
 
 
@@ -1070,7 +1055,7 @@ async def public_url_register(
         conn = sqlite3.connect(local_db_path)
         conn.row_factory = sqlite3.Row
         try:
-            ensure_url_tables(conn)
+            validate_public_url_schema(conn)
 
             root_id = insert_url_root_if_not_exists(
                 conn=conn,
@@ -1174,7 +1159,7 @@ async def public_url_decompose(
         conn = sqlite3.connect(local_db_path)
         conn.row_factory = sqlite3.Row
         try:
-            ensure_url_tables(conn)
+            validate_public_url_schema(conn)
 
             page_row = find_page_with_root(conn, page_url)
             if not page_row:
