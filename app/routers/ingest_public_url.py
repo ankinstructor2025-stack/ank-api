@@ -820,6 +820,30 @@ def replace_row_data_for_public_url(
     return inserted, skipped
 
 
+@router.get("/sources")
+def get_public_url_sources(
+    authorization: str | None = Header(default=None),
+):
+    # 認証（他と同じ）
+    get_uid_from_auth_header(authorization)
+
+    config = load_public_url_config()
+    sources = config.get("sources") or []
+
+    return {
+        "source_type": "public_url",
+        "sources": [
+            {
+                "source_key": str(s.get("source_key") or "").strip(),
+                "label": str(s.get("label") or "").strip(),
+                "url": str(s.get("url") or "").strip(),
+            }
+            for s in sources
+            if isinstance(s, dict)
+        ]
+    }
+
+
 @router.post("/register")
 async def public_url_register(
     req: PublicUrlRequest,
