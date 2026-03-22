@@ -151,26 +151,27 @@ def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
 
 # ---------- status json helpers ----------
 
-def default_source_status() -> dict[str, Any]:
+def default_status_payload() -> dict[str, Any]:
     return {
+        "updated_at": None,
         "job_id": None,
+        "source_type": None,
         "status": "idle",
         "phase": None,
         "message": None,
         "error_message": None,
         "started_at": None,
         "finished_at": None,
-    }
-
-
-def default_status_payload() -> dict[str, Any]:
-    return {
-        "updated_at": None,
-        "sources": {
-            "kokkai": default_source_status(),
-            "opendata": default_source_status(),
-            "file_upload": default_source_status(),
-        },
+        "dataset_id": None,
+        "dataset_name": None,
+        "row_count": 0,
+        "knowledge_count": 0,
+        "qa_current": 0,
+        "qa_total": 0,
+        "plain_current": 0,
+        "plain_total": 0,
+        "chunk_current": 0,
+        "chunk_total": 0,
     }
 
 
@@ -178,11 +179,10 @@ def _validate_status_payload_shape(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="status json root must be object")
 
-    sources = payload.get("sources")
-    if not isinstance(sources, dict):
-        raise HTTPException(status_code=500, detail="status json 'sources' must be object")
-
-    return payload
+    base = default_status_payload()
+    merged = dict(base)
+    merged.update(payload)
+    return merged
 
 
 def load_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
@@ -198,12 +198,12 @@ def load_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
 
 
 def save_status_payload(bucket: storage.Bucket, uid: str, payload: dict[str, Any]) -> None:
-    payload = _validate_status_payload_shape(payload)
-    payload["updated_at"] = now_iso()
+    merged = _validate_status_payload_shape(payload)
+    merged["updated_at"] = now_iso()
 
     blob = bucket.blob(user_status_path(uid))
     blob.upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(merged, ensure_ascii=False, indent=2),
         content_type="application/json; charset=utf-8",
     )
 
@@ -216,73 +216,40 @@ def ensure_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
     return payload
 
 
-def get_source_status_or_error(payload: dict[str, Any], source_type: str) -> dict[str, Any]:
-    sources = payload.get("sources", {})
-    if source_type not in sources:
-        return {
-            "job_id": None,
-            "status": "error",
-            "phase": None,
-            "message": None,
-            "error_message": f"source_type '{source_type}' not found in status json",
-            "started_at": None,
-            "finished_at": None,
-        }
-
-    source = sources.get(source_type)
-    if not isinstance(source, dict):
-        return {
-            "job_id": None,
-            "status": "error",
-            "phase": None,
-            "message": None,
-            "error_message": f"source_type '{source_type}' is not object in status json",
-            "started_at": None,
-            "finished_at": None,
-        }
-
-    merged = default_source_status()
-    merged.update(source)
-    return merged
+def try_read_status_payload(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
+    payload = load_status_payload(bucket, uid)
+    return _validate_status_payload_shape(payload)
 
 
-def try_read_status_payload(bucket: storage.Bucket, uid: str, source_type: str) -> dict[str, Any]:
-    status = get_source_status_or_error(load_status_payload(bucket, uid), source_type)
-    return {
-        "job_id": status.get("job_id"),
-        "status": status.get("status"),
-        "phase": status.get("phase"),
-        "message": status.get("message"),
-        "error_message": status.get("error_message"),
-        "started_at": status.get("started_at"),
-        "finished_at": status.get("finished_at"),
-    }
-
-
-def _update_source_status(
+def update_status_payload(
     bucket: storage.Bucket,
     uid: str,
-    source_type: str,
     *,
     job_id: str | None = None,
+    source_type: str | None = None,
     status: str | None = None,
     phase: str | None = None,
     message: str | None = None,
     error_message: str | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
+    dataset_id: str | None = None,
+    dataset_name: str | None = None,
+    row_count: int | None = None,
+    knowledge_count: int | None = None,
+    qa_current: int | None = None,
+    qa_total: int | None = None,
+    plain_current: int | None = None,
+    plain_total: int | None = None,
+    chunk_current: int | None = None,
+    chunk_total: int | None = None,
 ) -> dict[str, Any]:
-    payload = ensure_status_payload(bucket, uid)
-    sources = payload["sources"]
-
-    if source_type not in sources or not isinstance(sources[source_type], dict):
-        raise HTTPException(status_code=500, detail=f"source_type '{source_type}' not found in status json")
-
-    current = default_source_status()
-    current.update(sources[source_type])
+    current = ensure_status_payload(bucket, uid)
 
     if job_id is not None:
         current["job_id"] = job_id
+    if source_type is not None:
+        current["source_type"] = source_type
     if status is not None:
         current["status"] = status
     if phase is not None:
@@ -295,71 +262,146 @@ def _update_source_status(
         current["started_at"] = started_at
     if finished_at is not None:
         current["finished_at"] = finished_at
+    if dataset_id is not None:
+        current["dataset_id"] = dataset_id
+    if dataset_name is not None:
+        current["dataset_name"] = dataset_name
+    if row_count is not None:
+        current["row_count"] = row_count
+    if knowledge_count is not None:
+        current["knowledge_count"] = knowledge_count
+    if qa_current is not None:
+        current["qa_current"] = qa_current
+    if qa_total is not None:
+        current["qa_total"] = qa_total
+    if plain_current is not None:
+        current["plain_current"] = plain_current
+    if plain_total is not None:
+        current["plain_total"] = plain_total
+    if chunk_current is not None:
+        current["chunk_current"] = chunk_current
+    if chunk_total is not None:
+        current["chunk_total"] = chunk_total
 
-    sources[source_type] = current
-    save_status_payload(bucket, uid, payload)
+    save_status_payload(bucket, uid, current)
     return current
 
 
-def set_source_running(
+def set_job_running(
     bucket: storage.Bucket,
     uid: str,
-    source_type: str,
     job_id: str,
+    source_type: str,
     *,
     phase: str | None = None,
     message: str | None = None,
+    dataset_id: str | None = None,
+    dataset_name: str | None = None,
+    row_count: int | None = None,
+    qa_total: int | None = None,
+    plain_total: int | None = None,
+    chunk_total: int | None = None,
 ) -> dict[str, Any]:
-    return _update_source_status(
+    return update_status_payload(
         bucket,
         uid,
-        source_type,
         job_id=job_id,
+        source_type=source_type,
         status="running",
         phase=phase,
         message=message,
         error_message=None,
         started_at=now_iso(),
         finished_at=None,
+        dataset_id=dataset_id,
+        dataset_name=dataset_name,
+        row_count=row_count,
+        knowledge_count=0,
+        qa_current=0,
+        qa_total=qa_total if qa_total is not None else 0,
+        plain_current=0,
+        plain_total=plain_total if plain_total is not None else 0,
+        chunk_current=0,
+        chunk_total=chunk_total if chunk_total is not None else 0,
     )
 
 
-def set_source_finished(
+def set_job_progress(
     bucket: storage.Bucket,
     uid: str,
-    source_type: str,
+    *,
+    phase: str | None = None,
+    message: str | None = None,
+    knowledge_count: int | None = None,
+    qa_current: int | None = None,
+    qa_total: int | None = None,
+    plain_current: int | None = None,
+    plain_total: int | None = None,
+    chunk_current: int | None = None,
+    chunk_total: int | None = None,
+) -> dict[str, Any]:
+    return update_status_payload(
+        bucket,
+        uid,
+        status="running",
+        phase=phase,
+        message=message,
+        knowledge_count=knowledge_count,
+        qa_current=qa_current,
+        qa_total=qa_total,
+        plain_current=plain_current,
+        plain_total=plain_total,
+        chunk_current=chunk_current,
+        chunk_total=chunk_total,
+    )
+
+
+def set_job_done(
+    bucket: storage.Bucket,
+    uid: str,
     job_id: str,
     *,
     phase: str | None = None,
     message: str | None = None,
+    knowledge_count: int | None = None,
+    qa_current: int | None = None,
+    qa_total: int | None = None,
+    plain_current: int | None = None,
+    plain_total: int | None = None,
+    chunk_current: int | None = None,
+    chunk_total: int | None = None,
 ) -> dict[str, Any]:
-    return _update_source_status(
+    return update_status_payload(
         bucket,
         uid,
-        source_type,
         job_id=job_id,
-        status="finished",
+        status="done",
         phase=phase,
         message=message,
         error_message=None,
         finished_at=now_iso(),
+        knowledge_count=knowledge_count,
+        qa_current=qa_current,
+        qa_total=qa_total,
+        plain_current=plain_current,
+        plain_total=plain_total,
+        chunk_current=chunk_current,
+        chunk_total=chunk_total,
     )
 
 
-def set_source_error(
+def set_job_error(
     bucket: storage.Bucket,
     uid: str,
-    source_type: str,
     job_id: str | None,
     error_message: str,
     *,
     phase: str | None = None,
     message: str | None = None,
 ) -> dict[str, Any]:
-    return _update_source_status(
+    return update_status_payload(
         bucket,
         uid,
-        source_type,
         job_id=job_id,
         status="error",
         phase=phase,
@@ -369,16 +411,10 @@ def set_source_error(
     )
 
 
-def clear_source_status(bucket: storage.Bucket, uid: str, source_type: str) -> dict[str, Any]:
-    payload = ensure_status_payload(bucket, uid)
-    sources = payload["sources"]
-
-    if source_type not in sources or not isinstance(sources[source_type], dict):
-        raise HTTPException(status_code=500, detail=f"source_type '{source_type}' not found in status json")
-
-    sources[source_type] = default_source_status()
+def clear_job_status(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
+    payload = default_status_payload()
     save_status_payload(bucket, uid, payload)
-    return sources[source_type]
+    return payload
 
 
 # ---------- compatibility wrappers ----------
@@ -391,12 +427,12 @@ def build_status_payload_from_db(
     uid: str | None = None,
     source_type: str | None = None,
 ) -> dict[str, Any]:
-    if bucket is None or uid is None or source_type is None:
+    if bucket is None or uid is None:
         raise HTTPException(
             status_code=500,
-            detail="build_status_payload_from_db now requires bucket, uid and source_type",
+            detail="build_status_payload_from_db now requires bucket and uid",
         )
-    return try_read_status_payload(bucket, uid, source_type)
+    return try_read_status_payload(bucket, uid)
 
 
 def fetch_other_running_job_id(
@@ -412,7 +448,7 @@ def fetch_other_running_job_id(
             status_code=500,
             detail="fetch_other_running_job_id now requires bucket and uid",
         )
-    status = try_read_status_payload(bucket, uid, source_type)
+    status = try_read_status_payload(bucket, uid)
     current_job_id = status.get("job_id")
     if status.get("status") == "running" and current_job_id and current_job_id != job_id:
         return str(current_job_id)
