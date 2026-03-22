@@ -33,6 +33,10 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
+def knowledge_generate_path(uid: str) -> str:
+    return f"users/{uid}/knowledge_generate.json"
+
+
 def local_user_db_path(uid: str) -> str:
     return f"/tmp/ank_{uid}.db"
 
@@ -314,10 +318,6 @@ def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
                 status,
                 knowledge_count,
                 error_message,
-                qa_chunk_total,
-                qa_chunk_done,
-                plain_chunk_total,
-                plain_chunk_done,
                 created_at,
                 started_at,
                 finished_at
@@ -418,6 +418,84 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         return cur.fetchone()
     finally:
         conn.close()
+
+
+
+
+def default_generate_source_payload() -> dict[str, Any]:
+    return {
+        "job_id": None,
+        "status": "idle",
+        "phase": None,
+        "selected_count": 0,
+        "done_count": 0,
+        "error_count": 0,
+        "waiting_count": 0,
+        "qa_count": 0,
+        "plain_count": 0,
+        "current_item_id": None,
+        "current_label": None,
+        "message": None,
+        "error_message": None,
+        "started_at": None,
+        "finished_at": None,
+        "total_qa_chunks": 0,
+        "processed_qa_chunks": 0,
+        "total_plain_chunks": 0,
+        "processed_plain_chunks": 0,
+        "total_chunks": 0,
+        "processed_chunks": 0,
+        "items": [],
+    }
+
+
+def read_generation_status(bucket_name: str, uid: str) -> dict[str, Any]:
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(knowledge_generate_path(uid))
+    if not blob.exists():
+        return {
+            "updated_at": None,
+            "sources": {
+                "kokkai": default_generate_source_payload(),
+                "opendata": default_generate_source_payload(),
+                "file_upload": default_generate_source_payload(),
+            },
+        }
+    try:
+        payload = json.loads(blob.download_as_bytes().decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to parse knowledge_generate.json: {e}")
+    sources = payload.setdefault("sources", {})
+    for key in ("kokkai", "opendata", "file_upload"):
+        if not isinstance(sources.get(key), dict):
+            sources[key] = default_generate_source_payload()
+    return payload
+
+
+def write_generation_status(bucket_name: str, uid: str, payload: dict[str, Any]) -> None:
+    payload["updated_at"] = now_iso()
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(knowledge_generate_path(uid))
+    blob.upload_from_string(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        content_type="application/json; charset=utf-8",
+    )
+
+
+def update_generation_status_source(bucket_name: str, uid: str, source_type: str, source_payload: dict[str, Any]) -> dict[str, Any]:
+    if source_type not in ("kokkai", "opendata", "file_upload"):
+        raise ValueError(f"invalid source_type: {source_type}")
+    payload = read_generation_status(bucket_name, uid)
+    payload["sources"][source_type] = source_payload
+    write_generation_status(bucket_name, uid, payload)
+    return source_payload
+
+
+def get_generation_status_source(bucket_name: str, uid: str, source_type: str) -> dict[str, Any]:
+    payload = read_generation_status(bucket_name, uid)
+    return payload.get("sources", {}).get(source_type) or default_generate_source_payload()
 
 
 def load_json_safe(text: str) -> Any | None:

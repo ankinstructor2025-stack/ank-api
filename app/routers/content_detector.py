@@ -95,3 +95,39 @@ def detect_resource_kind(resource: Mapping[str, Any], source_path: str, content_
         declared_format=normalize_text(resource.get("format")),
         mimetype=normalize_text(resource.get("mimetype")),
     )
+
+
+def detect_content_kind_or_raise(
+    *,
+    filename: str = "",
+    source_path: str = "",
+    content_type: str = "",
+    declared_format: str = "",
+    mimetype: str = "",
+) -> str:
+    kind = detect_content_kind(
+        filename=filename,
+        source_path=source_path,
+        content_type=content_type,
+        declared_format=declared_format,
+        mimetype=mimetype,
+    )
+    if not kind:
+        raise ValueError(
+            "Unsupported or undetectable content kind: "
+            f"filename={filename!r}, source_path={source_path!r}, "
+            f"content_type={content_type!r}, declared_format={declared_format!r}, mimetype={mimetype!r}"
+        )
+    return kind
+
+
+def detect_resource_kind_or_raise(resource: Mapping[str, Any], source_path: str, content_type: str = "") -> str:
+    kind = detect_resource_kind(resource, source_path, content_type)
+    if not kind:
+        raise ValueError(
+            "Unsupported or undetectable resource kind: "
+            f"name={normalize_text(resource.get('name'))!r}, source_path={source_path!r}, "
+            f"content_type={content_type!r}, format={normalize_text(resource.get('format'))!r}, "
+            f"mimetype={normalize_text(resource.get('mimetype'))!r}"
+        )
+    return kind
