@@ -1583,7 +1583,6 @@ def run_opendata_job(
             SOURCE_TYPE,
             phase="extract_knowledge",
             message="job started",
-            knowledge_count=total_qa_count + total_plain_count,
         )
 
         background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
