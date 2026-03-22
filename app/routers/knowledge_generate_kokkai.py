@@ -21,7 +21,7 @@ from .knowledge_generate_common import (
     build_status_payload_from_db,
     get_uid_from_auth_header,
     normalize_text,
-    extract_json_text,
+    extract_row_text,
     load_chunk_config,
     load_template_text,
     open_user_db,
@@ -421,7 +421,7 @@ def insert_kokkai_contents(
     now = now_iso()
 
     for idx, row in enumerate(source_rows, start=1):
-        speech_text = extract_json_text(row["speech"])
+        speech_text = extract_row_text(row["speech"])
         if not speech_text:
             continue
 
