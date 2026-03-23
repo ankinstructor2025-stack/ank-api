@@ -1398,6 +1398,11 @@ async def public_url_register(
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"public_url register failed: {type(e).__name__}: {e}",
+        )
 
     for page in result_pages:
         page.pop("parent_url", None)
@@ -1493,3 +1498,8 @@ async def public_url_decompose(
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"public_url decompose failed: {type(e).__name__}: {e}",
+        )
