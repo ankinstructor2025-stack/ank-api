@@ -576,14 +576,17 @@ def upsert_url_page(
 def build_page_results(
     target_url: str,
     rule: CrawlRule,
-    page_scoring: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    root_res = fetch_html_response(target_url)
-    root_html = root_res.text
+    root_html = fetch_html(target_url)
     root_links_all = extract_links(root_html, target_url)
 
     seen_urls: set[str] = set()
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
+
+    stack: list[CrawlNode] = [
+        CrawlNode(url=url, parent_url=None, depth=1)
+        for url in reversed(level1_urls)
+    ]
 
     page_results: list[dict[str, Any]] = []
 
@@ -595,12 +598,6 @@ def build_page_results(
             text=root_features["text"],
             text_length=root_features["text_length"],
             link_count=root_features["link_count"],
-            short_line_ratio=root_features["short_line_ratio"],
-            heading_count=root_features["heading_count"],
-            paragraph_count=root_features["paragraph_count"],
-            link_only_block_ratio=root_features["link_only_block_ratio"],
-            nav_like_block_ratio=root_features["nav_like_block_ratio"],
-            page_scoring=page_scoring,
         )
         page_results.append(
             {
@@ -611,126 +608,75 @@ def build_page_results(
                 "depth": 0,
                 "status": "new",
                 "child_count": len(level1_urls),
-                "title": root_features["title"],
-                "content_type": root_res.headers.get("Content-Type", "text/html"),
-                "http_status": root_res.status_code,
-                "fetched_at": now_iso(),
-                "text_length": root_features["text_length"],
-                "link_count": root_features["link_count"],
-                "short_line_ratio": root_features["short_line_ratio"],
                 "score": root_judged["score"],
-                "decision": root_judged["decision"],
-                "decision_reason": root_judged["decision_reason"],
+                "page_type": root_judged["page_type"],
                 "is_usable": root_judged["is_usable"],
+                "judge_reason": root_judged["judge_reason"],
                 "created_at": now_iso(),
             }
         )
 
-    # root直下の各枝を1本ずつ掘る
-    for level1_url in level1_urls:
-        if len(page_results) >= rule.max_pages:
-            break
+    while stack and len(page_results) < rule.max_pages:
+        node = stack.pop()
 
-        branch_stack: list[CrawlNode] = [
-            CrawlNode(url=level1_url, parent_url=None, depth=1)
-        ]
+        page_info = {
+            "page_id": None,
+            "page_url": node.url,
+            "parent_url": node.parent_url,
+            "parent_page_id": None,
+            "depth": node.depth,
+            "status": "new",
+            "child_count": 0,
+            "score": 0,
+            "page_type": "unknown",
+            "is_usable": 0,
+            "judge_reason": None,
+            "created_at": now_iso(),
+        }
 
-        while branch_stack and len(page_results) < rule.max_pages:
-            node = branch_stack.pop()
+        try:
+            html = fetch_html(node.url)
+            features = extract_page_features(html)
 
-            page_info = {
-                "page_id": None,
-                "page_url": node.url,
-                "parent_url": node.parent_url,
-                "parent_page_id": None,
-                "depth": node.depth,
-                "status": "new",
-                "child_count": 0,
-                "title": "",
-                "content_type": None,
-                "http_status": None,
-                "fetched_at": None,
-                "text_length": 0,
-                "link_count": 0,
-                "short_line_ratio": 0.0,
-                "score": 0,
-                "decision": "reject",
-                "decision_reason": json.dumps(
-                    {
-                        "filter_mode": str(page_scoring.get("filter_mode") or "score_only"),
-                        "score": 0,
-                        "reasons": [{"rule": "not_fetched", "score": 0}],
-                    },
-                    ensure_ascii=False,
-                ),
-                "is_usable": 0,
-                "created_at": now_iso(),
-            }
+            child_urls: list[str] = []
+            if node.depth < rule.max_depth:
+                child_urls_all = extract_links(html, node.url)
+                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
 
-            try:
-                res = fetch_html_response(node.url)
-                html = res.text
-                features = extract_page_features(html)
+            page_info["child_count"] = len(child_urls)
 
-                page_info["title"] = features["title"]
-                page_info["content_type"] = res.headers.get("Content-Type", "text/html")
-                page_info["http_status"] = res.status_code
-                page_info["fetched_at"] = now_iso()
-                page_info["text_length"] = features["text_length"]
-                page_info["link_count"] = features["link_count"]
-                page_info["short_line_ratio"] = features["short_line_ratio"]
+            judged = judge_page(
+                url=node.url,
+                title=features["title"],
+                text=features["text"],
+                text_length=features["text_length"],
+                link_count=features["link_count"],
+            )
+            page_info["score"] = judged["score"]
+            page_info["page_type"] = judged["page_type"]
+            page_info["is_usable"] = judged["is_usable"]
+            page_info["judge_reason"] = judged["judge_reason"]
 
-                child_urls: list[str] = []
-                if node.depth < rule.max_depth:
-                    child_urls_all = extract_links(html, node.url)
-                    child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
-
-                page_info["child_count"] = len(child_urls)
-
-                judged = judge_page(
-                    url=node.url,
-                    title=features["title"],
-                    text=features["text"],
-                    text_length=features["text_length"],
-                    link_count=features["link_count"],
-                    short_line_ratio=features["short_line_ratio"],
-                    heading_count=features["heading_count"],
-                    paragraph_count=features["paragraph_count"],
-                    link_only_block_ratio=features["link_only_block_ratio"],
-                    nav_like_block_ratio=features["nav_like_block_ratio"],
-                    page_scoring=page_scoring,
-                )
-                page_info["score"] = judged["score"]
-                page_info["decision"] = judged["decision"]
-                page_info["decision_reason"] = judged["decision_reason"]
-                page_info["is_usable"] = judged["is_usable"]
-
-                if node.depth < rule.max_depth:
-                    for child_url in reversed(child_urls):
-                        if len(page_results) + len(branch_stack) >= rule.max_pages:
-                            break
-                        branch_stack.append(
-                            CrawlNode(
-                                url=child_url,
-                                parent_url=node.url,
-                                depth=node.depth + 1,
-                            )
+            if node.depth < rule.max_depth:
+                for child_url in reversed(child_urls):
+                    if len(page_results) + len(stack) >= rule.max_pages:
+                        break
+                    stack.append(
+                        CrawlNode(
+                            url=child_url,
+                            parent_url=node.url,
+                            depth=node.depth + 1,
                         )
+                    )
 
-            except HTTPException:
-                page_info["status"] = "fetch_error"
-                page_info["decision"] = "reject"
-                page_info["is_usable"] = 0
-                page_info["decision_reason"] = json.dumps(
-                    {
-                        "filter_mode": str(page_scoring.get("filter_mode") or "score_only"),
-                        "score": 0,
-                        "reasons": [{"rule": "fetch_error", "score": 0}],
-                    },
-                    ensure_ascii=False,
-                )
+        except HTTPException:
+            page_info["status"] = "fetch_error"
+            page_info["score"] = 0
+            page_info["page_type"] = "unknown"
+            page_info["is_usable"] = 0
+            page_info["judge_reason"] = "fetch_error"
 
-            page_results.append(page_info)
+        page_results.append(page_info)
 
     return page_results
 
