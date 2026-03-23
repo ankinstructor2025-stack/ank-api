@@ -965,6 +965,234 @@ def build_page_results(target_url: str, rule: CrawlRule, page_scoring: dict[str,
 
     return page_results
 
+def list_registered_roots(cur: sqlite3.Cursor, source_key: str | None = None) -> list[dict]:
+    if source_key:
+        cur.execute(
+            """
+            SELECT
+              r.root_id,
+              r.source_type,
+              r.root_url,
+              r.created_at,
+              COUNT(p.page_id) AS page_count,
+              SUM(CASE WHEN p.status = 'done' THEN 1 ELSE 0 END) AS done_count
+            FROM url_roots r
+            LEFT JOIN url_pages p
+              ON p.root_id = r.root_id
+            WHERE r.source_type = ?
+            GROUP BY r.root_id, r.source_type, r.root_url, r.created_at
+            ORDER BY r.created_at DESC
+            """,
+            (source_key,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT
+              r.root_id,
+              r.source_type,
+              r.root_url,
+              r.created_at,
+              COUNT(p.page_id) AS page_count,
+              SUM(CASE WHEN p.status = 'done' THEN 1 ELSE 0 END) AS done_count
+            FROM url_roots r
+            LEFT JOIN url_pages p
+              ON p.root_id = r.root_id
+            GROUP BY r.root_id, r.source_type, r.root_url, r.created_at
+            ORDER BY r.created_at DESC
+            """
+        )
+
+    rows = cur.fetchall()
+    out = []
+    for row in rows:
+        page_count = int(row["page_count"] or 0)
+        done_count = int(row["done_count"] or 0)
+
+        if page_count <= 0:
+            status = "new"
+        elif done_count >= page_count:
+            status = "done"
+        elif done_count > 0:
+            status = "running"
+        else:
+            status = "new"
+
+        out.append(
+            {
+                "root_id": row["root_id"],
+                "source_type": row["source_type"],
+                "source_key": row["source_type"],
+                "root_url": row["root_url"],
+                "title": row["root_url"],
+                "status": status,
+                "child_count": page_count,
+                "page_count": page_count,
+                "created_at": row["created_at"],
+            }
+        )
+    return out
+
+
+def list_root_pages(cur: sqlite3.Cursor, root_id: str) -> list[dict]:
+    cur.execute(
+        """
+        SELECT
+          page_id,
+          root_id,
+          parent_page_id,
+          page_url,
+          depth,
+          status,
+          child_count,
+          title,
+          content_type,
+          http_status,
+          fetched_at,
+          text_length,
+          link_count,
+          short_line_ratio,
+          score,
+          decision,
+          decision_reason,
+          is_usable,
+          created_at
+        FROM url_pages
+        WHERE root_id = ?
+        ORDER BY depth, created_at, page_url
+        """,
+        (root_id,),
+    )
+
+    rows = cur.fetchall()
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "page_id": row["page_id"],
+                "root_id": row["root_id"],
+                "parent_page_id": row["parent_page_id"],
+                "page_url": row["page_url"],
+                "depth": row["depth"],
+                "status": row["status"],
+                "child_count": row["child_count"],
+                "title": row["title"],
+                "content_type": row["content_type"],
+                "http_status": row["http_status"],
+                "fetched_at": row["fetched_at"],
+                "text_length": row["text_length"],
+                "link_count": row["link_count"],
+                "short_line_ratio": row["short_line_ratio"],
+                "score": row["score"],
+                "decision": row["decision"],
+                "decision_reason": row["decision_reason"],
+                "is_usable": row["is_usable"],
+                "created_at": row["created_at"],
+            }
+        )
+    return out
+
+def _list_roots_impl(source_key: str | None, authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_public_url.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        validate_public_url_schema(conn)
+        cur = conn.cursor()
+        rows = list_registered_roots(cur, source_key)
+    finally:
+        conn.close()
+
+    return {
+        "mode": "roots",
+        "root_count": len(rows),
+        "rows": rows,
+    }
+
+
+def _root_pages_impl(root_id: str, authorization: str | None):
+    uid = get_uid_from_auth_header(authorization)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+        )
+
+    local_db_path = f"/tmp/ank_{uid}_public_url.db"
+    db_blob.download_to_filename(local_db_path)
+
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        validate_public_url_schema(conn)
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT root_id, source_type, root_url, created_at
+            FROM url_roots
+            WHERE root_id = ?
+            LIMIT 1
+            """,
+            (root_id,),
+        )
+        root = cur.fetchone()
+        if not root:
+            raise HTTPException(status_code=404, detail=f"root not found: root_id={root_id}")
+
+        pages = list_root_pages(cur, root_id)
+    finally:
+        conn.close()
+
+    return {
+        "mode": "pages",
+        "root": {
+            "root_id": root["root_id"],
+            "source_type": root["source_type"],
+            "source_key": root["source_type"],
+            "root_url": root["root_url"],
+            "title": root["root_url"],
+            "created_at": root["created_at"],
+        },
+        "page_count": len(pages),
+        "rows": pages,
+    }
+
+@router.get("/roots")
+def public_url_roots_get(
+    source_key: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    return _list_roots_impl(source_key, authorization)
+
+
+@router.get("/pages")
+def public_url_pages_get(
+    root_id: str,
+    authorization: str | None = Header(default=None),
+):
+    return _root_pages_impl(root_id, authorization)
 
 @router.get("/sources")
 def get_public_url_sources(authorization: str | None = Header(default=None)):
