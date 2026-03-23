@@ -31,7 +31,7 @@ def create_app() -> FastAPI:
     app.include_router(upload_retrieve_router, prefix="/v1")
     app.include_router(knowledge_generate_kokkai_router, prefix="/v1")
     app.include_router(knowledge_generate_opendata_router, prefix="/v1")
-    app.include_router(knowledge_generate_public_router, prefix="/v1")
+    app.include_router(knowledge_generate_public_url_router, prefix="/v1")
     app.include_router(knowledge_generate_upload_router, prefix="/v1")
     app.include_router(knowledge_refine_router, prefix="/v1")
     app.include_router(knowledge_search_router, prefix="/v1")
