@@ -14,6 +14,7 @@ import firebase_admin
 import requests
 import ulid
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 from fastapi import APIRouter, Header, HTTPException
 from firebase_admin import auth as fb_auth
 from google.cloud import storage
@@ -31,6 +32,23 @@ DEFAULT_TIMEOUT_SEC = 15
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; ank-bot/1.0)"
 }
+
+CONTENT_HINT_PATTERN = re.compile(
+    r"main|content|contents|article|entry|post|pagebody|section|honbun|detail|wrapper",
+    re.I,
+)
+
+NOISE_HINT_PATTERN = re.compile(
+    r"breadcrumb|pankuzu|topicpath|sidebar|side|sidemenu|localnav|globalnav|gnav|subnav|"
+    r"related|relation|share|sns|pagetop|search|utility|tool|header|footer|pickup|ranking|"
+    r"banner|bnr|advert|ad-|ad_|menu|navi|navigation",
+    re.I,
+)
+
+TOC_HINT_PATTERN = re.compile(
+    r"目次|contents|index|ページ内リンク|このページ",
+    re.I,
+)
 
 
 class PublicUrlRequest(BaseModel):
@@ -273,52 +291,198 @@ def calc_short_line_ratio(text: str) -> float:
     return round(short_count / len(lines), 4)
 
 
-def extract_page_features(html: str) -> dict[str, Any]:
+def get_tag_hint_text(tag: Tag) -> str:
+    class_names = " ".join(tag.get("class", [])) if tag.get("class") else ""
+    tag_id = tag.get("id", "") or ""
+    aria_label = tag.get("aria-label", "") or ""
+    return f"{class_names} {tag_id} {aria_label}".strip()
+
+
+def remove_global_noise(soup: BeautifulSoup) -> None:
+    for tag in soup.select("script, style, noscript, svg, header, footer, nav, aside, form, iframe"):
+        tag.decompose()
+
+    for tag in soup.find_all(True):
+        hint = get_tag_hint_text(tag)
+        if hint and NOISE_HINT_PATTERN.search(hint):
+            tag.decompose()
+
+
+def candidate_node_score(node: Tag) -> float:
+    text = " ".join(node.stripped_strings)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return 0.0
+
+    text_length = len(text)
+    paragraph_count = len([t for t in node.find_all(["p", "li", "dd", "dt"]) if len(" ".join(t.stripped_strings)) >= 30])
+    heading_count = len(node.find_all(["h1", "h2", "h3", "h4"]))
+    link_count = len(node.find_all("a", href=True))
+
+    score = float(text_length)
+    score += paragraph_count * 180.0
+    score += heading_count * 120.0
+    score -= link_count * 20.0
+
+    if text_length > 0:
+        score -= (link_count / text_length) * 5000.0
+
+    return score
+
+
+def find_best_main_node(soup: BeautifulSoup) -> Tag:
+    candidates: list[Tag] = []
+
+    explicit = [
+        soup.find("main"),
+        soup.find("article"),
+        soup.find(attrs={"role": "main"}),
+    ]
+    for node in explicit:
+        if isinstance(node, Tag):
+            candidates.append(node)
+
+    for tag in soup.find_all(["div", "section", "article", "main"]):
+        hint = get_tag_hint_text(tag)
+        if hint and CONTENT_HINT_PATTERN.search(hint):
+            candidates.append(tag)
+
+    if soup.body:
+        candidates.append(soup.body)
+
+    unique_candidates: list[Tag] = []
+    seen_ids: set[int] = set()
+    for node in candidates:
+        node_id = id(node)
+        if node_id in seen_ids:
+            continue
+        seen_ids.add(node_id)
+        unique_candidates.append(node)
+
+    if not unique_candidates:
+        return soup.body or soup
+
+    return max(unique_candidates, key=candidate_node_score)
+
+
+def remove_toc_like_nodes(main_node: Tag) -> None:
+    for tag in main_node.find_all(["ul", "ol", "div", "section", "nav"]):
+        text = " ".join(tag.stripped_strings)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+
+        hint = get_tag_hint_text(tag)
+        link_count = len(tag.find_all("a", href=True))
+        li_count = len(tag.find_all("li"))
+        text_length = len(text)
+
+        if hint and TOC_HINT_PATTERN.search(hint) and link_count >= 3:
+            tag.decompose()
+            continue
+
+        if text_length > 0 and link_count >= 5 and li_count >= 3:
+            link_density = link_count / text_length
+            if link_density >= 0.04 and text_length <= 800:
+                tag.decompose()
+
+
+def collect_content_blocks(main_node: Tag) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+
+    for tag in main_node.find_all(["h1", "h2", "h3", "h4", "p", "li", "dd", "dt", "td", "th"]):
+        text = " ".join(tag.stripped_strings)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+
+        anchor_text = " ".join(a.get_text(" ", strip=True) for a in tag.find_all("a", href=True))
+        anchor_text = re.sub(r"\s+", " ", anchor_text).strip()
+
+        link_count = len(tag.find_all("a", href=True))
+        is_heading = tag.name in {"h1", "h2", "h3", "h4"}
+        is_short = len(text) <= 20
+        is_link_only = bool(anchor_text) and anchor_text == text
+        is_nav_like = is_link_only or (link_count >= 2 and is_short)
+
+        blocks.append(
+            {
+                "tag": tag.name,
+                "text": text,
+                "length": len(text),
+                "link_count": link_count,
+                "is_heading": is_heading,
+                "is_short": is_short,
+                "is_link_only": is_link_only,
+                "is_nav_like": is_nav_like,
+            }
+        )
+
+    return blocks
+
+
+def parse_content_features(html: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
 
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
+    remove_global_noise(soup)
+    main_node = find_best_main_node(soup)
+    remove_toc_like_nodes(main_node)
 
-    body = soup.body or soup
-    text = " ".join(body.stripped_strings)
-    text = re.sub(r"\s+", " ", text).strip()
+    blocks = collect_content_blocks(main_node)
 
-    link_count = len(body.find_all("a", href=True))
+    kept_blocks = [
+        block["text"]
+        for block in blocks
+        if not block["is_link_only"]
+    ]
+
+    text = "\n".join(kept_blocks).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+
     text_length = len(text)
+    link_count = sum(block["link_count"] for block in blocks if not block["is_nav_like"])
     short_line_ratio = calc_short_line_ratio(text)
+
+    heading_count = sum(1 for block in blocks if block["is_heading"])
+    paragraph_count = sum(
+        1
+        for block in blocks
+        if block["tag"] in {"p", "li", "dd", "dt", "td", "th"} and block["length"] >= 30 and not block["is_link_only"]
+    )
+    block_count = len(blocks)
+    link_only_block_count = sum(1 for block in blocks if block["is_link_only"])
+    nav_like_block_count = sum(1 for block in blocks if block["is_nav_like"])
+
+    link_only_block_ratio = round(link_only_block_count / block_count, 4) if block_count > 0 else 0.0
+    nav_like_block_ratio = round(nav_like_block_count / block_count, 4) if block_count > 0 else 0.0
 
     return {
         "title": title,
-        "text": text,
+        "text": text.strip(),
         "text_length": text_length,
         "link_count": link_count,
         "short_line_ratio": short_line_ratio,
+        "heading_count": heading_count,
+        "paragraph_count": paragraph_count,
+        "block_count": block_count,
+        "link_only_block_ratio": link_only_block_ratio,
+        "nav_like_block_ratio": nav_like_block_ratio,
     }
 
 
+def extract_page_features(html: str) -> dict[str, Any]:
+    return parse_content_features(html)
+
+
 def extract_main_content_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
-        tag.decompose()
-
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.find(id=re.compile("main|content|contents", re.I))
-        or soup.find(class_=re.compile("main|content|contents", re.I))
-        or soup.body
-        or soup
-    )
-
-    text = main.get_text("\n", strip=True)
-    text = re.sub(r"\n{2,}", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+    features = parse_content_features(html)
+    return features["text"]
 
 
 def apply_keyword_scores(
@@ -326,10 +490,12 @@ def apply_keyword_scores(
     keyword_scores: dict[str, Any],
     rule_name: str,
     reasons: list[dict[str, Any]],
-) -> int:
+) -> tuple[int, list[dict[str, Any]]]:
     score = 0
+    matched_reasons: list[dict[str, Any]] = []
+
     if not target_text or not isinstance(keyword_scores, dict):
-        return score
+        return score, matched_reasons
 
     lower_text = target_text.lower()
 
@@ -342,7 +508,7 @@ def apply_keyword_scores(
         keyword_str = str(keyword)
         if keyword_str.lower() in lower_text:
             score += delta_int
-            reasons.append(
+            matched_reasons.append(
                 {
                     "rule": rule_name,
                     "matched": keyword_str,
@@ -350,7 +516,8 @@ def apply_keyword_scores(
                 }
             )
 
-    return score
+    reasons.extend(matched_reasons)
+    return score, matched_reasons
 
 
 def apply_threshold_rule(
@@ -409,6 +576,62 @@ def apply_threshold_list(
     return score
 
 
+def apply_structure_scores(
+    text_length: int,
+    heading_count: int,
+    paragraph_count: int,
+    short_line_ratio: float,
+    link_only_block_ratio: float,
+    nav_like_block_ratio: float,
+    reasons: list[dict[str, Any]],
+) -> int:
+    score = 0
+
+    def add(rule: str, delta: int, **extra):
+        nonlocal score
+        score += delta
+        item = {"rule": rule, "score": delta}
+        item.update(extra)
+        reasons.append(item)
+
+    if paragraph_count >= 10:
+        add("structure_paragraph_rich", 18, paragraph_count=paragraph_count)
+    elif paragraph_count >= 6:
+        add("structure_paragraph_good", 12, paragraph_count=paragraph_count)
+    elif paragraph_count >= 3:
+        add("structure_paragraph_basic", 8, paragraph_count=paragraph_count)
+
+    if heading_count >= 4:
+        add("structure_heading_good", 10, heading_count=heading_count)
+    elif heading_count >= 2:
+        add("structure_heading_basic", 6, heading_count=heading_count)
+
+    if text_length >= 1200 and paragraph_count >= 4:
+        add("structure_dense_text", 8, text_length=text_length)
+
+    if short_line_ratio <= 0.25 and text_length >= 600:
+        add("structure_long_sentence", 8, short_line_ratio=short_line_ratio)
+    elif short_line_ratio <= 0.40 and text_length >= 400:
+        add("structure_sentence_ok", 4, short_line_ratio=short_line_ratio)
+
+    if link_only_block_ratio >= 0.50:
+        add("structure_link_only_blocks_high", -35, link_only_block_ratio=link_only_block_ratio)
+    elif link_only_block_ratio >= 0.30:
+        add("structure_link_only_blocks_mid", -20, link_only_block_ratio=link_only_block_ratio)
+    elif link_only_block_ratio >= 0.15:
+        add("structure_link_only_blocks_low", -10, link_only_block_ratio=link_only_block_ratio)
+
+    if nav_like_block_ratio >= 0.50:
+        add("structure_nav_like_high", -25, nav_like_block_ratio=nav_like_block_ratio)
+    elif nav_like_block_ratio >= 0.30:
+        add("structure_nav_like_mid", -15, nav_like_block_ratio=nav_like_block_ratio)
+
+    if paragraph_count == 0 and heading_count <= 1 and text_length < 800:
+        add("structure_content_thin", -15, text_length=text_length)
+
+    return score
+
+
 def match_decision(score_value: int, conf: dict[str, Any]) -> bool:
     if not isinstance(conf, dict):
         return False
@@ -431,6 +654,10 @@ def judge_page(
     text_length: int,
     link_count: int,
     short_line_ratio: float,
+    heading_count: int,
+    paragraph_count: int,
+    link_only_block_ratio: float,
+    nav_like_block_ratio: float,
     page_scoring: dict[str, Any],
 ) -> dict[str, Any]:
     score = 0
@@ -440,9 +667,44 @@ def judge_page(
     thresholds = page_scoring.get("thresholds", {}) or {}
     decisions = page_scoring.get("decisions", {}) or {}
 
-    score += apply_keyword_scores(title or "", rules.get("title_keywords", {}) or {}, "title_keywords", reasons)
-    score += apply_keyword_scores(text or "", rules.get("body_keywords", {}) or {}, "body_keywords", reasons)
-    score += apply_keyword_scores(url or "", rules.get("url_keywords", {}) or {}, "url_keywords", reasons)
+    keyword_total = 0
+
+    title_keyword_score, _ = apply_keyword_scores(
+        title or "",
+        rules.get("title_keywords", {}) or {},
+        "title_keywords",
+        reasons,
+    )
+    body_keyword_score, _ = apply_keyword_scores(
+        text or "",
+        rules.get("body_keywords", {}) or {},
+        "body_keywords",
+        reasons,
+    )
+    url_keyword_score, _ = apply_keyword_scores(
+        url or "",
+        rules.get("url_keywords", {}) or {},
+        "url_keywords",
+        reasons,
+    )
+
+    keyword_total += title_keyword_score
+    keyword_total += body_keyword_score
+    keyword_total += url_keyword_score
+
+    keyword_cap = 25
+    if keyword_total > keyword_cap:
+        reasons.append(
+            {
+                "rule": "keyword_cap",
+                "score": keyword_cap - keyword_total,
+                "raw_keyword_score": keyword_total,
+                "applied_keyword_score": keyword_cap,
+            }
+        )
+        score += keyword_cap
+    else:
+        score += keyword_total
 
     min_text_length = thresholds.get("min_text_length")
     if isinstance(min_text_length, dict):
@@ -473,6 +735,16 @@ def judge_page(
         reasons,
     )
 
+    score += apply_structure_scores(
+        text_length=text_length,
+        heading_count=heading_count,
+        paragraph_count=paragraph_count,
+        short_line_ratio=short_line_ratio,
+        link_only_block_ratio=link_only_block_ratio,
+        nav_like_block_ratio=nav_like_block_ratio,
+        reasons=reasons,
+    )
+
     score = max(0, min(100, int(score)))
 
     decision = str(page_scoring.get("default_decision") or "pass").strip() or "pass"
@@ -499,6 +771,11 @@ def judge_page(
             {
                 "filter_mode": filter_mode,
                 "score": score,
+                "link_density": link_density,
+                "heading_count": heading_count,
+                "paragraph_count": paragraph_count,
+                "link_only_block_ratio": link_only_block_ratio,
+                "nav_like_block_ratio": nav_like_block_ratio,
                 "reasons": reasons if reasons else [{"rule": "no_rule_match", "score": 0}],
             },
             ensure_ascii=False,
@@ -868,6 +1145,10 @@ def build_page_results(
             text_length=root_features["text_length"],
             link_count=root_features["link_count"],
             short_line_ratio=root_features["short_line_ratio"],
+            heading_count=root_features["heading_count"],
+            paragraph_count=root_features["paragraph_count"],
+            link_only_block_ratio=root_features["link_only_block_ratio"],
+            nav_like_block_ratio=root_features["nav_like_block_ratio"],
             page_scoring=page_scoring,
         )
         page_results.append(
@@ -953,6 +1234,10 @@ def build_page_results(
                 text_length=features["text_length"],
                 link_count=features["link_count"],
                 short_line_ratio=features["short_line_ratio"],
+                heading_count=features["heading_count"],
+                paragraph_count=features["paragraph_count"],
+                link_only_block_ratio=features["link_only_block_ratio"],
+                nav_like_block_ratio=features["nav_like_block_ratio"],
                 page_scoring=page_scoring,
             )
             page_info["score"] = judged["score"]
