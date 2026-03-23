@@ -4,35 +4,43 @@ import json
 import os
 import re
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
+import firebase_admin
 import requests
+import ulid
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 from fastapi import APIRouter, Header, HTTPException
+from firebase_admin import auth as fb_auth
 from google.cloud import storage
 from pydantic import BaseModel, Field
-
-import firebase_admin
-from firebase_admin import auth as fb_auth
-
-import ulid
-
 
 router = APIRouter(prefix="/public-url", tags=["public_url"])
 
 JST = ZoneInfo("Asia/Tokyo")
-
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 TEMPLATE_PREFIX = os.getenv("TEMPLATE_PREFIX", "template")
 PUBLIC_URL_CONFIG_NAME = "public_url.json"
 DEFAULT_TIMEOUT_SEC = 15
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; ank-bot/1.0)"
-}
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ank-bot/1.0)"}
+
+CONTENT_HINT_PATTERN = re.compile(
+    r"main|content|contents|article|entry|post|pagebody|section|honbun|detail|wrapper",
+    re.I,
+)
+NOISE_HINT_PATTERN = re.compile(
+    r"breadcrumb|pankuzu|topicpath|sidebar|side|sidemenu|localnav|globalnav|gnav|subnav|"
+    r"related|relation|share|sns|pagetop|search|utility|tool|header|footer|pickup|ranking|"
+    r"banner|bnr|advert|ad-|ad_|menu|navi|navigation",
+    re.I,
+)
+TOC_HINT_PATTERN = re.compile(r"目次|contents|index|ページ内リンク|このページ", re.I)
 
 
 class PublicUrlRequest(BaseModel):
@@ -49,6 +57,9 @@ class CrawlRule:
     include_root_page: bool
     max_depth: int
     max_pages: int
+    branch_first: bool
+    priority_keywords: list[str]
+    deprioritize_keywords: list[str]
 
 
 @dataclass
@@ -62,11 +73,7 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
-def get_public_url_blob_path() -> str:
-    return f"{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}"
-
-
-def ensure_firebase_initialized():
+def ensure_firebase_initialized() -> None:
     if firebase_admin._apps:
         return
     firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
@@ -105,11 +112,9 @@ def normalize_url(url: str) -> str:
     parsed = urlparse((url or "").strip())
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
-
     path = parsed.path or "/"
     if path != "/" and path.endswith("/"):
         path = path[:-1]
-
     query = f"?{parsed.query}" if parsed.query else ""
     return f"{scheme}://{netloc}{path}{query}"
 
@@ -124,7 +129,7 @@ def is_html_like_url(url: str) -> bool:
         ".pdf", ".zip", ".xls", ".xlsx", ".csv", ".json",
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
         ".doc", ".docx", ".ppt", ".pptx", ".xml",
-        ".mp3", ".mp4", ".avi", ".mov"
+        ".mp3", ".mp4", ".avi", ".mov",
     )
     return not lower.endswith(blocked_exts)
 
@@ -134,21 +139,16 @@ def load_public_url_config() -> dict[str, Any]:
         client = storage.Client()
         bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}")
-
         if not blob.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"config not found: gs://{BUCKET_NAME}/{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}"
+                detail=f"config not found: gs://{BUCKET_NAME}/{TEMPLATE_PREFIX}/{PUBLIC_URL_CONFIG_NAME}",
             )
-
         text = blob.download_as_text(encoding="utf-8")
         data = json.loads(text)
-
         if not isinstance(data, dict):
             raise HTTPException(status_code=500, detail="invalid json structure")
-
         return data
-
     except HTTPException:
         raise
     except json.JSONDecodeError as e:
@@ -159,28 +159,42 @@ def load_public_url_config() -> dict[str, Any]:
 
 def get_public_url_source(config: dict[str, Any], source_key: str) -> dict[str, Any]:
     sources = config.get("sources")
-
     if not isinstance(sources, list):
         raise HTTPException(status_code=500, detail="sources not found in config")
-
     for s in sources:
-        if not isinstance(s, dict):
-            continue
-        if str(s.get("source_key") or "").strip() == source_key:
+        if isinstance(s, dict) and str(s.get("source_key") or "").strip() == source_key:
             return s
-
     raise HTTPException(status_code=404, detail=f"source_key not found: {source_key}")
 
 
 def load_crawl_rule(config: dict[str, Any]) -> CrawlRule:
-    crawl_conf = config.get("crawl", {}) or {}
+    crawl_conf = config.get("crawl")
+    if not isinstance(crawl_conf, dict):
+        raise HTTPException(status_code=500, detail="crawl not found in public_url.json")
+
+    def as_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(x).strip().lower() for x in value if str(x).strip()]
 
     return CrawlRule(
         same_domain_only=bool(crawl_conf.get("same_domain_only", True)),
         include_root_page=bool(crawl_conf.get("include_root_page", False)),
-        max_depth=int(crawl_conf.get("max_depth", 3)),
+        max_depth=int(crawl_conf.get("max_depth", 4)),
         max_pages=int(crawl_conf.get("max_pages", 200)),
+        branch_first=bool(crawl_conf.get("branch_first", True)),
+        priority_keywords=as_list(crawl_conf.get("priority_keywords", [])),
+        deprioritize_keywords=as_list(crawl_conf.get("deprioritize_keywords", [])),
     )
+
+
+def load_page_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
+    page_scoring = config.get("page_scoring")
+    if not isinstance(page_scoring, dict):
+        raise HTTPException(status_code=500, detail="page_scoring not found in public_url.json")
+    if page_scoring.get("enabled") is not True:
+        raise HTTPException(status_code=500, detail="page_scoring.enabled must be true")
+    return page_scoring
 
 
 def get_source_url(source: dict[str, Any]) -> str:
@@ -190,40 +204,180 @@ def get_source_url(source: dict[str, Any]) -> str:
     return normalize_url(url)
 
 
-def fetch_html(url: str) -> str:
+def fetch_html_response(url: str) -> requests.Response:
     try:
         res = requests.get(url, headers=DEFAULT_HEADERS, timeout=DEFAULT_TIMEOUT_SEC)
         res.raise_for_status()
         res.encoding = res.apparent_encoding or res.encoding
-        return res.text
+        return res
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"public url fetch error: {e}")
 
 
+def fetch_html(url: str) -> str:
+    return fetch_html_response(url).text
+
+
+def get_tag_hint_text(tag: Any) -> str:
+    if tag is None or not isinstance(tag, Tag):
+        return ""
+    attrs = getattr(tag, "attrs", None)
+    if not isinstance(attrs, dict):
+        return ""
+    class_value = attrs.get("class")
+    if isinstance(class_value, list):
+        class_names = " ".join(str(x) for x in class_value if x)
+    elif class_value:
+        class_names = str(class_value)
+    else:
+        class_names = ""
+    tag_id = attrs.get("id", "") or ""
+    aria_label = attrs.get("aria-label", "") or ""
+    return f"{class_names} {tag_id} {aria_label}".strip()
+
+
+def remove_global_noise(soup: BeautifulSoup) -> None:
+    for tag in soup.select("script, style, noscript, svg, header, footer, nav, aside, form, iframe"):
+        if isinstance(tag, Tag):
+            tag.decompose()
+    for tag in list(soup.find_all(True)):
+        if not isinstance(tag, Tag):
+            continue
+        hint = get_tag_hint_text(tag)
+        if hint and NOISE_HINT_PATTERN.search(hint):
+            tag.decompose()
+
+
+def candidate_node_score(node: Tag) -> float:
+    text = " ".join(node.stripped_strings)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return 0.0
+    text_length = len(text)
+    paragraph_count = len([t for t in node.find_all(["p", "li", "dd", "dt"]) if len(" ".join(t.stripped_strings)) >= 30])
+    heading_count = len(node.find_all(["h1", "h2", "h3", "h4"]))
+    link_count = len(node.find_all("a", href=True))
+    score = float(text_length)
+    score += paragraph_count * 180.0
+    score += heading_count * 120.0
+    score -= link_count * 20.0
+    if text_length > 0:
+        score -= (link_count / text_length) * 5000.0
+    return score
+
+
+def find_best_main_node(soup: BeautifulSoup) -> Tag:
+    candidates: list[Tag] = []
+    explicit = [soup.find("main"), soup.find("article"), soup.find(attrs={"role": "main"})]
+    for node in explicit:
+        if isinstance(node, Tag):
+            candidates.append(node)
+    for tag in soup.find_all(["div", "section", "article", "main"]):
+        if not isinstance(tag, Tag):
+            continue
+        hint = get_tag_hint_text(tag)
+        if hint and CONTENT_HINT_PATTERN.search(hint):
+            candidates.append(tag)
+    if isinstance(soup.body, Tag):
+        candidates.append(soup.body)
+    unique_candidates: list[Tag] = []
+    seen_ids: set[int] = set()
+    for node in candidates:
+        node_id = id(node)
+        if node_id in seen_ids:
+            continue
+        seen_ids.add(node_id)
+        unique_candidates.append(node)
+    if not unique_candidates:
+        return soup.body if isinstance(soup.body, Tag) else soup
+    return max(unique_candidates, key=candidate_node_score)
+
+
+def remove_toc_like_nodes(main_node: Tag) -> None:
+    for tag in list(main_node.find_all(["ul", "ol", "div", "section", "nav"])):
+        if not isinstance(tag, Tag):
+            continue
+        text = " ".join(tag.stripped_strings)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        hint = get_tag_hint_text(tag)
+        link_count = len(tag.find_all("a", href=True))
+        li_count = len(tag.find_all("li"))
+        text_length = len(text)
+        if hint and TOC_HINT_PATTERN.search(hint) and link_count >= 3:
+            tag.decompose()
+            continue
+        if text_length > 0 and link_count >= 5 and li_count >= 3:
+            link_density = link_count / text_length
+            if link_density >= 0.04 and text_length <= 800:
+                tag.decompose()
+
+
 def extract_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
+    remove_global_noise(soup)
+    main_node = find_best_main_node(soup)
+    remove_toc_like_nodes(main_node)
+
     urls: list[str] = []
     seen: set[str] = set()
 
-    for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        if href.startswith("#"):
-            continue
+    def collect(anchor_root: Tag | BeautifulSoup) -> None:
+        for a in anchor_root.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith("#"):
+                continue
+            lower = href.lower()
+            if lower.startswith(("javascript:", "mailto:", "tel:")):
+                continue
+            abs_url = urljoin(base_url, href)
+            norm = normalize_url(abs_url)
+            if norm not in seen:
+                seen.add(norm)
+                urls.append(norm)
 
-        lower = href.lower()
-        if lower.startswith(("javascript:", "mailto:", "tel:")):
-            continue
-
-        abs_url = urljoin(base_url, href)
-        norm = normalize_url(abs_url)
-
-        if norm not in seen:
-            seen.add(norm)
-            urls.append(norm)
-
+    collect(main_node)
+    if len(urls) < 5:
+        collect(soup)
     return urls
+
+
+def root_path_prefix(url: str) -> str:
+    path = urlparse(url).path or "/"
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "/"
+    if len(parts) <= 2:
+        return "/" + "/".join(parts)
+    return "/" + "/".join(parts[:-1])
+
+
+def child_url_priority(url: str, target_url: str, rule: CrawlRule) -> int:
+    u = (url or "").lower()
+    score = 0
+
+    for kw in rule.priority_keywords:
+        if kw and kw in u:
+            score += 100
+    for kw in rule.deprioritize_keywords:
+        if kw and kw in u:
+            score -= 120
+
+    target_prefix = root_path_prefix(target_url).lower()
+    if target_prefix and target_prefix != "/" and target_prefix in u:
+        score += 40
+
+    path = urlparse(u).path
+    depth = len([x for x in path.split("/") if x])
+    score += min(depth, 10) * 4
+
+    if u.endswith(".html") or u.endswith(".htm"):
+        score += 8
+    if "index.html" in u:
+        score -= 3
+
+    return score
 
 
 def filter_child_urls(
@@ -233,7 +387,6 @@ def filter_child_urls(
     seen_urls: set[str],
 ) -> list[str]:
     result: list[str] = []
-
     for url in urls:
         if rule.same_domain_only and not same_domain(url, target_url):
             continue
@@ -243,241 +396,353 @@ def filter_child_urls(
             continue
         if url in seen_urls:
             continue
-
         seen_urls.add(url)
         result.append(url)
-
+    result.sort(key=lambda x: child_url_priority(x, target_url, rule), reverse=True)
     return result
 
 
-def extract_page_features(html: str) -> dict[str, Any]:
-    soup = BeautifulSoup(html, "html.parser")
+def calc_short_line_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    lines = []
+    for x in re.split(r"[。\n\r]+", text):
+        x = re.sub(r"\s+", " ", x).strip()
+        if x:
+            lines.append(x)
+    if not lines:
+        return 0.0
+    short_count = sum(1 for line in lines if len(line) <= 20)
+    return round(short_count / len(lines), 4)
 
+
+def collect_content_blocks(main_node: Tag) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for tag in main_node.find_all(["h1", "h2", "h3", "h4", "p", "li", "dd", "dt", "td", "th"]):
+        text = " ".join(tag.stripped_strings)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        anchor_text = " ".join(a.get_text(" ", strip=True) for a in tag.find_all("a", href=True))
+        anchor_text = re.sub(r"\s+", " ", anchor_text).strip()
+        link_count = len(tag.find_all("a", href=True))
+        is_heading = tag.name in {"h1", "h2", "h3", "h4"}
+        is_short = len(text) <= 20
+        is_link_only = bool(anchor_text) and anchor_text == text
+        is_nav_like = is_link_only or (link_count >= 2 and is_short)
+        blocks.append(
+            {
+                "tag": tag.name,
+                "text": text,
+                "length": len(text),
+                "link_count": link_count,
+                "is_heading": is_heading,
+                "is_link_only": is_link_only,
+                "is_nav_like": is_nav_like,
+            }
+        )
+    return blocks
+
+
+def parse_content_features(html: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
-
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    body = soup.body or soup
-    text = " ".join(body.stripped_strings)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    link_count = len(body.find_all("a", href=True))
+    remove_global_noise(soup)
+    main_node = find_best_main_node(soup)
+    remove_toc_like_nodes(main_node)
+    blocks = collect_content_blocks(main_node)
+    kept_blocks = [block["text"] for block in blocks if not block["is_link_only"]]
+    text = "\n".join(kept_blocks).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
     text_length = len(text)
-
+    link_count = sum(block["link_count"] for block in blocks if not block["is_nav_like"])
+    short_line_ratio = calc_short_line_ratio(text)
+    heading_count = sum(1 for block in blocks if block["is_heading"])
+    paragraph_count = sum(
+        1
+        for block in blocks
+        if block["tag"] in {"p", "li", "dd", "dt", "td", "th"} and block["length"] >= 30 and not block["is_link_only"]
+    )
+    block_count = len(blocks)
+    link_only_block_count = sum(1 for block in blocks if block["is_link_only"])
+    nav_like_block_count = sum(1 for block in blocks if block["is_nav_like"])
+    link_only_block_ratio = round(link_only_block_count / block_count, 4) if block_count > 0 else 0.0
+    nav_like_block_ratio = round(nav_like_block_count / block_count, 4) if block_count > 0 else 0.0
     return {
         "title": title,
         "text": text,
         "text_length": text_length,
         "link_count": link_count,
+        "short_line_ratio": short_line_ratio,
+        "heading_count": heading_count,
+        "paragraph_count": paragraph_count,
+        "block_count": block_count,
+        "link_only_block_ratio": link_only_block_ratio,
+        "nav_like_block_ratio": nav_like_block_ratio,
     }
 
 
-def judge_page(url: str, title: str, text: str, text_length: int, link_count: int) -> dict[str, Any]:
+def extract_page_features(html: str) -> dict[str, Any]:
+    return parse_content_features(html)
+
+
+def extract_main_content_text(html: str) -> str:
+    return parse_content_features(html)["text"]
+
+
+def apply_keyword_scores(target_text: str, keyword_scores: dict[str, Any], rule_name: str, reasons: list[dict[str, Any]]) -> int:
     score = 0
-    reasons: list[str] = []
+    if not target_text or not isinstance(keyword_scores, dict):
+        return 0
+    lower_text = target_text.lower()
+    for keyword, delta in keyword_scores.items():
+        try:
+            delta_int = int(delta)
+        except Exception:
+            continue
+        keyword_str = str(keyword)
+        if keyword_str.lower() in lower_text:
+            score += delta_int
+            reasons.append({"rule": rule_name, "matched": keyword_str, "score": delta_int})
+    return score
 
-    lower_url = url.lower()
-    lower_title = title.lower()
-    lower_text = text.lower()
 
-    faq_keywords = ["faq", "q&a", "qanda", "よくある質問", "質問", "回答"]
-    guide_keywords = ["手続き", "申請", "届出", "利用方法", "使い方", "必要書類", "準備", "案内", "方法"]
-    notice_keywords = ["お知らせ", "新着", "更新情報", "障害", "報道発表", "発生について", "掲載", "公表"]
+def apply_threshold_rule(value: float, rule_conf: dict[str, Any], rule_name: str, reasons: list[dict[str, Any]]) -> int:
+    if not isinstance(rule_conf, dict):
+        return 0
+    lt_value = rule_conf.get("lt")
+    gte_value = rule_conf.get("gte")
+    raw_score = rule_conf.get("score", 0)
+    try:
+        rule_score = int(raw_score)
+    except Exception:
+        return 0
+    matched = True
+    if lt_value is not None and not (value < float(lt_value)):
+        matched = False
+    if gte_value is not None and not (value >= float(gte_value)):
+        matched = False
+    if not matched:
+        return 0
+    reasons.append({"rule": rule_name, "value": value, "score": rule_score})
+    return rule_score
 
-    if any(k in lower_url for k in ["faq", "qanda", "guide", "help", "manual"]):
-        score += 20
-        reasons.append("url_keyword")
 
-    if any(k in lower_title for k in faq_keywords):
-        score += 40
-        reasons.append("title_faq")
+def apply_threshold_list(value: float, rule_list: list[dict[str, Any]], rule_name: str, reasons: list[dict[str, Any]]) -> int:
+    score = 0
+    if not isinstance(rule_list, list):
+        return 0
+    for item in rule_list:
+        if isinstance(item, dict):
+            score += apply_threshold_rule(value, item, rule_name, reasons)
+    return score
 
-    if any(k in title for k in guide_keywords):
-        score += 30
-        reasons.append("title_guide")
 
-    if any(k in title for k in notice_keywords):
-        score -= 40
-        reasons.append("title_notice")
+def apply_structure_scores(
+    text_length: int,
+    heading_count: int,
+    paragraph_count: int,
+    short_line_ratio: float,
+    link_only_block_ratio: float,
+    nav_like_block_ratio: float,
+    structure_rules: dict[str, Any],
+    reasons: list[dict[str, Any]],
+) -> int:
+    score = 0
+    score += apply_threshold_list(float(paragraph_count), structure_rules.get("paragraph_count", []), "paragraph_count", reasons)
+    score += apply_threshold_list(float(heading_count), structure_rules.get("heading_count", []), "heading_count", reasons)
+    score += apply_threshold_list(float(text_length), structure_rules.get("text_density", []), "text_density", reasons)
+    score += apply_threshold_list(float(short_line_ratio), structure_rules.get("sentence_ratio", []), "sentence_ratio", reasons)
+    score += apply_threshold_list(float(link_only_block_ratio), structure_rules.get("link_only_block_ratio", []), "link_only_block_ratio", reasons)
+    score += apply_threshold_list(float(nav_like_block_ratio), structure_rules.get("nav_like_block_ratio", []), "nav_like_block_ratio", reasons)
+    return score
 
-    qa_pattern_count = 0
-    for pat in [r"\bq\s*[:：]", r"\ba\s*[:：]"]:
-        qa_pattern_count += len(re.findall(pat, lower_text))
-    qa_pattern_count += text.count("質問")
-    qa_pattern_count += text.count("回答")
 
-    if qa_pattern_count >= 2:
-        score += 35
-        reasons.append("qa_pattern")
+def match_decision(score_value: int, conf: dict[str, Any]) -> bool:
+    if not isinstance(conf, dict):
+        return False
+    gte_value = conf.get("gte")
+    lt_value = conf.get("lt")
+    if gte_value is not None and score_value < int(gte_value):
+        return False
+    if lt_value is not None and score_value >= int(lt_value):
+        return False
+    return True
 
-    if any(k in text for k in guide_keywords):
-        score += 20
-        reasons.append("body_guide")
 
-    if text_length >= 1200:
-        score += 20
-        reasons.append("long_text")
-    elif text_length >= 500:
-        score += 10
-        reasons.append("enough_text")
-    elif text_length < 200:
-        score -= 25
-        reasons.append("too_short")
+def judge_page(
+    url: str,
+    title: str,
+    text: str,
+    text_length: int,
+    link_count: int,
+    short_line_ratio: float,
+    heading_count: int,
+    paragraph_count: int,
+    link_only_block_ratio: float,
+    nav_like_block_ratio: float,
+    page_scoring: dict[str, Any],
+) -> dict[str, Any]:
+    score = int(page_scoring.get("base_score", 0) or 0)
+    reasons: list[dict[str, Any]] = []
 
-    if link_count >= 20 and text_length < 1200:
-        score -= 20
-        reasons.append("link_heavy")
+    rules = page_scoring.get("rules", {}) or {}
+    thresholds = page_scoring.get("thresholds", {}) or {}
+    structure_rules = page_scoring.get("structure_rules", {}) or {}
+    decisions = page_scoring.get("decisions", {}) or {}
 
-    if "pdf" in lower_text and text_length < 400:
-        score -= 15
-        reasons.append("pdf_only_like")
+    keyword_total = 0
+    keyword_total += apply_keyword_scores(title or "", rules.get("title_keywords", {}) or {}, "title_keywords", reasons)
+    keyword_total += apply_keyword_scores(text or "", rules.get("body_keywords", {}) or {}, "body_keywords", reasons)
+    keyword_total += apply_keyword_scores(url or "", rules.get("url_keywords", {}) or {}, "url_keywords", reasons)
 
-    page_type = "unknown"
+    keyword_cap = int(page_scoring.get("keyword_cap", 0) or 0)
+    if keyword_cap > 0 and keyword_total > keyword_cap:
+        reasons.append({
+            "rule": "keyword_cap",
+            "score": keyword_cap - keyword_total,
+            "raw_keyword_score": keyword_total,
+            "applied_keyword_score": keyword_cap,
+        })
+        score += keyword_cap
+    else:
+        score += keyword_total
 
-    if any(k in title for k in notice_keywords):
-        page_type = "notice"
-    elif (
-        any(k in lower_title for k in ["一覧", "カテゴリ", "index", "list"])
-        or (link_count >= 10 and text_length < 1500)
-        or ("ヘルプ" in title and link_count >= 5)
-    ):
-        page_type = "list"
-    elif any(k in lower_title for k in faq_keywords) or qa_pattern_count >= 2:
-        page_type = "faq"
-    elif any(k in title for k in guide_keywords):
-        page_type = "guide"
+    min_text_length = thresholds.get("min_text_length")
+    if isinstance(min_text_length, dict):
+        score += apply_threshold_rule(float(text_length), min_text_length, "min_text_length", reasons)
 
-    if page_type == "list":
-        score = min(score, 60)
+    score += apply_threshold_list(float(text_length), thresholds.get("text_length_bonus", []) or [], "text_length_bonus", reasons)
 
-    score = max(0, min(100, score))
+    link_density = round(link_count / max(text_length, 1), 4) if text_length > 0 else 0.0
+    score += apply_threshold_list(link_density, thresholds.get("link_density", []) or [], "link_density", reasons)
+    score += apply_threshold_list(float(short_line_ratio), thresholds.get("short_line_ratio", []) or [], "short_line_ratio", reasons)
 
-    is_usable = 0
-    if page_type in ("faq", "guide") and score >= 40:
-        is_usable = 1
-    elif page_type == "unknown" and score >= 60 and text_length >= 500:
-        is_usable = 1
+    score += apply_structure_scores(
+        text_length=text_length,
+        heading_count=heading_count,
+        paragraph_count=paragraph_count,
+        short_line_ratio=short_line_ratio,
+        link_only_block_ratio=link_only_block_ratio,
+        nav_like_block_ratio=nav_like_block_ratio,
+        structure_rules=structure_rules,
+        reasons=reasons,
+    )
+
+    score = max(0, min(100, int(score)))
+
+    decision = str(page_scoring.get("default_decision") or "reject").strip() or "reject"
+    if match_decision(score, decisions.get("pass", {}) or {}):
+        decision = "pass"
+    elif match_decision(score, decisions.get("review", {}) or {}):
+        decision = "review"
+    elif match_decision(score, decisions.get("reject", {}) or {}):
+        decision = "reject"
+
+    filter_mode = str(page_scoring.get("filter_mode") or "score_only").strip()
+    is_usable = 1 if decision == "pass" else 0 if filter_mode == "active_filter" else 1 if decision in ("pass", "review") else 0
 
     return {
         "score": score,
-        "page_type": page_type,
+        "decision": decision,
         "is_usable": is_usable,
-        "judge_reason": ",".join(reasons) if reasons else "no_rule_match",
+        "decision_reason": json.dumps(
+            {
+                "filter_mode": filter_mode,
+                "score": score,
+                "link_density": link_density,
+                "heading_count": heading_count,
+                "paragraph_count": paragraph_count,
+                "link_only_block_ratio": link_only_block_ratio,
+                "nav_like_block_ratio": nav_like_block_ratio,
+                "reasons": reasons if reasons else [{"rule": "no_rule_match", "score": 0}],
+            },
+            ensure_ascii=False,
+        ),
     }
 
 
-def ensure_url_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS url_roots (
-          root_id TEXT PRIMARY KEY,
-          source_type TEXT NOT NULL,
-          root_url TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_roots_root_url
-        ON url_roots(root_url)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS url_pages (
-          page_id TEXT PRIMARY KEY,
-          root_id TEXT NOT NULL,
-          parent_page_id TEXT,
-          page_url TEXT NOT NULL,
-          depth INTEGER NOT NULL,
-          status TEXT NOT NULL,
-          child_count INTEGER NOT NULL DEFAULT 0,
-          score INTEGER NOT NULL DEFAULT 0,
-          page_type TEXT NOT NULL DEFAULT 'unknown',
-          is_usable INTEGER NOT NULL DEFAULT 0,
-          judge_reason TEXT,
-          created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_url_pages_root_page_url
-        ON url_pages(root_id, page_url)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_id
-        ON url_pages(root_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_parent_page_id
-        ON url_pages(parent_page_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_url_pages_root_depth
-        ON url_pages(root_id, depth)
-        """
-    )
-
-
-def find_page_row(
-    conn: sqlite3.Connection,
-    root_id: str,
-    page_url: str,
-) -> sqlite3.Row | None:
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     cur = conn.execute(
         """
-        SELECT *
-        FROM url_pages
-        WHERE root_id = ? AND page_url = ?
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
         """,
-        (root_id, page_url),
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def get_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table_name})")
+    rows = cur.fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def require_table_columns(conn: sqlite3.Connection, table_name: str, required_columns: list[str]) -> None:
+    if not table_exists(conn, table_name):
+        raise HTTPException(status_code=500, detail=f"required table not found: {table_name}")
+    actual_columns = get_table_columns(conn, table_name)
+    missing = [col for col in required_columns if col not in actual_columns]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"required columns not found in {table_name}: {', '.join(missing)}")
+
+
+def validate_public_url_schema(conn: sqlite3.Connection) -> None:
+    require_table_columns(conn, "url_roots", ["root_id", "source_type", "root_url", "created_at"])
+    require_table_columns(
+        conn,
+        "url_pages",
+        [
+            "page_id", "root_id", "parent_page_id", "page_url", "depth", "status", "child_count",
+            "title", "content_type", "http_status", "fetched_at", "text_length", "link_count",
+            "short_line_ratio", "score", "decision", "decision_reason", "is_usable", "created_at",
+        ],
+    )
+    require_table_columns(conn, "url_page_contents", ["content_id", "page_id", "content_text", "created_at"])
+
+
+def find_page_row(conn: sqlite3.Connection, root_id: str, page_url: str) -> sqlite3.Row | None:
+    cur = conn.execute("SELECT * FROM url_pages WHERE root_id = ? AND page_url = ?", (root_id, page_url))
+    return cur.fetchone()
+
+
+def find_page_with_root(conn: sqlite3.Connection, page_url: str) -> sqlite3.Row | None:
+    cur = conn.execute(
+        """
+        SELECT
+            p.page_id,
+            p.root_id,
+            p.page_url,
+            p.depth,
+            p.status,
+            p.decision,
+            p.is_usable,
+            r.source_type AS source_key,
+            r.root_url
+        FROM url_pages p
+        JOIN url_roots r ON p.root_id = r.root_id
+        WHERE p.page_url = ?
+        ORDER BY p.created_at DESC
+        LIMIT 1
+        """,
+        (page_url,),
     )
     return cur.fetchone()
 
 
-def insert_url_root_if_not_exists(
-    conn: sqlite3.Connection,
-    root_id: str,
-    source_type: str,
-    root_url: str,
-) -> str:
-    now = now_iso()
-
-    cur = conn.execute(
-        """
-        SELECT root_id
-        FROM url_roots
-        WHERE root_url = ?
-        """,
-        (root_url,),
-    )
+def insert_url_root_if_not_exists(conn: sqlite3.Connection, root_id: str, source_type: str, root_url: str) -> str:
+    cur = conn.execute("SELECT root_id FROM url_roots WHERE root_url = ?", (root_url,))
     row = cur.fetchone()
     if row:
         return row["root_id"]
-
     conn.execute(
-        """
-        INSERT INTO url_roots (
-            root_id,
-            source_type,
-            root_url,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (root_id, source_type, root_url, now),
+        "INSERT INTO url_roots (root_id, source_type, root_url, created_at) VALUES (?, ?, ?, ?)",
+        (root_id, source_type, root_url, now_iso()),
     )
     return root_id
 
@@ -490,48 +755,39 @@ def upsert_url_page(
     depth: int,
     status: str,
     child_count: int,
+    title: str | None,
+    content_type: str | None,
+    http_status: int | None,
+    fetched_at: str | None,
+    text_length: int,
+    link_count: int,
+    short_line_ratio: float,
     score: int,
-    page_type: str,
+    decision: str | None,
+    decision_reason: str | None,
     is_usable: int,
-    judge_reason: str | None,
 ) -> tuple[bool, str, str]:
-    now = now_iso()
     existing = find_page_row(conn, root_id, page_url)
-
     if existing:
         page_id = existing["page_id"]
-
         current_status = str(existing["status"] or "new")
         if current_status == "done":
             next_status = "done"
         elif status == "fetch_error":
             next_status = "fetch_error"
         else:
-            next_status = "new"
-
+            next_status = status
         conn.execute(
             """
             UPDATE url_pages
-               SET parent_page_id = ?,
-                   depth = ?,
-                   status = ?,
-                   child_count = ?,
-                   score = ?,
-                   page_type = ?,
-                   is_usable = ?,
-                   judge_reason = ?
+               SET parent_page_id = ?, depth = ?, status = ?, child_count = ?, title = ?, content_type = ?,
+                   http_status = ?, fetched_at = ?, text_length = ?, link_count = ?, short_line_ratio = ?,
+                   score = ?, decision = ?, decision_reason = ?, is_usable = ?
              WHERE page_id = ?
             """,
             (
-                parent_page_id,
-                depth,
-                next_status,
-                child_count,
-                score,
-                page_type,
-                is_usable,
-                judge_reason,
-                page_id,
+                parent_page_id, depth, next_status, child_count, title, content_type, http_status, fetched_at,
+                text_length, link_count, short_line_ratio, score, decision, decision_reason, is_usable, page_id,
             ),
         )
         return False, page_id, next_status
@@ -540,53 +796,46 @@ def upsert_url_page(
     conn.execute(
         """
         INSERT INTO url_pages (
-            page_id,
-            root_id,
-            parent_page_id,
-            page_url,
-            depth,
-            status,
-            child_count,
-            score,
-            page_type,
-            is_usable,
-            judge_reason,
-            created_at
+            page_id, root_id, parent_page_id, page_url, depth, status, child_count, title, content_type,
+            http_status, fetched_at, text_length, link_count, short_line_ratio, score, decision,
+            decision_reason, is_usable, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            page_id,
-            root_id,
-            parent_page_id,
-            page_url,
-            depth,
-            status,
-            child_count,
-            score,
-            page_type,
-            is_usable,
-            judge_reason,
-            now,
+            page_id, root_id, parent_page_id, page_url, depth, status, child_count, title, content_type,
+            http_status, fetched_at, text_length, link_count, short_line_ratio, score, decision,
+            decision_reason, is_usable, now_iso(),
         ),
     )
     return True, page_id, status
 
 
-def build_page_results(
-    target_url: str,
-    rule: CrawlRule,
-) -> list[dict[str, Any]]:
-    root_html = fetch_html(target_url)
-    root_links_all = extract_links(root_html, target_url)
+def replace_url_page_content(conn: sqlite3.Connection, page_id: str, content_text: str) -> tuple[str, bool]:
+    now = now_iso()
+    cur = conn.execute("SELECT content_id FROM url_page_contents WHERE page_id = ?", (page_id,))
+    row = cur.fetchone()
+    if row:
+        content_id = str(row["content_id"])
+        conn.execute(
+            "UPDATE url_page_contents SET content_text = ?, created_at = ? WHERE content_id = ?",
+            (content_text, now, content_id),
+        )
+        return content_id, False
+    content_id = make_id()
+    conn.execute(
+        "INSERT INTO url_page_contents (content_id, page_id, content_text, created_at) VALUES (?, ?, ?, ?)",
+        (content_id, page_id, content_text, now),
+    )
+    return content_id, True
 
+
+def build_page_results(target_url: str, rule: CrawlRule, page_scoring: dict[str, Any]) -> list[dict[str, Any]]:
+    root_res = fetch_html_response(target_url)
+    root_html = root_res.text
+    root_links_all = extract_links(root_html, target_url)
     seen_urls: set[str] = set()
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
-
-    stack: list[CrawlNode] = [
-        CrawlNode(url=url, parent_url=None, depth=1)
-        for url in reversed(level1_urls)
-    ]
 
     page_results: list[dict[str, Any]] = []
 
@@ -598,6 +847,12 @@ def build_page_results(
             text=root_features["text"],
             text_length=root_features["text_length"],
             link_count=root_features["link_count"],
+            short_line_ratio=root_features["short_line_ratio"],
+            heading_count=root_features["heading_count"],
+            paragraph_count=root_features["paragraph_count"],
+            link_only_block_ratio=root_features["link_only_block_ratio"],
+            nav_like_block_ratio=root_features["nav_like_block_ratio"],
+            page_scoring=page_scoring,
         )
         page_results.append(
             {
@@ -608,228 +863,114 @@ def build_page_results(
                 "depth": 0,
                 "status": "new",
                 "child_count": len(level1_urls),
+                "title": root_features["title"],
+                "content_type": root_res.headers.get("Content-Type", "text/html"),
+                "http_status": root_res.status_code,
+                "fetched_at": now_iso(),
+                "text_length": root_features["text_length"],
+                "link_count": root_features["link_count"],
+                "short_line_ratio": root_features["short_line_ratio"],
                 "score": root_judged["score"],
-                "page_type": root_judged["page_type"],
+                "decision": root_judged["decision"],
+                "decision_reason": root_judged["decision_reason"],
                 "is_usable": root_judged["is_usable"],
-                "judge_reason": root_judged["judge_reason"],
                 "created_at": now_iso(),
             }
         )
 
-    while stack and len(page_results) < rule.max_pages:
-        node = stack.pop()
+    if not rule.branch_first:
+        branch_seeds = list(reversed(level1_urls))
+        global_stack: list[CrawlNode] = [CrawlNode(url=u, parent_url=None, depth=1) for u in branch_seeds]
+        branch_groups: list[list[CrawlNode]] = [global_stack]
+    else:
+        branch_groups = [[CrawlNode(url=level1_url, parent_url=None, depth=1)] for level1_url in level1_urls]
 
-        page_info = {
-            "page_id": None,
-            "page_url": node.url,
-            "parent_url": node.parent_url,
-            "parent_page_id": None,
-            "depth": node.depth,
-            "status": "new",
-            "child_count": 0,
-            "score": 0,
-            "page_type": "unknown",
-            "is_usable": 0,
-            "judge_reason": None,
-            "created_at": now_iso(),
-        }
+    for branch_stack in branch_groups:
+        if len(page_results) >= rule.max_pages:
+            break
+        while branch_stack and len(page_results) < rule.max_pages:
+            node = branch_stack.pop()
+            page_info = {
+                "page_id": None,
+                "page_url": node.url,
+                "parent_url": node.parent_url,
+                "parent_page_id": None,
+                "depth": node.depth,
+                "status": "new",
+                "child_count": 0,
+                "title": "",
+                "content_type": None,
+                "http_status": None,
+                "fetched_at": None,
+                "text_length": 0,
+                "link_count": 0,
+                "short_line_ratio": 0.0,
+                "score": 0,
+                "decision": "reject",
+                "decision_reason": json.dumps({"score": 0, "reasons": [{"rule": "not_fetched", "score": 0}]}, ensure_ascii=False),
+                "is_usable": 0,
+                "created_at": now_iso(),
+            }
+            try:
+                res = fetch_html_response(node.url)
+                html = res.text
+                features = extract_page_features(html)
+                page_info["title"] = features["title"]
+                page_info["content_type"] = res.headers.get("Content-Type", "text/html")
+                page_info["http_status"] = res.status_code
+                page_info["fetched_at"] = now_iso()
+                page_info["text_length"] = features["text_length"]
+                page_info["link_count"] = features["link_count"]
+                page_info["short_line_ratio"] = features["short_line_ratio"]
 
-        try:
-            html = fetch_html(node.url)
-            features = extract_page_features(html)
+                child_urls: list[str] = []
+                if node.depth < rule.max_depth:
+                    child_urls_all = extract_links(html, node.url)
+                    child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+                page_info["child_count"] = len(child_urls)
 
-            child_urls: list[str] = []
-            if node.depth < rule.max_depth:
-                child_urls_all = extract_links(html, node.url)
-                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+                judged = judge_page(
+                    url=node.url,
+                    title=features["title"],
+                    text=features["text"],
+                    text_length=features["text_length"],
+                    link_count=features["link_count"],
+                    short_line_ratio=features["short_line_ratio"],
+                    heading_count=features["heading_count"],
+                    paragraph_count=features["paragraph_count"],
+                    link_only_block_ratio=features["link_only_block_ratio"],
+                    nav_like_block_ratio=features["nav_like_block_ratio"],
+                    page_scoring=page_scoring,
+                )
+                page_info["score"] = judged["score"]
+                page_info["decision"] = judged["decision"]
+                page_info["decision_reason"] = judged["decision_reason"]
+                page_info["is_usable"] = judged["is_usable"]
 
-            page_info["child_count"] = len(child_urls)
+                if node.depth < rule.max_depth:
+                    for child_url in reversed(child_urls):
+                        if len(page_results) + len(branch_stack) >= rule.max_pages:
+                            break
+                        branch_stack.append(CrawlNode(url=child_url, parent_url=node.url, depth=node.depth + 1))
 
-            judged = judge_page(
-                url=node.url,
-                title=features["title"],
-                text=features["text"],
-                text_length=features["text_length"],
-                link_count=features["link_count"],
-            )
-            page_info["score"] = judged["score"]
-            page_info["page_type"] = judged["page_type"]
-            page_info["is_usable"] = judged["is_usable"]
-            page_info["judge_reason"] = judged["judge_reason"]
-
-            if node.depth < rule.max_depth:
-                for child_url in reversed(child_urls):
-                    if len(page_results) + len(stack) >= rule.max_pages:
-                        break
-                    stack.append(
-                        CrawlNode(
-                            url=child_url,
-                            parent_url=node.url,
-                            depth=node.depth + 1,
-                        )
-                    )
-
-        except HTTPException:
-            page_info["status"] = "fetch_error"
-            page_info["score"] = 0
-            page_info["page_type"] = "unknown"
-            page_info["is_usable"] = 0
-            page_info["judge_reason"] = "fetch_error"
-
-        page_results.append(page_info)
+            except HTTPException:
+                page_info["status"] = "fetch_error"
+                page_info["decision"] = "reject"
+                page_info["is_usable"] = 0
+                page_info["decision_reason"] = json.dumps(
+                    {"score": 0, "reasons": [{"rule": "fetch_error", "score": 0}]},
+                    ensure_ascii=False,
+                )
+            page_results.append(page_info)
 
     return page_results
 
 
-def extract_main_content_blocks(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
-        tag.decompose()
-
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.find(id=re.compile("main|content|contents", re.I))
-        or soup.find(class_=re.compile("main|content|contents", re.I))
-        or soup.body
-        or soup
-    )
-
-    blocks: list[str] = []
-    seen: set[str] = set()
-
-    for tag in main.find_all(["h1", "h2", "h3", "h4", "p", "li", "dt", "dd", "th", "td"]):
-        text = " ".join(tag.stripped_strings)
-        text = re.sub(r"\s+", " ", text).strip()
-
-        if not text:
-            continue
-        if len(text) < 8:
-            continue
-        if text in seen:
-            continue
-
-        seen.add(text)
-        blocks.append(text)
-
-    if blocks:
-        return blocks
-
-    fallback_text = main.get_text("\n", strip=True)
-    lines = [re.sub(r"\s+", " ", x).strip() for x in fallback_text.splitlines()]
-    lines = [x for x in lines if len(x) >= 8]
-
-    return lines
-
-
-def merge_blocks_for_row_data(blocks: list[str], min_len: int = 80, max_len: int = 500) -> list[str]:
-    rows: list[str] = []
-    buffer = ""
-
-    for block in blocks:
-        block = re.sub(r"\s+", " ", block).strip()
-        if not block:
-            continue
-
-        if not buffer:
-            buffer = block
-            continue
-
-        if len(buffer) + 1 + len(block) <= max_len:
-            buffer += " " + block
-            continue
-
-        rows.append(buffer)
-        buffer = block
-
-    if buffer:
-        rows.append(buffer)
-
-    cleaned = [x.strip() for x in rows if x and len(x.strip()) >= 20]
-    return cleaned
-
-
-def find_page_with_root(conn: sqlite3.Connection, page_url: str) -> sqlite3.Row | None:
-    cur = conn.execute(
-        """
-        SELECT
-            p.page_id,
-            p.root_id,
-            p.page_url,
-            p.depth,
-            p.status,
-            p.page_type,
-            p.is_usable,
-            r.source_type AS source_key,
-            r.root_url
-        FROM url_pages p
-        JOIN url_roots r
-          ON p.root_id = r.root_id
-        WHERE p.page_url = ?
-        ORDER BY p.created_at DESC
-        LIMIT 1
-        """,
-        (page_url,),
-    )
-    return cur.fetchone()
-
-
-def replace_row_data_for_public_url(
-    conn: sqlite3.Connection,
-    file_id: str,
-    source_key: str,
-    source_item_id: str,
-    contents: list[str],
-) -> tuple[int, int]:
-    conn.execute(
-        """
-        DELETE FROM row_data
-        WHERE file_id = ?
-          AND source_type = 'public_url'
-        """,
-        (file_id,),
-    )
-
-    inserted = 0
-    skipped = 0
-    created_at = now_iso()
-
-    for idx, content in enumerate(contents, start=1):
-        row_source_item_id = f"{source_item_id}:{idx}"
-
-        conn.execute(
-            """
-            INSERT INTO row_data
-              (row_id, file_id, source_type, source_key, source_item_id, row_index, content, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                make_id(),
-                file_id,
-                "public_url",
-                source_key,
-                row_source_item_id,
-                idx,
-                content,
-                created_at,
-            ),
-        )
-        inserted += 1
-
-    return inserted, skipped
-
-
 @router.get("/sources")
-def get_public_url_sources(
-    authorization: str | None = Header(default=None),
-):
-    # 認証（他と同じ）
+def get_public_url_sources(authorization: str | None = Header(default=None)):
     get_uid_from_auth_header(authorization)
-
     config = load_public_url_config()
     sources = config.get("sources") or []
-
     return {
         "source_type": "public_url",
         "sources": [
@@ -840,32 +981,25 @@ def get_public_url_sources(
             }
             for s in sources
             if isinstance(s, dict)
-        ]
+        ],
     }
 
 
 @router.post("/register")
-async def public_url_register(
-    req: PublicUrlRequest,
-    authorization: str | None = Header(default=None),
-):
+async def public_url_register(req: PublicUrlRequest, authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
-
     config = load_public_url_config()
     source = get_public_url_source(config, req.source_key)
     rule = load_crawl_rule(config)
+    page_scoring = load_page_scoring_config(config)
     target_url = get_source_url(source)
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
-
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
-        )
+        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
 
     local_db_path = f"/tmp/ank_{uid}_public_url.db"
     db_blob.download_to_filename(local_db_path)
@@ -876,30 +1010,15 @@ async def public_url_register(
     result_pages: list[dict[str, Any]] = []
 
     try:
-        page_results = build_page_results(
-            target_url=target_url,
-            rule=rule,
-        )
-
+        page_results = build_page_results(target_url=target_url, rule=rule, page_scoring=page_scoring)
         conn = sqlite3.connect(local_db_path)
         conn.row_factory = sqlite3.Row
         try:
-            ensure_url_tables(conn)
-
-            root_id = insert_url_root_if_not_exists(
-                conn=conn,
-                root_id=root_id,
-                source_type=req.source_key,
-                root_url=target_url,
-            )
-
+            validate_public_url_schema(conn)
+            root_id = insert_url_root_if_not_exists(conn=conn, root_id=root_id, source_type=req.source_key, root_url=target_url)
             url_to_page_id: dict[str, str] = {}
-
             for page in page_results:
-                parent_page_id = None
-                if page["parent_url"]:
-                    parent_page_id = url_to_page_id.get(page["parent_url"])
-
+                parent_page_id = url_to_page_id.get(page["parent_url"]) if page["parent_url"] else None
                 inserted, actual_page_id, actual_status = upsert_url_page(
                     conn=conn,
                     root_id=root_id,
@@ -908,34 +1027,38 @@ async def public_url_register(
                     depth=page["depth"],
                     status=page["status"],
                     child_count=page["child_count"],
+                    title=page["title"],
+                    content_type=page["content_type"],
+                    http_status=page["http_status"],
+                    fetched_at=page["fetched_at"],
+                    text_length=page["text_length"],
+                    link_count=page["link_count"],
+                    short_line_ratio=page["short_line_ratio"],
                     score=page["score"],
-                    page_type=page["page_type"],
+                    decision=page["decision"],
+                    decision_reason=page["decision_reason"],
                     is_usable=page["is_usable"],
-                    judge_reason=page["judge_reason"],
                 )
-
                 url_to_page_id[page["page_url"]] = actual_page_id
-
-                if inserted:
-                    row_inserted += 1
-                else:
-                    row_skipped += 1
-
+                row_inserted += 1 if inserted else 0
+                row_skipped += 0 if inserted else 1
                 page["page_id"] = actual_page_id
                 page["parent_page_id"] = parent_page_id
                 page["status"] = actual_status
                 result_pages.append(page)
-
             conn.commit()
         finally:
             conn.close()
-
         db_blob.upload_from_filename(local_db_path)
-
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"public_url register failed: {type(e).__name__}: {e}\n{traceback.format_exc()}",
+        )
 
     for page in result_pages:
         page.pop("parent_url", None)
@@ -956,23 +1079,16 @@ async def public_url_register(
 
 
 @router.post("/decompose")
-async def public_url_decompose(
-    req: PublicUrlDecomposeRequest,
-    authorization: str | None = Header(default=None),
-):
+async def public_url_decompose(req: PublicUrlDecomposeRequest, authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
     page_url = normalize_url(req.page_url)
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
-
     db_gcs_path = user_db_path(uid)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}"
-        )
+        raise HTTPException(status_code=400, detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}")
 
     local_db_path = f"/tmp/ank_{uid}_public_url.db"
     db_blob.download_to_filename(local_db_path)
@@ -981,57 +1097,37 @@ async def public_url_decompose(
         conn = sqlite3.connect(local_db_path)
         conn.row_factory = sqlite3.Row
         try:
-            ensure_url_tables(conn)
-
+            validate_public_url_schema(conn)
             page_row = find_page_with_root(conn, page_url)
             if not page_row:
                 raise HTTPException(status_code=404, detail="page not found")
 
             html = fetch_html(page_url)
-            raw_blocks = extract_main_content_blocks(html)
-            contents = merge_blocks_for_row_data(raw_blocks)
-
-            if not contents:
+            content_text = extract_main_content_text(html)
+            if not content_text:
                 raise HTTPException(status_code=400, detail="no content extracted")
 
-            row_count, skipped_count = replace_row_data_for_public_url(
-                conn=conn,
-                file_id=str(page_row["page_id"]),
-                source_key=str(page_row["source_key"]),
-                source_item_id=page_url,
-                contents=contents,
-            )
-
-            conn.execute(
-                """
-                UPDATE url_pages
-                   SET status = 'done'
-                 WHERE page_id = ?
-                """,
-                (str(page_row["page_id"]),),
-            )
-
+            content_id, inserted = replace_url_page_content(conn=conn, page_id=str(page_row["page_id"]), content_text=content_text)
+            conn.execute("UPDATE url_pages SET status = 'done' WHERE page_id = ?", (str(page_row["page_id"]),))
             conn.commit()
         finally:
             conn.close()
-
         db_blob.upload_from_filename(local_db_path)
-
         return {
             "mode": "public_url_decompose",
             "page_url": page_url,
-            "file_id": str(page_row["page_id"]),
+            "page_id": str(page_row["page_id"]),
+            "content_id": content_id,
             "source_key": str(page_row["source_key"]),
-            "row_count": row_count,
-            "qa_count": 0,
-            "text_count": row_count,
-            "skipped_count": skipped_count,
-            "message": "public url decomposed into row_data",
+            "content_length": len(content_text),
+            "inserted": inserted,
+            "message": "public url content saved",
         }
-
     except HTTPException:
         raise
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"sqlite integrity error: {e}")
     except sqlite3.Error as e:
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"public_url decompose failed: {type(e).__name__}: {e}")
