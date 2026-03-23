@@ -294,10 +294,14 @@ def calc_short_line_ratio(text: str) -> float:
 
 
 def get_tag_hint_text(tag: Any) -> str:
-    if tag is None or not hasattr(tag, "get"):
+    if tag is None or not isinstance(tag, Tag):
         return ""
 
-    class_value = tag.get("class")
+    attrs = getattr(tag, "attrs", None)
+    if not isinstance(attrs, dict):
+        return ""
+
+    class_value = attrs.get("class")
     if isinstance(class_value, list):
         class_names = " ".join(str(x) for x in class_value if x)
     elif class_value:
@@ -305,8 +309,8 @@ def get_tag_hint_text(tag: Any) -> str:
     else:
         class_names = ""
 
-    tag_id = tag.get("id", "") or ""
-    aria_label = tag.get("aria-label", "") or ""
+    tag_id = attrs.get("id", "") or ""
+    aria_label = attrs.get("aria-label", "") or ""
 
     return f"{class_names} {tag_id} {aria_label}".strip()
 
