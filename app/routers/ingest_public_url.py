@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -136,7 +137,7 @@ def is_html_like_url(url: str) -> bool:
         ".pdf", ".zip", ".xls", ".xlsx", ".csv", ".json",
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
         ".doc", ".docx", ".ppt", ".pptx", ".xml",
-        ".mp3", ".mp4", ".avi", ".mov"
+        ".mp3", ".mp4", ".avi", ".mov",
     )
     return not lower.endswith(blocked_exts)
 
@@ -302,7 +303,7 @@ def remove_global_noise(soup: BeautifulSoup) -> None:
     for tag in soup.select("script, style, noscript, svg, header, footer, nav, aside, form, iframe"):
         tag.decompose()
 
-    for tag in soup.find_all(True):
+    for tag in list(soup.find_all(True)):
         hint = get_tag_hint_text(tag)
         if hint and NOISE_HINT_PATTERN.search(hint):
             tag.decompose()
@@ -316,7 +317,9 @@ def candidate_node_score(node: Tag) -> float:
         return 0.0
 
     text_length = len(text)
-    paragraph_count = len([t for t in node.find_all(["p", "li", "dd", "dt"]) if len(" ".join(t.stripped_strings)) >= 30])
+    paragraph_count = len(
+        [t for t in node.find_all(["p", "li", "dd", "dt"]) if len(" ".join(t.stripped_strings)) >= 30]
+    )
     heading_count = len(node.find_all(["h1", "h2", "h3", "h4"]))
     link_count = len(node.find_all("a", href=True))
 
@@ -367,7 +370,7 @@ def find_best_main_node(soup: BeautifulSoup) -> Tag:
 
 
 def remove_toc_like_nodes(main_node: Tag) -> None:
-    for tag in main_node.find_all(["ul", "ol", "div", "section", "nav"]):
+    for tag in list(main_node.find_all(["ul", "ol", "div", "section", "nav"])):
         text = " ".join(tag.stripped_strings)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
@@ -435,11 +438,7 @@ def parse_content_features(html: str) -> dict[str, Any]:
 
     blocks = collect_content_blocks(main_node)
 
-    kept_blocks = [
-        block["text"]
-        for block in blocks
-        if not block["is_link_only"]
-    ]
+    kept_blocks = [block["text"] for block in blocks if not block["is_link_only"]]
 
     text = "\n".join(kept_blocks).strip()
     text = re.sub(r"\n{3,}", "\n\n", text)
