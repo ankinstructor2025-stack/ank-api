@@ -292,18 +292,32 @@ def calc_short_line_ratio(text: str) -> float:
     return round(short_count / len(lines), 4)
 
 
-def get_tag_hint_text(tag: Tag) -> str:
-    class_names = " ".join(tag.get("class", [])) if tag.get("class") else ""
+def get_tag_hint_text(tag: Any) -> str:
+    if tag is None or not hasattr(tag, "get"):
+        return ""
+
+    class_value = tag.get("class")
+    if isinstance(class_value, list):
+        class_names = " ".join(str(x) for x in class_value if x)
+    elif class_value:
+        class_names = str(class_value)
+    else:
+        class_names = ""
+
     tag_id = tag.get("id", "") or ""
     aria_label = tag.get("aria-label", "") or ""
+
     return f"{class_names} {tag_id} {aria_label}".strip()
 
 
 def remove_global_noise(soup: BeautifulSoup) -> None:
     for tag in soup.select("script, style, noscript, svg, header, footer, nav, aside, form, iframe"):
-        tag.decompose()
+        if isinstance(tag, Tag):
+            tag.decompose()
 
     for tag in list(soup.find_all(True)):
+        if not isinstance(tag, Tag):
+            continue
         hint = get_tag_hint_text(tag)
         if hint and NOISE_HINT_PATTERN.search(hint):
             tag.decompose()
@@ -347,16 +361,20 @@ def find_best_main_node(soup: BeautifulSoup) -> Tag:
             candidates.append(node)
 
     for tag in soup.find_all(["div", "section", "article", "main"]):
+        if not isinstance(tag, Tag):
+            continue
         hint = get_tag_hint_text(tag)
         if hint and CONTENT_HINT_PATTERN.search(hint):
             candidates.append(tag)
 
-    if soup.body:
+    if isinstance(soup.body, Tag):
         candidates.append(soup.body)
 
     unique_candidates: list[Tag] = []
     seen_ids: set[int] = set()
     for node in candidates:
+        if not isinstance(node, Tag):
+            continue
         node_id = id(node)
         if node_id in seen_ids:
             continue
@@ -364,13 +382,21 @@ def find_best_main_node(soup: BeautifulSoup) -> Tag:
         unique_candidates.append(node)
 
     if not unique_candidates:
-        return soup.body or soup
+        if isinstance(soup.body, Tag):
+            return soup.body
+        return soup
 
     return max(unique_candidates, key=candidate_node_score)
 
 
 def remove_toc_like_nodes(main_node: Tag) -> None:
+    if not isinstance(main_node, Tag):
+        return
+
     for tag in list(main_node.find_all(["ul", "ol", "div", "section", "nav"])):
+        if not isinstance(tag, Tag):
+            continue
+
         text = " ".join(tag.stripped_strings)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
