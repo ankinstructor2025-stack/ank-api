@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
+import traceback
 
 import firebase_admin
 import requests
@@ -1427,7 +1428,7 @@ async def public_url_register(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"public_url register failed: {type(e).__name__}: {e}",
+            detail=f"public_url register failed: {type(e).__name__}: {e}\n{traceback.format_exc()}",
         )
 
     for page in result_pages:
