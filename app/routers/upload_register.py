@@ -12,7 +12,7 @@ from firebase_admin import auth as fb_auth
 import ulid
 
 
-router = APIRouter()
+router = APIRouter(prefix="/upload", tags=["upload"])
 JST = ZoneInfo("Asia/Tokyo")
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
