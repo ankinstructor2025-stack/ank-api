@@ -1476,7 +1476,7 @@ def create_upload_job(
             file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
             if not file_row:
                 raise HTTPException(status_code=400, detail=f"upload_files not found: {item.parent_source_id or ''}")
-            file_ext = normalize_text(file_row["ext"]).lower()
+            raw_ext = normalize_text(file_row["ext"]).lower()
             file_ext = normalize_upload_chunk_ext(raw_ext.split(".")[-1])
             qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "qa")
             plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "plain")
