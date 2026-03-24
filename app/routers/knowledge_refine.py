@@ -425,6 +425,28 @@ def upsert_knowledge_meta(
     )
 
 
+def insert_knowledge_db_row(
+    conn: sqlite3.Connection,
+    database_name: str,
+    source_type: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO knowledge_db (
+            database_name,
+            source_type,
+            created_at
+        )
+        VALUES (?, ?, ?)
+        """,
+        (
+            database_name,
+            source_type,
+            now_jst_iso(),
+        ),
+    )
+
+
 def build_knowledge_db_for_job(
     conn: sqlite3.Connection,
     uid: str,
@@ -610,12 +632,27 @@ def build_knowledge_db_for_job(
 
     gcs_path = upload_knowledge_db(uid, local_knowledge_db_path, filename)
 
+    job_row = ensure_job_exists(conn, job_id)
+    source_type = str(job_row["source_type"] or "").strip()
+    if not source_type:
+        raise HTTPException(
+            status_code=500,
+            detail=f"source_type not found for job_id={job_id}",
+        )
+
+    insert_knowledge_db_row(
+        conn=conn,
+        database_name=filename,
+        source_type=source_type,
+    )
+
     return {
         "filename": filename,
         "gcs_path": gcs_path,
         "entry_count": entry_count,
         "qa_count": qa_count,
         "plain_count": plain_count,
+        "source_type": source_type,
     }
 
 
