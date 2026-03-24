@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header, Query
 from fastapi.responses import StreamingResponse
+from urllib.parse import quote
 import io
 import os
 import sqlite3
@@ -19,8 +20,8 @@ def user_db_path(uid: str) -> str:
     return f"users/{uid}/ank.db"
 
 
-def build_upload_blob_path(uid: str, file_id: str, original_name: str) -> str:
-    return f"users/{uid}/uploads/{file_id}_{original_name}"
+def build_upload_blob_path(uid: str, file_id: str, file_name: str) -> str:
+    return f"users/{uid}/uploads/{file_id}_{file_name}"
 
 
 def ensure_firebase_initialized():
@@ -81,8 +82,7 @@ def fetch_upload_file_rows(uid: str) -> list[dict]:
             """
             SELECT
               file_id,
-              logical_name,
-              original_name,
+              file_name,
               ext,
               created_at
             FROM upload_files
@@ -113,8 +113,7 @@ def fetch_upload_file_row(uid: str, file_id: str) -> dict:
             """
             SELECT
               file_id,
-              logical_name,
-              original_name,
+              file_name,
               ext,
               created_at
             FROM upload_files
@@ -154,7 +153,7 @@ def upload_files(
 
     files = []
     for row in rows:
-        gcs_path = build_upload_blob_path(uid, row["file_id"], row["original_name"])
+        gcs_path = build_upload_blob_path(uid, row["file_id"], row["file_name"])
         blob = bucket.blob(gcs_path)
 
         file_size = None
@@ -168,9 +167,8 @@ def upload_files(
         files.append(
             {
                 "file_id": row["file_id"],
-                "title": row["logical_name"],
-                "logical_name": row["logical_name"],
-                "original_name": row["original_name"],
+                "title": row["file_name"],
+                "file_name": row["file_name"],
                 "ext": row["ext"],
                 "created_at": row["created_at"],
                 "gcs_path": gcs_path,
@@ -200,7 +198,7 @@ def upload_download(
 
     row = fetch_upload_file_row(uid, file_id)
 
-    gcs_path = build_upload_blob_path(uid, row["file_id"], row["original_name"])
+    gcs_path = build_upload_blob_path(uid, row["file_id"], row["file_name"])
     blob = bucket.blob(gcs_path)
 
     if not blob.exists():
@@ -208,7 +206,7 @@ def upload_download(
 
     binary = blob.download_as_bytes()
 
-    filename = row["original_name"] or row["logical_name"] or f"{file_id}"
+    file_name = row["file_name"] or f"{file_id}"
     media_type = "application/octet-stream"
 
     ext = (row.get("ext") or "").lower()
@@ -221,8 +219,19 @@ def upload_download(
     elif ext == "pdf":
         media_type = "application/pdf"
 
+    # 日本語ファイル名で落ちにくいようにする
+    safe_ascii_name = "download.bin"
+    if "." in file_name:
+        ext2 = file_name.rsplit(".", 1)[-1]
+        safe_ascii_name = f"download.{ext2}"
+
+    quoted_name = quote(file_name)
+
     headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
+        "Content-Disposition": (
+            f"attachment; filename=\"{safe_ascii_name}\"; "
+            f"filename*=UTF-8''{quoted_name}"
+        )
     }
 
     return StreamingResponse(

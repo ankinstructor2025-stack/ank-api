@@ -62,9 +62,8 @@ async def upload_and_register(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    original_filename = file.filename
-    logical_name = original_filename
-    ext = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else ""
+    file_name = file.filename
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
 
     file_id = str(ulid.new())
 
@@ -76,7 +75,7 @@ async def upload_and_register(
     if not db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found"
+            detail="ank.db not found"
         )
 
     db_blob.download_to_filename(local_db_path)
@@ -87,18 +86,19 @@ async def upload_and_register(
         conn = sqlite3.connect(local_db_path)
         cur = conn.cursor()
 
-        # 同名チェック
+        # ✅ 同名チェック（file_name）
         cur.execute("""
             SELECT 1
             FROM upload_files
-            WHERE original_name = ?
+            WHERE file_name = ?
             LIMIT 1
-        """, (original_filename,))
+        """, (file_name,))
         if cur.fetchone():
             conn.close()
             raise HTTPException(status_code=409, detail="同名ファイルはアップロードできません")
 
-        upload_blob_path = f"users/{uid}/uploads/{file_id}_{original_filename}"
+        # ⚠ GCSパスは一旦現状維持（壊さない）
+        upload_blob_path = f"users/{uid}/uploads/{file_id}_{file_name}"
         upload_blob = bucket.blob(upload_blob_path)
 
         file.file.seek(0)
@@ -109,13 +109,12 @@ async def upload_and_register(
         cur.execute(
             """
             INSERT INTO upload_files
-            (file_id, logical_name, original_name, ext, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            (file_id, file_name, ext, created_at)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 file_id,
-                logical_name,
-                original_filename,
+                file_name,
                 ext,
                 created_at,
             ),
@@ -128,8 +127,7 @@ async def upload_and_register(
 
         return {
             "file_id": file_id,
-            "logical_name": logical_name,
-            "original_filename": original_filename,
+            "file_name": file_name,
             "ext": ext,
             "created_at": created_at,
             "gcs_path": upload_blob_path
