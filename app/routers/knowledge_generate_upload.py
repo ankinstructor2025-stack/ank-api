@@ -12,8 +12,10 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
 from google.cloud import storage
 from pydantic import BaseModel, Field
 
-from .content_detector import normalize_text
+from .content_detector import detect_content_kind, normalize_text
+from .content_splitter_csv import split_csv_records
 from .content_splitter_pdf import split_pdf_records
+from .content_splitter_text import split_text_records
 from .knowledge_generate_common import (
     fetch_job_row,
     fetch_next_new_job_item,
@@ -35,6 +37,7 @@ from .knowledge_generate_common import (
 )
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_llm_client import run_chunked_llm_json
+from .openai_prompt_builder import build_upload_prompt_text
 
 logger = logging.getLogger(__name__)
 
@@ -118,20 +121,32 @@ class KnowledgeRunRequest(BaseModel):
     job_id: str
 
 
-def get_required_upload_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
-    upload_conf = chunk_config.get("upload")
-    if not isinstance(upload_conf, dict):
-        raise HTTPException(status_code=500, detail="openai_chunk.json: upload section not found")
+def normalize_upload_chunk_ext(ext: str | None) -> str:
+    ext_norm = normalize_text(ext).lower()
+    if ext_norm in {"txt", "text", "md", "markdown", "log", "tsv", "html", "htm"}:
+        return "txt"
+    return ext_norm
 
-    conf = upload_conf.get(prompt_type)
+
+def get_required_upload_chunk_conf(chunk_config: dict, ext: str, prompt_type: str) -> ChunkConfig:
+    upload_conf = chunk_config.get("file_upload")
+    if not isinstance(upload_conf, dict):
+        raise HTTPException(status_code=500, detail="openai_chunk.json: file_upload section not found")
+
+    ext_key = normalize_upload_chunk_ext(ext)
+    ext_conf = upload_conf.get(ext_key)
+    if not isinstance(ext_conf, dict):
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: file_upload.{ext_key} section not found")
+
+    conf = ext_conf.get(prompt_type)
     if not isinstance(conf, dict):
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type} section not found")
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: file_upload.{ext_key}.{prompt_type} section not found")
 
     missing = [key for key in ("max_chars", "max_items", "overlap_items") if key not in conf]
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"openai_chunk.json: upload.{prompt_type} missing keys: {', '.join(missing)}",
+            detail=f"openai_chunk.json: file_upload.{ext_key}.{prompt_type} missing keys: {', '.join(missing)}",
         )
 
     try:
@@ -141,15 +156,15 @@ def get_required_upload_chunk_conf(chunk_config: dict, prompt_type: str) -> Chun
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"openai_chunk.json: invalid upload.{prompt_type} values: {e}",
+            detail=f"openai_chunk.json: invalid file_upload.{ext_key}.{prompt_type} values: {e}",
         )
 
     if max_chars <= 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.max_chars must be > 0")
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: file_upload.{ext_key}.{prompt_type}.max_chars must be > 0")
     if max_items <= 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.max_items must be > 0")
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: file_upload.{ext_key}.{prompt_type}.max_items must be > 0")
     if overlap_items < 0:
-        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.overlap_items must be >= 0")
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: file_upload.{ext_key}.{prompt_type}.overlap_items must be >= 0")
 
     return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
@@ -297,48 +312,8 @@ def fetch_upload_content_rows(conn: sqlite3.Connection, job_item_id: str) -> lis
     return cur.fetchall()
 
 
-def build_upload_prompt_text(
-    *,
-    job_item_id: str,
-    prompt_template: str,
-    chunk: Any,
-    parent_source_id: str | None,
-    parent_key1: str | None,
-    parent_key2: str | None,
-    parent_label: str | None,
-    row_count: int,
-) -> str:
-    chunk_rows = getattr(chunk, "items", chunk)
-
-    lines: list[str] = []
-    for row in chunk_rows:
-        text = normalize_text(row["content_text"] if isinstance(row, sqlite3.Row) else row.get("content_text"))
-        if not text:
-            continue
-        sort_no = row["sort_no"] if isinstance(row, sqlite3.Row) else row.get("sort_no")
-        lines.append(f"[{sort_no}] {text}")
-
-    input_text = "\n\n".join(lines).strip()
-    if not input_text:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents text empty after chunk build: {job_item_id}")
-
-    return (
-        f"対象: {parent_label or parent_source_id or ''}\n"
-        f"job_item_id: {job_item_id}\n\n"
-        f"{prompt_template}\n\n"
-        f"【ファイル情報】\n"
-        f"file_id: {parent_source_id or ''}\n"
-        f"file_name: {parent_key1 or ''}\n"
-        f"ext: {parent_key2 or ''}\n"
-        f"label: {parent_label or ''}\n"
-        f"row_count: {row_count}\n"
-        f"job_item_id: {job_item_id}\n\n"
-        f"【入力テキスト】\n"
-        f"{input_text}\n"
-    )
-
-
 def build_upload_prompt_texts(
+
     conn: sqlite3.Connection,
     job_item_id: str,
     template_text: str,
@@ -363,10 +338,9 @@ def build_upload_prompt_texts(
                 job_item_id=job_item_id,
                 prompt_template=template_text.strip(),
                 chunk=chunk,
-                parent_source_id=item["parent_source_id"],
-                parent_key1=item["parent_key1"],
-                parent_key2=item["parent_key2"],
-                parent_label=item["parent_label"],
+                file_name=item["parent_key1"],
+                file_type=item["parent_key2"],
+                source_label=item["parent_label"],
                 row_count=item["row_count"],
             )
         )
@@ -621,9 +595,10 @@ def build_upload_records_from_blob(file_row: sqlite3.Row, file_bytes: bytes) -> 
     file_id = file_row["file_id"]
     file_name = file_row["file_name"] or ""
     ext = normalize_text(file_row["ext"]).lower()
+    kind = detect_content_kind(filename=file_name, declared_format=ext)
     records: list[dict[str, Any]] = []
 
-    if ext == "pdf":
+    if kind == "pdf":
         pages = split_pdf_records(file_bytes)
         for page in pages:
             text = normalize_text(page.get("text"))
@@ -639,25 +614,23 @@ def build_upload_records_from_blob(file_row: sqlite3.Row, file_bytes: bytes) -> 
             )
         return records
 
-    text = decode_text_bytes(file_bytes)
+    if kind == "csv":
+        rows = split_csv_records(file_bytes)
+        for idx, row in enumerate(rows, start=1):
+            content_text = extract_structured_text(row)
+            if not content_text:
+                continue
+            records.append(
+                {
+                    "source_item_id": f"{file_id}#row={idx}",
+                    "row_id": f"{file_id}:{idx}",
+                    "content_text": f"[FILE] {file_name}\n[ROW] {idx}\n{content_text}",
+                }
+            )
+        return records
 
-    if ext == "csv":
-        reader = csv.DictReader(io.StringIO(text))
-        if reader.fieldnames:
-            for idx, row in enumerate(reader, start=1):
-                content_text = extract_structured_text(row)
-                if not content_text:
-                    continue
-                records.append(
-                    {
-                        "source_item_id": f"{file_id}#row={idx}",
-                        "row_id": f"{file_id}:{idx}",
-                        "content_text": f"[FILE] {file_name}\n[ROW] {idx}\n{content_text}",
-                    }
-                )
-            return records
-
-    if ext == "json":
+    if kind == "json":
+        text = decode_text_bytes(file_bytes)
         try:
             obj = json.loads(text)
         except Exception as e:
@@ -677,24 +650,27 @@ def build_upload_records_from_blob(file_row: sqlite3.Row, file_bytes: bytes) -> 
             )
         return records
 
-    line_no = 1
-    for raw_line in text.splitlines():
-        line = normalize_text(raw_line)
-        if not line:
+    text_records = split_text_records(file_bytes)
+    for idx, record in enumerate(text_records, start=1):
+        content_text = extract_structured_text(record.get("text") or record)
+        if not content_text:
             continue
+        title = normalize_text(record.get("title"))
+        prefix = f"[FILE] {file_name}\n"
+        if title:
+            prefix += f"[TITLE] {title}\n"
         records.append(
             {
-                "source_item_id": f"{file_id}#line={line_no}",
-                "row_id": f"{file_id}:{line_no}",
-                "content_text": f"[FILE] {file_name}\n[LINE] {line_no}\n{line}",
+                "source_item_id": f"{file_id}#row={idx}",
+                "row_id": f"{file_id}:{idx}",
+                "content_text": f"{prefix}{content_text}",
             }
         )
-        line_no += 1
-
     return records
 
 
 def insert_upload_contents(
+
     conn: sqlite3.Connection,
     bucket: storage.Bucket,
     uid: str,
@@ -1246,8 +1222,6 @@ def run_upload_job_background(uid: str, job_id: str) -> None:
         qa_template_text = load_template_text(BUCKET_NAME, UPLOAD_QA_PROMPT_PATH)
         plain_template_text = load_template_text(BUCKET_NAME, UPLOAD_PLAIN_PROMPT_PATH)
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
-        qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, "plain")
 
         requested_at = job_row["requested_at"] or now_iso()
         total_qa_count = int(job_row["qa_count"] or 0)
@@ -1314,6 +1288,13 @@ def run_upload_job_background(uid: str, job_id: str) -> None:
 
             try:
                 progress_callback(message="item running")
+
+                current_item = fetch_next_new_job_item(local_db_path, job_id)
+                if not current_item or current_item["job_item_id"] != current_job_item_id:
+                    raise HTTPException(status_code=500, detail=f"knowledge_job_items reload failed: {current_job_item_id}")
+                file_ext = normalize_text(current_item["parent_key2"]).lower()
+                qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "qa")
+                plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "plain")
 
                 result = process_upload_job_item(
                     local_db_path=local_db_path,
@@ -1461,8 +1442,6 @@ def create_upload_job(
         qa_template_text = load_template_text(BUCKET_NAME, UPLOAD_QA_PROMPT_PATH)
         plain_template_text = load_template_text(BUCKET_NAME, UPLOAD_PLAIN_PROMPT_PATH)
         chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
-        qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, "plain")
 
         unique_items: List[KnowledgeTargetItem] = []
         seen_keys = set()
@@ -1495,6 +1474,13 @@ def create_upload_job(
                 requested_at=requested_at,
                 preview_only=body.preview_only,
             )
+
+            file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
+            if not file_row:
+                raise HTTPException(status_code=400, detail=f"upload_files not found: {item.parent_source_id or ''}")
+            file_ext = normalize_text(file_row["ext"]).lower()
+            qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "qa")
+            plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, file_ext, "plain")
 
             prompts = build_prompts_for_existing_job_item(
                 local_db_path=local_db_path,
