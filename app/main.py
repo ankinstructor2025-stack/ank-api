@@ -7,7 +7,6 @@ from app.routers.ingest_kokkai import router as ingest_kokkai_router
 from app.routers.ingest_opendata import router as ingest_opendata_router
 from app.routers.ingest_public_url import router as ingest_public_url_router
 from app.routers.upload_register import router as upload_register_router
-from app.routers.upload_ingest import router as upload_ingest_router
 from app.routers.upload_retrieve import router as upload_retrieve_router
 from app.routers.knowledge_generate_kokkai import router as knowledge_generate_kokkai_router
 from app.routers.knowledge_generate_opendata import router as knowledge_generate_opendata_router
@@ -27,7 +26,6 @@ def create_app() -> FastAPI:
     app.include_router(ingest_opendata_router, prefix="/v1")
     app.include_router(ingest_public_url_router, prefix="/v1")
     app.include_router(upload_register_router, prefix="/v1")
-    app.include_router(upload_ingest_router, prefix="/v1")
     app.include_router(upload_retrieve_router, prefix="/v1")
     app.include_router(knowledge_generate_kokkai_router, prefix="/v1")
     app.include_router(knowledge_generate_opendata_router, prefix="/v1")
