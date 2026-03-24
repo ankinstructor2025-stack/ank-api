@@ -1,30 +1,45 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
+import logging
 import os
 import sqlite3
-import uuid
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import List, Optional, Any
+from typing import Any, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
 from google.cloud import storage
+from pydantic import BaseModel, Field
 
-import firebase_admin
-from firebase_admin import auth as fb_auth
-
-from .openai_llm_client import run_chunked_llm_json
+from .content_detector import normalize_text
+from .content_splitter_pdf import split_pdf_records
+from .knowledge_generate_common import (
+    fetch_job_row,
+    fetch_next_new_job_item,
+    get_uid_from_auth_header,
+    load_chunk_config,
+    load_template_text,
+    local_user_db_path,
+    new_id,
+    now_iso,
+    open_user_db,
+    replace_local_db_from_blob,
+    set_job_done,
+    set_job_error,
+    set_job_progress,
+    set_job_running,
+    try_read_status_payload,
+    upload_local_db,
+    user_db_path,
+)
 from .openai_chunking import ChunkConfig, build_chunks
-
+from .openai_llm_client import run_chunked_llm_json
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/knowledge/upload", tags=["knowledge_upload"])
 
-JST = ZoneInfo("Asia/Tokyo")
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 SOURCE_TYPE = "upload"
 
@@ -33,115 +48,110 @@ UPLOAD_PLAIN_PROMPT_PATH = "template/upload_plain_prompt.txt"
 OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
 
-DEFAULT_UPLOAD_QA_PROMPT = """あなたは、アップロードされた資料から検索に使えるQAを抽出するアシスタントです。
-
-入力として、同一ファイルに属する複数のテキストブロックが与えられます。
-内容を読み取り、利用価値のあるQAを抽出してください。
-
-目的は、チャットボットや検索システムで再利用できるナレッジを作ることです。
-そのため、表面的な言い換えではなく、意味のある質問と回答の組を作成してください。
-
-出力は必ずJSONオブジェクトで返してください。
-形式:
-{
-  "job_item_id": "...",
-  "qa_list": [
-    {
-      "question": "...",
-      "answer": "..."
-    }
-  ]
-}
-
-注意:
-- 根拠が弱いものは作らない
-- 回答は入力に含まれる情報だけを使う
-- 推測で補わない
-- 同じ意味のQAを重複して作らない
-"""
-
-DEFAULT_UPLOAD_PLAIN_PROMPT = """あなたは、アップロードされた資料から検索に使える説明文を抽出するアシスタントです。
-
-入力として、同一ファイルに属する複数のテキストブロックが与えられます。
-内容を読み取り、検索や要約に使える平文ナレッジを抽出してください。
-
-出力は必ずJSONオブジェクトで返してください。
-形式:
-{
-  "job_item_id": "...",
-  "plain_list": [
-    {
-      "content": "..."
-    }
-  ]
-}
-
-注意:
-- 重要な定義、ルール、手順、要点、注意事項を優先する
-- 断片をそのまま大量に返さない
-- 推測で補わない
-- 同じ意味の説明文を重複して作らない
-"""
+class KnowledgeJobStatusResponse(BaseModel):
+    updated_at: Optional[str] = None
+    job_id: Optional[str] = None
+    source_type: Optional[str] = None
+    status: str = "idle"
+    phase: Optional[str] = None
+    message: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    dataset_id: Optional[str] = None
+    dataset_name: Optional[str] = None
+    row_count: int = 0
+    knowledge_count: int = 0
+    qa_current: int = 0
+    qa_total: int = 0
+    plain_current: int = 0
+    plain_total: int = 0
+    chunk_current: int = 0
+    chunk_total: int = 0
 
 
-def now_iso() -> str:
-    return datetime.now(tz=JST).isoformat()
+class KnowledgeTargetItem(BaseModel):
+    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="upload")
+    parent_source_id: Optional[str] = None
+    parent_key1: Optional[str] = None
+    parent_key2: Optional[str] = None
+    parent_label: Optional[str] = None
+    row_count: int = 0
 
 
-def new_id() -> str:
-    return uuid.uuid4().hex
+class KnowledgeJobCreateRequest(BaseModel):
+    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="upload")
+    source_name: Optional[str] = None
+    request_type: str = "extract_knowledge"
+    items: List[KnowledgeTargetItem]
+    preview_only: bool = False
 
 
-def debug(message: str) -> None:
-    print(f"[DEBUG][knowledge_upload] {message}")
+class PromptPreviewItem(BaseModel):
+    job_item_id: str
+    parent_source_id: Optional[str] = None
+    parent_label: Optional[str] = None
+    prompt_type: str
+    prompt_text: str
 
 
-def user_db_path(uid: str) -> str:
-    return f"users/{uid}/ank.db"
+class KnowledgeDebugItem(BaseModel):
+    job_item_id: str
+    parent_label: Optional[str] = None
+    status: str
+    qa_count: int = 0
+    plain_count: int = 0
+    error_message: Optional[str] = None
+    llm_result: Optional[Any] = None
 
 
-def local_user_db_path(uid: str, suffix: str) -> str:
-    return f"/tmp/ank_{uid}_upload_{suffix}_{new_id()}.db"
+class KnowledgeJobCreateResponse(BaseModel):
+    job_id: str
+    selected_count: int
+    created_item_count: int
+    status: str
+    prompt_previews: List[PromptPreviewItem] = []
+    debug_items: List[KnowledgeDebugItem] = []
 
 
-def ensure_firebase_initialized():
-    if firebase_admin._apps:
-        return
-    firebase_admin.initialize_app(options={"projectId": "ank-firebase"})
+class KnowledgeRunRequest(BaseModel):
+    job_id: str
 
 
-def get_uid_from_auth_header(authorization: str | None) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+def get_required_upload_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
+    upload_conf = chunk_config.get("upload")
+    if not isinstance(upload_conf, dict):
+        raise HTTPException(status_code=500, detail="openai_chunk.json: upload section not found")
 
-    token = authorization.replace("Bearer ", "", 1).strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Empty bearer token")
+    conf = upload_conf.get(prompt_type)
+    if not isinstance(conf, dict):
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type} section not found")
 
-    ensure_firebase_initialized()
+    missing = [key for key in ("max_chars", "max_items", "overlap_items") if key not in conf]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"openai_chunk.json: upload.{prompt_type} missing keys: {', '.join(missing)}",
+        )
+
     try:
-        decoded = fb_auth.verify_id_token(token)
-        uid = decoded.get("uid")
-        if not uid:
-            raise HTTPException(status_code=401, detail="uid not found in token")
-        return uid
+        max_chars = int(conf["max_chars"])
+        max_items = int(conf["max_items"])
+        overlap_items = int(conf["overlap_items"])
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"openai_chunk.json: invalid upload.{prompt_type} values: {e}",
+        )
 
+    if max_chars <= 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.max_chars must be > 0")
+    if max_items <= 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.max_items must be > 0")
+    if overlap_items < 0:
+        raise HTTPException(status_code=500, detail=f"openai_chunk.json: upload.{prompt_type}.overlap_items must be >= 0")
 
-def normalize_text(text: str | None) -> str:
-    if not text:
-        return ""
-    return " ".join(str(text).split()).strip()
-
-
-def load_json_safe(text: str) -> dict | list | None:
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
+    return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
 
 def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
@@ -168,8 +178,8 @@ def flatten_json_like(value: Any, prefix: str = "") -> list[str]:
     return [text]
 
 
-def extract_row_text(content: Any) -> str | None:
-    if not content:
+def extract_structured_text(content: Any) -> str | None:
+    if content is None:
         return None
 
     parsed = content
@@ -177,7 +187,7 @@ def extract_row_text(content: Any) -> str | None:
         try:
             parsed = json.loads(content)
         except Exception:
-            return content.strip() or None
+            return normalize_text(content) or None
 
     if isinstance(parsed, dict):
         text = normalize_text(parsed.get("text"))
@@ -213,300 +223,34 @@ def extract_row_text(content: Any) -> str | None:
     return normalize_text(str(parsed)) or None
 
 
-def load_template_text(path: str, default_text: str) -> str:
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(path)
-
-    if not blob.exists():
-        debug(f"template not found. use default template: {path}")
-        return default_text.strip()
-
-    return blob.download_as_bytes().decode("utf-8").strip()
-
-
-def load_chunk_config() -> dict:
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(OPENAI_CHUNK_CONFIG_PATH)
-
-    if not blob.exists():
-        raise HTTPException(status_code=404, detail=f"{OPENAI_CHUNK_CONFIG_PATH} not found")
-
-    try:
-        obj = json.loads(blob.download_as_bytes().decode("utf-8"))
-        if not isinstance(obj, dict):
-            raise ValueError("chunk config root is not object")
-        return obj
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"failed to parse {OPENAI_CHUNK_CONFIG_PATH}: {e}")
-
-
-def get_upload_chunk_conf(chunk_config: dict, prompt_type: str) -> ChunkConfig:
-    conf = ((chunk_config.get("upload") or {}).get(prompt_type) or {})
-    max_chars = int(conf.get("max_chars") or (10000 if prompt_type == "qa" else 12000))
-    max_items = int(conf.get("max_items") or (60 if prompt_type == "qa" else 100))
-    overlap_items = int(conf.get("overlap_items") or (3 if prompt_type == "qa" else 5))
-
-    if max_chars <= 0:
-        max_chars = 10000 if prompt_type == "qa" else 12000
-    if max_items <= 0:
-        max_items = 60 if prompt_type == "qa" else 100
-    if overlap_items < 0:
-        overlap_items = 0
-
-    return ChunkConfig(
-        max_chars=max_chars,
-        max_items=max_items,
-        overlap_items=overlap_items,
-    )
-
-
-def open_user_db(local_db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(local_db_path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    return conn
-
-
-def upload_local_db(db_blob: storage.Blob, local_db_path: str) -> None:
-    if not os.path.exists(local_db_path):
-        raise FileNotFoundError(f"local db not found: {local_db_path}")
-
-    snapshot_path = f"{local_db_path}.upload.sqlite"
-
-    src_conn = None
-    dst_conn = None
-
-    try:
-        src_conn = sqlite3.connect(local_db_path, timeout=30)
-        src_conn.row_factory = sqlite3.Row
-        src_conn.execute("PRAGMA busy_timeout = 30000")
-
-        journal_mode = src_conn.execute("PRAGMA journal_mode").fetchone()[0]
-        logger.info("upload_local_db journal_mode=%s path=%s", journal_mode, local_db_path)
-
-        if str(journal_mode).lower() == "wal":
-            src_conn.execute("PRAGMA wal_checkpoint(FULL)")
-            logger.info("upload_local_db wal checkpoint done: %s", local_db_path)
-
-        dst_conn = sqlite3.connect(snapshot_path, timeout=30)
-        src_conn.backup(dst_conn)
-        dst_conn.commit()
-
-    finally:
-        if dst_conn is not None:
-            dst_conn.close()
-        if src_conn is not None:
-            src_conn.close()
-
-    db_blob.upload_from_filename(snapshot_path)
-    logger.info("db uploaded to gcs: %s", db_blob.name)
-    debug(f"db uploaded to gcs: {db_blob.name}")
-
-    try:
-        os.remove(snapshot_path)
-    except Exception:
-        logger.warning("failed to remove snapshot file: %s", snapshot_path)
-
-
-def safe_upload_local_db(db_blob: storage.Blob, local_db_path: str, reason: str) -> None:
-    try:
-        upload_local_db(db_blob, local_db_path)
-        debug(f"safe upload success: reason={reason}")
-    except Exception as e:
-        logger.exception("safe upload failed: reason=%s", reason)
-        debug(f"safe upload failed: reason={reason} error={type(e).__name__}: {e}")
-
-
-LOCK_TTL_SECONDS = 60 * 60 * 6
-
-
-def ensure_job_locks_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS job_locks (
-            lock_key TEXT PRIMARY KEY,
-            job_id TEXT NOT NULL,
-            locked_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
-
-
-def build_lock_key(uid: str) -> str:
-    return f"{uid}:{SOURCE_TYPE}"
-
-
-def try_acquire_job_lock(local_db_path: str, lock_key: str, job_id: str) -> bool:
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        ensure_job_locks_table(conn)
-        now = now_iso()
-        expires_at = datetime.fromisoformat(now).timestamp() + LOCK_TTL_SECONDS
-        expires_iso = datetime.fromtimestamp(expires_at, tz=JST).isoformat()
-        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
+def decode_text_bytes(file_bytes: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp932"):
         try:
-            conn.execute(
-                "INSERT INTO job_locks (lock_key, job_id, locked_at, expires_at) VALUES (?, ?, ?, ?)",
-                (lock_key, job_id, now, expires_iso),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            return False
-    finally:
-        conn.close()
+            return file_bytes.decode(enc)
+        except Exception:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
 
 
-def release_job_lock(local_db_path: str, lock_key: str, job_id: str | None = None) -> None:
-    conn = open_user_db(local_db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        ensure_job_locks_table(conn)
-        if job_id:
-            conn.execute("DELETE FROM job_locks WHERE lock_key = ? AND job_id = ?", (lock_key, job_id))
-        else:
-            conn.execute("DELETE FROM job_locks WHERE lock_key = ?", (lock_key,))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def build_upload_blob_path(uid: str, file_id: str, file_name: str) -> str:
+    return f"users/{uid}/uploads/{file_id}_{file_name}"
 
 
-def get_running_lock_job_id(local_db_path: str, lock_key: str) -> str | None:
-    conn = open_user_db(local_db_path)
-    try:
-        ensure_job_locks_table(conn)
-        now = now_iso()
-        conn.execute("DELETE FROM job_locks WHERE expires_at < ?", (now,))
-        conn.commit()
-        cur = conn.execute("SELECT job_id FROM job_locks WHERE lock_key = ? LIMIT 1", (lock_key,))
-        row = cur.fetchone()
-        return row["job_id"] if row else None
-    finally:
-        conn.close()
-
-
-def fetch_upload_source_rows(local_db_path: str, file_id: str) -> list[sqlite3.Row]:
+def fetch_upload_file_row(local_db_path: str, file_id: str) -> sqlite3.Row | None:
     conn = open_user_db(local_db_path)
     try:
         cur = conn.execute(
             """
             SELECT
-                row_id,
-                row_index,
-                source_item_id,
-                content
-            FROM row_data
-            WHERE source_type = 'upload'
-              AND file_id = ?
-            ORDER BY row_index
+                file_id,
+                file_name,
+                ext,
+                created_at
+            FROM upload_files
+            WHERE file_id = ?
+            LIMIT 1
             """,
             (file_id,),
-        )
-        rows = cur.fetchall()
-        debug(f"fetch_upload_source_rows file_id={file_id} count={len(rows)}")
-        return rows
-    finally:
-        conn.close()
-
-
-def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_id,
-                source_type,
-                source_name,
-                request_type,
-                status,
-                selected_count,
-                qa_count,
-                plain_count,
-                error_count,
-                requested_at,
-                started_at,
-                finished_at,
-                error_message
-            FROM knowledge_jobs
-            WHERE job_id = ?
-            LIMIT 1
-            """,
-            (job_id,),
-        )
-        return cur.fetchone()
-    finally:
-        conn.close()
-
-
-def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_item_id,
-                job_id,
-                source_type,
-                parent_source_id,
-                parent_key1,
-                parent_key2,
-                parent_label,
-                row_count,
-                status,
-                knowledge_count,
-                error_message,
-                created_at,
-                started_at,
-                finished_at
-            FROM knowledge_job_items
-            WHERE job_id = ?
-            ORDER BY created_at, job_item_id
-            """,
-            (job_id,),
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def fetch_next_queued_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | None:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                job_item_id,
-                job_id,
-                source_type,
-                parent_source_id,
-                parent_key1,
-                parent_key2,
-                parent_label,
-                row_count,
-                status,
-                knowledge_count,
-                error_message,
-                created_at,
-                started_at,
-                finished_at
-            FROM knowledge_job_items
-            WHERE job_id = ?
-              AND status = 'queued'
-            ORDER BY created_at, job_item_id
-            LIMIT 1
-            """,
-            (job_id,),
         )
         return cur.fetchone()
     finally:
@@ -550,9 +294,7 @@ def fetch_upload_content_rows(conn: sqlite3.Connection, job_item_id: str) -> lis
         """,
         (job_item_id,),
     )
-    rows = cur.fetchall()
-    debug(f"fetch_upload_content_rows job_item_id={job_item_id} count={len(rows)}")
-    return rows
+    return cur.fetchall()
 
 
 def build_upload_prompt_text(
@@ -567,74 +309,18 @@ def build_upload_prompt_text(
     row_count: int,
 ) -> str:
     chunk_rows = getattr(chunk, "items", chunk)
-    debug(
-        f"build_upload_prompt_text job_item_id={job_item_id} "
-        f"chunk_type={type(chunk).__name__} rows_type={type(chunk_rows).__name__}"
-    )
 
     lines: list[str] = []
-    empty_count = 0
-
-    for idx, row in enumerate(chunk_rows, start=1):
-        content_text = (
-            getattr(row, "content_text", None)
-            or getattr(row, "text", None)
-            or getattr(row, "content", None)
-        )
-        sort_no = getattr(row, "sort_no", None)
-
-        raw_item = getattr(row, "item", None) or getattr(row, "row", None)
-        if not content_text and raw_item is not None:
-            if isinstance(raw_item, dict):
-                content_text = (
-                    raw_item.get("content_text")
-                    or raw_item.get("text")
-                    or raw_item.get("content")
-                )
-                if sort_no is None:
-                    sort_no = raw_item.get("sort_no")
-
-        if not content_text and isinstance(row, dict):
-            content_text = (
-                row.get("content_text")
-                or row.get("text")
-                or row.get("content")
-            )
-            if sort_no is None:
-                sort_no = row.get("sort_no")
-
-        if content_text is None:
-            try:
-                content_text = row["content_text"]
-                if sort_no is None:
-                    sort_no = row["sort_no"]
-            except Exception:
-                content_text = None
-
-        text = normalize_text(content_text)
+    for row in chunk_rows:
+        text = normalize_text(row["content_text"] if isinstance(row, sqlite3.Row) else row.get("content_text"))
         if not text:
-            empty_count += 1
-            if idx <= 3:
-                debug(
-                    f"build_upload_prompt_text empty row sample "
-                    f"job_item_id={job_item_id} idx={idx} row_type={type(row).__name__} "
-                    f"row_repr={str(row)[:300]}"
-                )
             continue
-
+        sort_no = row["sort_no"] if isinstance(row, sqlite3.Row) else row.get("sort_no")
         lines.append(f"[{sort_no}] {text}")
 
     input_text = "\n\n".join(lines).strip()
-    debug(
-        f"build_upload_prompt_text result job_item_id={job_item_id} "
-        f"line_count={len(lines)} empty_count={empty_count}"
-    )
-
     if not input_text:
-        raise HTTPException(
-            status_code=400,
-            detail=f"knowledge_contents text empty after chunk build: {job_item_id}",
-        )
+        raise HTTPException(status_code=400, detail=f"knowledge_contents text empty after chunk build: {job_item_id}")
 
     return (
         f"対象: {parent_label or parent_source_id or ''}\n"
@@ -642,7 +328,7 @@ def build_upload_prompt_text(
         f"{prompt_template}\n\n"
         f"【ファイル情報】\n"
         f"file_id: {parent_source_id or ''}\n"
-        f"logical_name: {parent_key1 or ''}\n"
+        f"file_name: {parent_key1 or ''}\n"
         f"ext: {parent_key2 or ''}\n"
         f"label: {parent_label or ''}\n"
         f"row_count: {row_count}\n"
@@ -655,15 +341,11 @@ def build_upload_prompt_text(
 def build_upload_prompt_texts(
     conn: sqlite3.Connection,
     job_item_id: str,
-    template_path: str,
-    default_template: str,
+    template_text: str,
     chunk_conf: ChunkConfig,
 ) -> list[str]:
     item = fetch_upload_job_item_meta(conn, job_item_id)
     rows = fetch_upload_content_rows(conn, job_item_id)
-
-    if not rows:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents not found before chunking: {job_item_id}")
 
     chunks = build_chunks(
         rows,
@@ -671,26 +353,15 @@ def build_upload_prompt_texts(
         allowed_content_types={"row"},
     )
 
-    debug(
-        f"build_upload_prompt_texts job_item_id={job_item_id} "
-        f"row_count={len(rows)} chunk_count={len(chunks)}"
-    )
-
     if not chunks:
-        raise HTTPException(status_code=400, detail=f"knowledge_contents not found after chunking: {job_item_id}")
-
-    prompt_template = load_template_text(template_path, default_template)
+        raise HTTPException(status_code=400, detail=f"knowledge_contents not found: {job_item_id}")
 
     prompt_texts: list[str] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        debug(
-            f"build_upload_prompt_texts chunk start job_item_id={job_item_id} "
-            f"chunk_index={idx} chunk_type={type(chunk).__name__}"
-        )
+    for chunk in chunks:
         prompt_texts.append(
             build_upload_prompt_text(
                 job_item_id=job_item_id,
-                prompt_template=prompt_template,
+                prompt_template=template_text.strip(),
                 chunk=chunk,
                 parent_source_id=item["parent_source_id"],
                 parent_key1=item["parent_key1"],
@@ -701,10 +372,9 @@ def build_upload_prompt_texts(
         )
 
     logger.info(
-        "upload prompt build: job_item_id=%s chunk_count=%s template=%s",
+        "upload prompt build: job_item_id=%s chunk_count=%s",
         job_item_id,
         len(prompt_texts),
-        template_path,
     )
     return prompt_texts
 
@@ -785,7 +455,6 @@ def insert_qa_items_from_llm_result(
 
         question_raw = normalize_text(qa.get("question"))
         answer_raw = normalize_text(qa.get("answer"))
-
         if not question_raw or not answer_raw:
             continue
 
@@ -852,7 +521,6 @@ def insert_qa_items_from_llm_result(
                 now,
             ),
         )
-
         inserted_count += 1
         sort_no += 1
 
@@ -943,46 +611,112 @@ def insert_plain_items_from_llm_result(
                 now,
             ),
         )
-
         inserted_count += 1
         sort_no += 1
 
     return inserted_count
 
 
+def build_upload_records_from_blob(file_row: sqlite3.Row, file_bytes: bytes) -> list[dict[str, Any]]:
+    file_id = file_row["file_id"]
+    file_name = file_row["file_name"] or ""
+    ext = normalize_text(file_row["ext"]).lower()
+    records: list[dict[str, Any]] = []
+
+    if ext == "pdf":
+        pages = split_pdf_records(file_bytes)
+        for page in pages:
+            text = normalize_text(page.get("text"))
+            if not text:
+                continue
+            page_no = int(page.get("page") or 0)
+            records.append(
+                {
+                    "source_item_id": f"{file_id}#page={page_no}",
+                    "row_id": f"{file_id}:{page_no}",
+                    "content_text": f"[FILE] {file_name}\n[PAGE] {page_no}\n{text}",
+                }
+            )
+        return records
+
+    text = decode_text_bytes(file_bytes)
+
+    if ext == "csv":
+        reader = csv.DictReader(io.StringIO(text))
+        if reader.fieldnames:
+            for idx, row in enumerate(reader, start=1):
+                content_text = extract_structured_text(row)
+                if not content_text:
+                    continue
+                records.append(
+                    {
+                        "source_item_id": f"{file_id}#row={idx}",
+                        "row_id": f"{file_id}:{idx}",
+                        "content_text": f"[FILE] {file_name}\n[ROW] {idx}\n{content_text}",
+                    }
+                )
+            return records
+
+    if ext == "json":
+        try:
+            obj = json.loads(text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"json parse failed: file_id={file_id} error={e}")
+
+        items = obj if isinstance(obj, list) else [obj]
+        for idx, item in enumerate(items, start=1):
+            content_text = extract_structured_text(item)
+            if not content_text:
+                continue
+            records.append(
+                {
+                    "source_item_id": f"{file_id}#row={idx}",
+                    "row_id": f"{file_id}:{idx}",
+                    "content_text": f"[FILE] {file_name}\n[ROW] {idx}\n{content_text}",
+                }
+            )
+        return records
+
+    line_no = 1
+    for raw_line in text.splitlines():
+        line = normalize_text(raw_line)
+        if not line:
+            continue
+        records.append(
+            {
+                "source_item_id": f"{file_id}#line={line_no}",
+                "row_id": f"{file_id}:{line_no}",
+                "content_text": f"[FILE] {file_name}\n[LINE] {line_no}\n{line}",
+            }
+        )
+        line_no += 1
+
+    return records
+
+
 def insert_upload_contents(
     conn: sqlite3.Connection,
+    bucket: storage.Bucket,
+    uid: str,
     job_id: str,
     job_item_id: str,
     source_id: str,
-    source_rows: list[sqlite3.Row],
+    file_row: sqlite3.Row,
 ) -> int:
-    inserted_count = 0
-    skipped_count = 0
+    file_name = file_row["file_name"] or ""
+    blob_path = build_upload_blob_path(uid, source_id, file_name)
+    blob = bucket.blob(blob_path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"uploaded file not found: {blob_path}")
+
+    file_bytes = blob.download_as_bytes()
+    records = build_upload_records_from_blob(file_row, file_bytes)
+    if not records:
+        raise HTTPException(status_code=400, detail=f"upload file text not found: {source_id}")
+
     now = now_iso()
-
-    debug(
-        f"insert_upload_contents start job_id={job_id} job_item_id={job_item_id} "
-        f"source_id={source_id} source_rows={len(source_rows)}"
-    )
-
-    for idx, row in enumerate(source_rows, start=1):
-        raw_content = row["content"]
-        content_text = extract_row_text(raw_content)
-
-        if idx <= 5:
-            debug(
-                f"insert_upload_contents sample idx={idx} row_index={row['row_index']} "
-                f"source_item_id={row['source_item_id']} raw={str(raw_content)[:250]}"
-            )
-            debug(
-                f"insert_upload_contents sample idx={idx} extracted={str(content_text)[:250]}"
-            )
-
-        if not content_text:
-            skipped_count += 1
-            continue
-
+    inserted_count = 0
+    for sort_no, record in enumerate(records, start=1):
         conn.execute(
             """
             INSERT INTO knowledge_contents (
@@ -1005,51 +739,31 @@ def insert_upload_contents(
                 job_item_id,
                 SOURCE_TYPE,
                 source_id,
-                row["source_item_id"],
-                row["row_id"],
+                record["source_item_id"],
+                record["row_id"],
                 "row",
-                content_text,
-                idx,
+                record["content_text"],
+                sort_no,
                 now,
                 now,
             ),
         )
         inserted_count += 1
 
-    debug(
-        f"insert_upload_contents result job_item_id={job_item_id} "
-        f"inserted_count={inserted_count} skipped_count={skipped_count}"
-    )
-
-    if inserted_count == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"knowledge_contents insert 0 rows: job_item_id={job_item_id}, "
-                f"source_id={source_id}, source_rows={len(source_rows)}, skipped_count={skipped_count}"
-            ),
-        )
-
     return inserted_count
 
 
 def create_job_record(
     local_db_path: str,
-    body: "KnowledgeJobCreateRequest",
+    body: KnowledgeJobCreateRequest,
     selected_count: int,
 ) -> tuple[str, str]:
     job_id = new_id()
     requested_at = now_iso()
 
-    print(
-        f"[START] create_job_record job_id={job_id} "
-        f"selected_count={selected_count} source_name={body.source_name}"
-    )
-
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-
+        conn.execute("BEGIN")
         conn.execute(
             """
             INSERT INTO knowledge_jobs (
@@ -1074,31 +788,26 @@ def create_job_record(
                 SOURCE_TYPE,
                 body.source_name or "ファイルアップロード",
                 body.request_type,
-                "preview" if body.preview_only else "queued",
+                "done" if body.preview_only else "new",
                 selected_count,
                 requested_at,
             ),
         )
-
         conn.commit()
-
-        print(f"[SUCCESS] create_job_record job_id={job_id}")
-
         return job_id, requested_at
-
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        print(f"[ERROR] create_job_record failed job_id={job_id} error={str(e)}")
         raise
-
     finally:
         conn.close()
 
 
 def prepare_job_item(
     local_db_path: str,
+    bucket: storage.Bucket,
+    uid: str,
     job_id: str,
-    item: "KnowledgeTargetItem",
+    item: KnowledgeTargetItem,
     requested_at: str,
     preview_only: bool,
 ) -> dict[str, Any]:
@@ -1106,20 +815,19 @@ def prepare_job_item(
     if not source_id:
         raise HTTPException(status_code=400, detail="parent_source_id is required")
 
-    debug(
-        f"prepare_job_item start job_id={job_id} source_id={source_id} "
-        f"parent_label={item.parent_label} row_count={item.row_count}"
-    )
-
-    source_rows = fetch_upload_source_rows(local_db_path, source_id)
-    if not source_rows:
-        raise HTTPException(status_code=400, detail=f"row_data not found: {source_id}")
+    file_row = fetch_upload_file_row(local_db_path, source_id)
+    if not file_row:
+        raise HTTPException(status_code=400, detail=f"upload_files not found: {source_id}")
 
     job_item_id = new_id()
 
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
+
+        parent_label = item.parent_label or file_row["file_name"]
+        parent_key1 = item.parent_key1 or file_row["file_name"]
+        parent_key2 = item.parent_key2 or file_row["ext"]
 
         conn.execute(
             """
@@ -1145,56 +853,43 @@ def prepare_job_item(
                 job_item_id,
                 job_id,
                 SOURCE_TYPE,
-                item.parent_source_id,
-                item.parent_key1,
-                item.parent_key2,
-                item.parent_label,
+                source_id,
+                parent_key1,
+                parent_key2,
+                parent_label,
                 item.row_count,
-                "preview" if preview_only else "queued",
+                "done" if preview_only else "new",
                 requested_at,
             ),
         )
 
-        inserted_count = insert_upload_contents(
+        inserted_rows = insert_upload_contents(
             conn=conn,
+            bucket=bucket,
+            uid=uid,
             job_id=job_id,
             job_item_id=job_item_id,
             source_id=source_id,
-            source_rows=source_rows,
+            file_row=file_row,
         )
 
-        debug(
-            f"prepare_job_item before commit job_item_id={job_item_id} "
-            f"inserted_count={inserted_count}"
+        conn.execute(
+            """
+            UPDATE knowledge_job_items
+            SET row_count = ?
+            WHERE job_item_id = ?
+            """,
+            (inserted_rows, job_item_id),
         )
 
         conn.commit()
-
-        debug(f"prepare_job_item committed job_item_id={job_item_id}")
-
         return {
             "job_item_id": job_item_id,
             "source_id": source_id,
-            "inserted_count": inserted_count,
         }
-
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        debug(f"prepare_job_item rollback job_item_id={job_item_id} error={type(e).__name__}: {e}")
         raise
-    finally:
-        conn.close()
-
-
-def count_knowledge_contents(local_db_path: str, job_item_id: str) -> int:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM knowledge_contents WHERE job_item_id = ?",
-            (job_item_id,),
-        )
-        row = cur.fetchone()
-        return int(row["cnt"] or 0)
     finally:
         conn.close()
 
@@ -1204,10 +899,9 @@ def build_prompts_for_existing_job_item(
     job_item_id: str,
     qa_chunk_conf: ChunkConfig,
     plain_chunk_conf: ChunkConfig,
+    qa_template_text: str,
+    plain_template_text: str,
 ) -> dict[str, Any]:
-    count = count_knowledge_contents(local_db_path, job_item_id)
-    debug(f"build_prompts_for_existing_job_item precheck job_item_id={job_item_id} knowledge_contents_count={count}")
-
     conn = open_user_db(local_db_path)
     try:
         meta = fetch_upload_job_item_meta(conn, job_item_id)
@@ -1215,16 +909,14 @@ def build_prompts_for_existing_job_item(
         qa_prompt_texts = build_upload_prompt_texts(
             conn=conn,
             job_item_id=job_item_id,
-            template_path=UPLOAD_QA_PROMPT_PATH,
-            default_template=DEFAULT_UPLOAD_QA_PROMPT,
+            template_text=qa_template_text,
             chunk_conf=qa_chunk_conf,
         )
 
         plain_prompt_texts = build_upload_prompt_texts(
             conn=conn,
             job_item_id=job_item_id,
-            template_path=UPLOAD_PLAIN_PROMPT_PATH,
-            default_template=DEFAULT_UPLOAD_PLAIN_PROMPT,
+            template_text=plain_template_text,
             chunk_conf=plain_chunk_conf,
         )
 
@@ -1235,6 +927,8 @@ def build_prompts_for_existing_job_item(
             "parent_label": meta["parent_label"],
             "qa_prompt_texts": qa_prompt_texts,
             "plain_prompt_texts": plain_prompt_texts,
+            "qa_chunk_total": len(qa_prompt_texts),
+            "plain_chunk_total": len(plain_prompt_texts),
         }
     finally:
         conn.close()
@@ -1243,7 +937,7 @@ def build_prompts_for_existing_job_item(
 def mark_job_item_running(local_db_path: str, job_item_id: str) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -1273,7 +967,7 @@ def finalize_job_item_success(
 ) -> tuple[int, int]:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
 
         qa_count = 0
         plain_count = 0
@@ -1286,7 +980,6 @@ def finalize_job_item_success(
                 source_id=source_id,
                 llm_result=qa_llm_result,
             )
-
             plain_count = insert_plain_items_from_llm_result(
                 conn=conn,
                 job_id=job_id,
@@ -1294,9 +987,6 @@ def finalize_job_item_success(
                 source_id=source_id,
                 llm_result=plain_llm_result,
             )
-
-        finished_at = now_iso()
-        item_status = "preview" if preview_only else "ready"
 
         conn.execute(
             """
@@ -1308,16 +998,15 @@ def finalize_job_item_success(
             WHERE job_item_id = ?
             """,
             (
-                item_status,
+                "done",
                 qa_count + plain_count,
-                finished_at,
+                now_iso(),
                 job_item_id,
             ),
         )
 
         conn.commit()
         return qa_count, plain_count
-
     except Exception:
         conn.rollback()
         raise
@@ -1325,14 +1014,10 @@ def finalize_job_item_success(
         conn.close()
 
 
-def finalize_job_item_error(
-    local_db_path: str,
-    job_item_id: str,
-    error_message: str,
-) -> None:
+def finalize_job_item_error(local_db_path: str, job_item_id: str, error_message: str) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_job_items
@@ -1341,11 +1026,7 @@ def finalize_job_item_error(
                 error_message = ?
             WHERE job_item_id = ?
             """,
-            (
-                now_iso(),
-                error_message,
-                job_item_id,
-            ),
+            (now_iso(), error_message, job_item_id),
         )
         conn.commit()
     except Exception:
@@ -1363,10 +1044,11 @@ def update_job_summary(
     total_qa_count: int,
     total_plain_count: int,
     total_error_count: int,
+    error_message: str | None = None,
 ) -> None:
     conn = open_user_db(local_db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         conn.execute(
             """
             UPDATE knowledge_jobs
@@ -1374,13 +1056,15 @@ def update_job_summary(
                 qa_count = ?,
                 plain_count = ?,
                 error_count = ?,
+                error_message = ?,
                 started_at = CASE
-                    WHEN ? IN ('running', 'ready', 'partial_error', 'error') THEN COALESCE(started_at, ?)
+                    WHEN ? = 'running' THEN COALESCE(started_at, ?)
                     ELSE started_at
                 END,
                 finished_at = CASE
-                    WHEN ? IN ('ready', 'partial_error', 'error', 'preview') THEN ?
-                    ELSE NULL
+                    WHEN ? IN ('done', 'error') THEN ?
+                    WHEN ? = 'running' THEN NULL
+                    ELSE finished_at
                 END
             WHERE job_id = ?
             """,
@@ -1389,10 +1073,12 @@ def update_job_summary(
                 total_qa_count,
                 total_plain_count,
                 total_error_count,
+                error_message,
                 status,
                 requested_at,
                 status,
                 now_iso(),
+                status,
                 job_id,
             ),
         )
@@ -1410,18 +1096,34 @@ def process_upload_job_item(
     job_item_id: str,
     qa_chunk_conf: ChunkConfig,
     plain_chunk_conf: ChunkConfig,
+    qa_template_text: str,
+    plain_template_text: str,
     preview_only: bool,
+    progress_callback=None,
 ) -> dict[str, Any]:
     prepared = build_prompts_for_existing_job_item(
         local_db_path=local_db_path,
         job_item_id=job_item_id,
         qa_chunk_conf=qa_chunk_conf,
         plain_chunk_conf=plain_chunk_conf,
+        qa_template_text=qa_template_text,
+        plain_template_text=plain_template_text,
     )
 
     source_id = prepared["source_id"]
     qa_prompt_texts = prepared["qa_prompt_texts"]
     plain_prompt_texts = prepared["plain_prompt_texts"]
+    total_qa_chunks = len(qa_prompt_texts)
+    total_plain_chunks = len(plain_prompt_texts)
+
+    if progress_callback:
+        progress_callback(
+            total_qa_chunks=total_qa_chunks,
+            processed_qa_chunks=0,
+            total_plain_chunks=total_plain_chunks,
+            processed_plain_chunks=0,
+            message="chunk prepared",
+        )
 
     if preview_only:
         qa_llm_result = {"job_item_id": job_item_id, "qa_list": []}
@@ -1429,22 +1131,42 @@ def process_upload_job_item(
         qa_llm_result_for_debug = None
         plain_llm_result_for_debug = None
     else:
-        mark_job_item_running(local_db_path, job_item_id)
+        qa_chunk_results = []
+        for idx, prompt_text in enumerate(qa_prompt_texts, start=1):
+            result_list = run_chunked_llm_json([prompt_text], "LLM UPLOAD QA")
+            if not result_list:
+                raise Exception("empty qa chunk result")
+            qa_chunk_results.append(result_list[0])
+            if progress_callback:
+                progress_callback(
+                    total_qa_chunks=total_qa_chunks,
+                    processed_qa_chunks=idx,
+                    total_plain_chunks=total_plain_chunks,
+                    processed_plain_chunks=0,
+                    message=f"qa chunk {idx}/{total_qa_chunks}",
+                )
 
-        qa_chunk_results = run_chunked_llm_json(
-            qa_prompt_texts,
-            "LLM UPLOAD QA",
-        )
         qa_llm_result = merge_qa_chunk_results(job_item_id, qa_chunk_results)
         qa_llm_result_for_debug = {
             "chunk_results": qa_chunk_results,
             "merged_result": qa_llm_result,
         }
 
-        plain_chunk_results = run_chunked_llm_json(
-            plain_prompt_texts,
-            "LLM UPLOAD PLAIN",
-        )
+        plain_chunk_results = []
+        for idx, prompt_text in enumerate(plain_prompt_texts, start=1):
+            result_list = run_chunked_llm_json([prompt_text], "LLM UPLOAD PLAIN")
+            if not result_list:
+                raise Exception("empty plain chunk result")
+            plain_chunk_results.append(result_list[0])
+            if progress_callback:
+                progress_callback(
+                    total_qa_chunks=total_qa_chunks,
+                    processed_qa_chunks=total_qa_chunks,
+                    total_plain_chunks=total_plain_chunks,
+                    processed_plain_chunks=idx,
+                    message=f"plain chunk {idx}/{total_plain_chunks}",
+                )
+
         plain_llm_result = merge_plain_chunk_results(job_item_id, plain_chunk_results)
         plain_llm_result_for_debug = {
             "chunk_results": plain_chunk_results,
@@ -1467,7 +1189,7 @@ def process_upload_job_item(
         "parent_label": prepared["parent_label"],
         "qa_count": qa_count,
         "plain_count": plain_count,
-        "status": "preview" if preview_only else "ready",
+        "status": "done",
         "qa_prompt_texts": qa_prompt_texts,
         "plain_prompt_texts": plain_prompt_texts,
         "qa_debug": qa_llm_result_for_debug,
@@ -1475,78 +1197,230 @@ def process_upload_job_item(
     }
 
 
-class KnowledgeTargetItem(BaseModel):
-    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="upload")
-    parent_source_id: Optional[str] = None
-    parent_key1: Optional[str] = None
-    parent_key2: Optional[str] = None
-    parent_label: Optional[str] = None
-    row_count: int = 0
+def run_upload_job_background(uid: str, job_id: str) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
 
+    db_gcs_path = user_db_path(uid)
+    db_blob = bucket.blob(db_gcs_path)
+    if not db_blob.exists():
+        logger.error("ank.db not found in background: %s", db_gcs_path)
+        set_job_error(
+            bucket,
+            uid,
+            job_id,
+            f"ank.db not found: {db_gcs_path}",
+            phase="extract_knowledge",
+            message="ank.db not found",
+        )
+        return
 
-class KnowledgeJobCreateRequest(BaseModel):
-    source_type: Optional[str] = Field(default=SOURCE_TYPE, description="upload")
-    source_name: Optional[str] = None
-    request_type: str = "extract_knowledge"
-    items: List[KnowledgeTargetItem]
-    preview_only: bool = False
+    local_db_path = local_user_db_path(uid)
 
+    try:
+        replace_local_db_from_blob(db_blob, local_db_path)
 
-class PromptPreviewItem(BaseModel):
-    job_item_id: str
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    prompt_type: str
-    prompt_text: str
+        job_row = fetch_job_row(local_db_path, job_id)
+        if not job_row:
+            set_job_error(
+                bucket,
+                uid,
+                job_id,
+                f"knowledge_jobs not found: {job_id}",
+                phase="extract_knowledge",
+                message="knowledge_jobs not found",
+            )
+            return
 
+        if job_row["source_type"] != SOURCE_TYPE:
+            set_job_error(
+                bucket,
+                uid,
+                job_id,
+                "invalid source_type",
+                phase="extract_knowledge",
+                message="invalid source_type",
+            )
+            return
 
-class KnowledgeDebugItem(BaseModel):
-    job_item_id: str
-    parent_label: Optional[str] = None
-    status: str
-    qa_count: int = 0
-    plain_count: int = 0
-    error_message: Optional[str] = None
-    llm_result: Optional[Any] = None
+        qa_template_text = load_template_text(BUCKET_NAME, UPLOAD_QA_PROMPT_PATH)
+        plain_template_text = load_template_text(BUCKET_NAME, UPLOAD_PLAIN_PROMPT_PATH)
+        chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
+        qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, "plain")
 
+        requested_at = job_row["requested_at"] or now_iso()
+        total_qa_count = int(job_row["qa_count"] or 0)
+        total_plain_count = int(job_row["plain_count"] or 0)
+        total_error_count = int(job_row["error_count"] or 0)
 
-class KnowledgeJobCreateResponse(BaseModel):
-    job_id: str
-    selected_count: int
-    created_item_count: int
-    status: str
-    prompt_previews: List[PromptPreviewItem] = []
-    debug_items: List[KnowledgeDebugItem] = []
+        conn = open_user_db(local_db_path)
+        try:
+            cur = conn.execute(
+                """
+                SELECT ji.parent_source_id, ji.parent_label, ji.row_count
+                FROM knowledge_job_items ji
+                WHERE ji.job_id = ?
+                ORDER BY ji.created_at, ji.job_item_id
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            first_item = cur.fetchone()
+        finally:
+            conn.close()
 
+        dataset_id = first_item["parent_source_id"] if first_item else None
+        dataset_name = first_item["parent_label"] if first_item else None
+        row_count = int(first_item["row_count"] or 0) if first_item else 0
 
-class KnowledgeRunRequest(BaseModel):
-    job_id: str
+        set_job_running(
+            bucket,
+            uid,
+            job_id,
+            SOURCE_TYPE,
+            phase="extract_knowledge",
+            message="background started",
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            qa_total=0,
+            plain_total=0,
+            chunk_total=0,
+        )
 
+        while True:
+            row = fetch_next_new_job_item(local_db_path, job_id)
+            if not row:
+                break
 
-class KnowledgeJobStatusItem(BaseModel):
-    job_item_id: str
-    parent_source_id: Optional[str] = None
-    parent_label: Optional[str] = None
-    status: str
-    knowledge_count: int = 0
-    error_message: Optional[str] = None
-    row_count: int = 0
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+            current_job_item_id = row["job_item_id"]
+            mark_job_item_running(local_db_path, current_job_item_id)
 
+            def progress_callback(*, total_qa_chunks=0, processed_qa_chunks=0, total_plain_chunks=0, processed_plain_chunks=0, message=None):
+                set_job_progress(
+                    bucket,
+                    uid,
+                    phase="extract_knowledge",
+                    message=message,
+                    knowledge_count=total_qa_count + total_plain_count,
+                    qa_current=int(processed_qa_chunks or 0),
+                    qa_total=int(total_qa_chunks or 0),
+                    plain_current=int(processed_plain_chunks or 0),
+                    plain_total=int(total_plain_chunks or 0),
+                    chunk_current=int(processed_qa_chunks or 0) + int(processed_plain_chunks or 0),
+                    chunk_total=int(total_qa_chunks or 0) + int(total_plain_chunks or 0),
+                )
 
-class KnowledgeJobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    selected_count: int = 0
-    qa_count: int = 0
-    plain_count: int = 0
-    error_count: int = 0
-    requested_at: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    error_message: Optional[str] = None
-    items: List[KnowledgeJobStatusItem] = []
+            try:
+                progress_callback(message="item running")
+
+                result = process_upload_job_item(
+                    local_db_path=local_db_path,
+                    job_id=job_id,
+                    job_item_id=current_job_item_id,
+                    qa_chunk_conf=qa_chunk_conf,
+                    plain_chunk_conf=plain_chunk_conf,
+                    qa_template_text=qa_template_text,
+                    plain_template_text=plain_template_text,
+                    preview_only=False,
+                    progress_callback=progress_callback,
+                )
+
+                total_qa_count += int(result["qa_count"] or 0)
+                total_plain_count += int(result["plain_count"] or 0)
+
+                update_job_summary(
+                    local_db_path=local_db_path,
+                    job_id=job_id,
+                    requested_at=requested_at,
+                    status="running",
+                    total_qa_count=total_qa_count,
+                    total_plain_count=total_plain_count,
+                    total_error_count=total_error_count,
+                    error_message=None,
+                )
+
+                set_job_progress(
+                    bucket,
+                    uid,
+                    phase="extract_knowledge",
+                    message="item done",
+                    knowledge_count=total_qa_count + total_plain_count,
+                )
+
+            except Exception as e:
+                logger.exception(
+                    "run_upload_job_background item failed: job_id=%s job_item_id=%s",
+                    job_id,
+                    current_job_item_id,
+                )
+
+                try:
+                    finalize_job_item_error(
+                        local_db_path=local_db_path,
+                        job_item_id=current_job_item_id,
+                        error_message=str(e),
+                    )
+                except Exception:
+                    logger.exception("failed to update error state: job_item_id=%s", current_job_item_id)
+
+                total_error_count += 1
+
+                try:
+                    update_job_summary(
+                        local_db_path=local_db_path,
+                        job_id=job_id,
+                        requested_at=requested_at,
+                        status="error",
+                        total_qa_count=total_qa_count,
+                        total_plain_count=total_plain_count,
+                        total_error_count=total_error_count,
+                        error_message=str(e),
+                    )
+                except Exception:
+                    logger.exception("failed to update job summary error: job_id=%s", job_id)
+
+                set_job_error(
+                    bucket,
+                    uid,
+                    job_id,
+                    str(e),
+                    phase="extract_knowledge",
+                    message="item failed",
+                )
+                return
+
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status="done",
+            total_qa_count=total_qa_count,
+            total_plain_count=total_plain_count,
+            total_error_count=total_error_count,
+            error_message=None,
+        )
+        upload_local_db(db_blob, local_db_path)
+        set_job_done(
+            bucket,
+            uid,
+            job_id,
+            phase="extract_knowledge",
+            message="completed",
+            knowledge_count=total_qa_count + total_plain_count,
+        )
+
+    except Exception as e:
+        logger.exception("run_upload_job_background failed: job_id=%s", job_id)
+        set_job_error(
+            bucket,
+            uid,
+            job_id,
+            str(e),
+            phase="extract_knowledge",
+            message="background failed",
+        )
 
 
 def validate_request(body: KnowledgeJobCreateRequest) -> None:
@@ -1580,22 +1454,18 @@ def create_upload_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = local_user_db_path(uid, "job")
-    db_blob.download_to_filename(local_db_path)
+    local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
-        chunk_config = load_chunk_config()
-        qa_chunk_conf = get_upload_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_upload_chunk_conf(chunk_config, "plain")
-
-        lock_key = build_lock_key(uid)
-        running_job_id = get_running_lock_job_id(local_db_path, lock_key)
-        if running_job_id:
-            raise HTTPException(status_code=409, detail=f"another upload job is running: {running_job_id}")
+        qa_template_text = load_template_text(BUCKET_NAME, UPLOAD_QA_PROMPT_PATH)
+        plain_template_text = load_template_text(BUCKET_NAME, UPLOAD_PLAIN_PROMPT_PATH)
+        chunk_config = load_chunk_config(BUCKET_NAME, OPENAI_CHUNK_CONFIG_PATH)
+        qa_chunk_conf = get_required_upload_chunk_conf(chunk_config, "qa")
+        plain_chunk_conf = get_required_upload_chunk_conf(chunk_config, "plain")
 
         unique_items: List[KnowledgeTargetItem] = []
         seen_keys = set()
-
         for item in body.items:
             key = (
                 SOURCE_TYPE,
@@ -1609,36 +1479,21 @@ def create_upload_job(
             unique_items.append(item)
 
         selected_count = len(unique_items)
-        debug(f"create_upload_job unique_items={selected_count}")
-
         job_id, requested_at = create_job_record(local_db_path, body, selected_count)
-
-        # 途中で失敗しても knowledge_jobs を確認できるように、ここで一度アップロードする
-        safe_upload_local_db(db_blob, local_db_path, f"after create_job_record job_id={job_id}")
 
         prompt_previews: List[PromptPreviewItem] = []
         debug_items: List[KnowledgeDebugItem] = []
         created_item_count = 0
 
         for item in unique_items:
-            debug(
-                f"create_upload_job loop start job_id={job_id} "
-                f"parent_source_id={item.parent_source_id} parent_label={item.parent_label}"
-            )
-
             prepared = prepare_job_item(
                 local_db_path=local_db_path,
+                bucket=bucket,
+                uid=uid,
                 job_id=job_id,
                 item=item,
                 requested_at=requested_at,
                 preview_only=body.preview_only,
-            )
-
-            # prepare_job_item 後も状態確認できるようにアップロード
-            safe_upload_local_db(
-                db_blob,
-                local_db_path,
-                f"after prepare_job_item job_id={job_id} job_item_id={prepared['job_item_id']}",
             )
 
             prompts = build_prompts_for_existing_job_item(
@@ -1646,6 +1501,8 @@ def create_upload_job(
                 job_item_id=prepared["job_item_id"],
                 qa_chunk_conf=qa_chunk_conf,
                 plain_chunk_conf=plain_chunk_conf,
+                qa_template_text=qa_template_text,
+                plain_template_text=plain_template_text,
             )
 
             prompt_previews.append(
@@ -1671,18 +1528,16 @@ def create_upload_job(
                 KnowledgeDebugItem(
                     job_item_id=prepared["job_item_id"],
                     parent_label=item.parent_label,
-                    status="preview" if body.preview_only else "queued",
+                    status="done" if body.preview_only else "new",
                     qa_count=0,
                     plain_count=0,
                     error_message=None,
-                    llm_result={
-                        "inserted_count": prepared.get("inserted_count"),
-                    },
+                    llm_result=None,
                 )
             )
             created_item_count += 1
 
-        initial_status = "preview" if body.preview_only else "queued"
+        initial_status = "done" if body.preview_only else "new"
         update_job_summary(
             local_db_path=local_db_path,
             job_id=job_id,
@@ -1691,6 +1546,7 @@ def create_upload_job(
             total_qa_count=0,
             total_plain_count=0,
             total_error_count=0,
+            error_message=None,
         )
 
         upload_local_db(db_blob, local_db_path)
@@ -1705,11 +1561,10 @@ def create_upload_job(
         )
 
     except sqlite3.IntegrityError as e:
-        safe_upload_local_db(db_blob, local_db_path, "sqlite integrity error")
         raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
-
+    except HTTPException:
+        raise
     except Exception as e:
-        safe_upload_local_db(db_blob, local_db_path, f"create_upload_job exception {type(e).__name__}")
         logger.exception("create_upload_job failed")
         raise HTTPException(status_code=500, detail=f"create_upload_job failed: {type(e).__name__}: {e}")
 
@@ -1717,6 +1572,7 @@ def create_upload_job(
 @router.post("/run", response_model=KnowledgeJobCreateResponse)
 def run_upload_job(
     body: KnowledgeRunRequest,
+    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
@@ -1732,8 +1588,25 @@ def run_upload_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    local_db_path = local_user_db_path(uid, "run")
-    db_blob.download_to_filename(local_db_path)
+    current_status = try_read_status_payload(bucket, uid)
+    if current_status.get("status") == "running":
+        running_job_id = current_status.get("job_id")
+        if running_job_id == body.job_id:
+            return KnowledgeJobCreateResponse(
+                job_id=body.job_id,
+                selected_count=0,
+                created_item_count=0,
+                status="running",
+                prompt_previews=[],
+                debug_items=[],
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"別のジョブが実行中です。完了後に再実行してください。 running_job_id={running_job_id or ''}",
+        )
+
+    local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(db_blob, local_db_path)
 
     try:
         job_row = fetch_job_row(local_db_path, body.job_id)
@@ -1742,207 +1615,67 @@ def run_upload_job(
         if job_row["source_type"] != SOURCE_TYPE:
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
-        if job_row["status"] == "ready":
-            items = fetch_job_items(local_db_path, body.job_id)
+        if job_row["status"] == "done":
+            set_job_done(
+                bucket,
+                uid,
+                body.job_id,
+                phase="extract_knowledge",
+                message="already done",
+                knowledge_count=int(job_row["qa_count"] or 0) + int(job_row["plain_count"] or 0),
+            )
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=int(job_row["selected_count"] or 0),
-                created_item_count=len(items),
-                status="ready",
+                selected_count=0,
+                created_item_count=0,
+                status="done",
                 prompt_previews=[],
                 debug_items=[],
             )
 
-        if job_row["status"] == "preview":
-            raise HTTPException(status_code=400, detail="preview job cannot be run")
-
-        chunk_config = load_chunk_config()
-        qa_chunk_conf = get_upload_chunk_conf(chunk_config, "qa")
-        plain_chunk_conf = get_upload_chunk_conf(chunk_config, "plain")
-
         requested_at = job_row["requested_at"] or now_iso()
-        selected_count = int(job_row["selected_count"] or 0)
-
-        lock_key = build_lock_key(uid)
-        acquired = try_acquire_job_lock(local_db_path, lock_key, body.job_id)
-        if not acquired:
-            running_job_id = get_running_lock_job_id(local_db_path, lock_key)
-            if running_job_id == body.job_id:
-                raise HTTPException(status_code=409, detail=f"job already running: {body.job_id}")
-            raise HTTPException(status_code=409, detail=f"another upload job is running: {running_job_id or body.job_id}")
-
-        prompt_previews: List[PromptPreviewItem] = []
-        debug_items: List[KnowledgeDebugItem] = []
-        created_item_count = 0
         total_qa_count = int(job_row["qa_count"] or 0)
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
-
-        conn = open_user_db(local_db_path)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                UPDATE knowledge_jobs
-                SET status = 'running',
-                    started_at = COALESCE(started_at, ?),
-                    finished_at = NULL,
-                    error_message = NULL
-                WHERE job_id = ?
-                """,
-                (now_iso(), body.job_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-        upload_local_db(db_blob, local_db_path)
-
-        while True:
-            row = fetch_next_queued_job_item(local_db_path, body.job_id)
-            if not row:
-                break
-
-            current_job_item_id = row["job_item_id"]
-
-            try:
-                result = process_upload_job_item(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    job_item_id=current_job_item_id,
-                    qa_chunk_conf=qa_chunk_conf,
-                    plain_chunk_conf=plain_chunk_conf,
-                    preview_only=False,
-                )
-
-                prompt_previews.append(
-                    PromptPreviewItem(
-                        job_item_id=result["job_item_id"],
-                        parent_source_id=result["parent_source_id"],
-                        parent_label=result["parent_label"],
-                        prompt_type="qa",
-                        prompt_text=join_prompt_previews(result["qa_prompt_texts"]),
-                    )
-                )
-                prompt_previews.append(
-                    PromptPreviewItem(
-                        job_item_id=result["job_item_id"],
-                        parent_source_id=result["parent_source_id"],
-                        parent_label=result["parent_label"],
-                        prompt_type="plain",
-                        prompt_text=join_prompt_previews(result["plain_prompt_texts"]),
-                    )
-                )
-
-                debug_items.append(
-                    KnowledgeDebugItem(
-                        job_item_id=result["job_item_id"],
-                        parent_label=result["parent_label"],
-                        status=result["status"],
-                        qa_count=result["qa_count"],
-                        plain_count=result["plain_count"],
-                        error_message=None,
-                        llm_result={
-                            "qa": result["qa_debug"],
-                            "plain": result["plain_debug"],
-                        },
-                    )
-                )
-
-                created_item_count += 1
-                total_qa_count += result["qa_count"]
-                total_plain_count += result["plain_count"]
-
-                update_job_summary(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    requested_at=requested_at,
-                    status="running",
-                    total_qa_count=total_qa_count,
-                    total_plain_count=total_plain_count,
-                    total_error_count=total_error_count,
-                )
-                upload_local_db(db_blob, local_db_path)
-
-            except Exception as e:
-                logger.exception(
-                    "run_upload_job item failed: job_id=%s job_item_id=%s",
-                    body.job_id,
-                    current_job_item_id,
-                )
-
-                try:
-                    finalize_job_item_error(
-                        local_db_path=local_db_path,
-                        job_item_id=current_job_item_id,
-                        error_message=str(e),
-                    )
-                except Exception:
-                    logger.exception("failed to update error state: job_item_id=%s", current_job_item_id)
-
-                debug_items.append(
-                    KnowledgeDebugItem(
-                        job_item_id=current_job_item_id,
-                        parent_label=row["parent_label"],
-                        status="error",
-                        qa_count=0,
-                        plain_count=0,
-                        error_message=str(e),
-                        llm_result=None,
-                    )
-                )
-                total_error_count += 1
-
-                update_job_summary(
-                    local_db_path=local_db_path,
-                    job_id=body.job_id,
-                    requested_at=requested_at,
-                    status="partial_error",
-                    total_qa_count=total_qa_count,
-                    total_plain_count=total_plain_count,
-                    total_error_count=total_error_count,
-                )
-                upload_local_db(db_blob, local_db_path)
-                break
-
-        final_status = "partial_error" if total_error_count > 0 else "ready"
 
         update_job_summary(
             local_db_path=local_db_path,
             job_id=body.job_id,
             requested_at=requested_at,
-            status=final_status,
+            status="running",
             total_qa_count=total_qa_count,
             total_plain_count=total_plain_count,
             total_error_count=total_error_count,
+            error_message=None,
         )
 
-        upload_local_db(db_blob, local_db_path)
+        set_job_running(
+            bucket,
+            uid,
+            body.job_id,
+            SOURCE_TYPE,
+            phase="extract_knowledge",
+            message="job started",
+        )
+
+        background_tasks.add_task(run_upload_job_background, uid, body.job_id)
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=selected_count,
-            created_item_count=created_item_count,
-            status=final_status,
-            prompt_previews=prompt_previews,
-            debug_items=debug_items,
+            selected_count=0,
+            created_item_count=0,
+            status="running",
+            prompt_previews=[],
+            debug_items=[],
         )
 
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=409, detail=f"duplicate or integrity error: {e}")
-
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("run_upload_job failed")
         raise HTTPException(status_code=500, detail=f"run_upload_job failed: {type(e).__name__}: {e}")
-
-    finally:
-        try:
-            release_job_lock(local_db_path, build_lock_key(uid), body.job_id)
-        except Exception:
-            logger.exception("failed to release upload job lock: job_id=%s", body.job_id)
 
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
@@ -1955,55 +1688,13 @@ def get_upload_job_status(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
-    db_blob = bucket.blob(db_gcs_path)
-    if not db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
-        )
-
-    local_db_path = local_user_db_path(uid, "status")
-    db_blob.download_to_filename(local_db_path)
-
     try:
-        job_row = fetch_job_row(local_db_path, job_id)
-        if not job_row:
-            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {job_id}")
-        if job_row["source_type"] != SOURCE_TYPE:
-            raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
-
-        item_rows = fetch_job_items(local_db_path, job_id)
-
-        items = [
-            KnowledgeJobStatusItem(
-                job_item_id=row["job_item_id"],
-                parent_source_id=row["parent_source_id"],
-                parent_label=row["parent_label"],
-                status=row["status"] or "",
-                knowledge_count=int(row["knowledge_count"] or 0),
-                error_message=row["error_message"],
-                row_count=int(row["row_count"] or 0),
-                started_at=row["started_at"],
-                finished_at=row["finished_at"],
-            )
-            for row in item_rows
-        ]
-
-        return KnowledgeJobStatusResponse(
-            job_id=job_row["job_id"],
-            status=job_row["status"] or "",
-            selected_count=int(job_row["selected_count"] or 0),
-            qa_count=int(job_row["qa_count"] or 0),
-            plain_count=int(job_row["plain_count"] or 0),
-            error_count=int(job_row["error_count"] or 0),
-            requested_at=job_row["requested_at"],
-            started_at=job_row["started_at"],
-            finished_at=job_row["finished_at"],
-            error_message=job_row["error_message"],
-            items=items,
-        )
-
+        payload = try_read_status_payload(bucket, uid)
+        if payload.get("job_id") == job_id:
+            return KnowledgeJobStatusResponse(**payload)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("get_upload_job_status failed")
-        raise HTTPException(status_code=500, detail=f"get_upload_job_status failed: {type(e).__name__}: {e}")
+        logger.warning("failed to read knowledge_generate.json: %s", e)
+
+    raise HTTPException(status_code=404, detail=f"status not found: {job_id}")
