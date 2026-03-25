@@ -6,7 +6,7 @@ import math
 import sqlite3
 import logging
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 from google.cloud import storage
 from openai import OpenAI
@@ -96,6 +96,10 @@ def knowledge_db_path(uid: str, filename: str) -> str:
     return f"users/{uid}/{filename}"
 
 
+def user_db_path(uid: str) -> str:
+    return f"users/{uid}/ank.db"
+
+
 def download_knowledge_db(uid: str, filename: str) -> str:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -111,9 +115,31 @@ def download_knowledge_db(uid: str, filename: str) -> str:
     return local_path
 
 
+def download_user_db(uid: str) -> str:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    gcs_path = user_db_path(uid)
+    blob = bucket.blob(gcs_path)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"user db not found: {gcs_path}")
+
+    local_path = f"/tmp/knowledge_master_{uid}.sqlite"
+    blob.download_to_filename(local_path)
+    return local_path
+
+
 def _open_knowledge_db(uid: str, db_name: str) -> sqlite3.Connection:
     safe_db_name = _sanitize_db_name(db_name)
     local_db_path = download_knowledge_db(uid, safe_db_name)
+    conn = sqlite3.connect(local_db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _open_user_db(uid: str) -> sqlite3.Connection:
+    local_db_path = download_user_db(uid)
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
     return conn
@@ -750,31 +776,55 @@ def search_knowledge(req: SearchRequest, authorization: str | None = Header(defa
 
 
 @router.get("/dbs")
-def list_knowledge_dbs(authorization: str | None = Header(default=None)):
+def list_knowledge_dbs(
+    source_type: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+):
     uid = get_uid_from_auth_header(authorization)
+    conn = _open_user_db(uid)
 
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    prefix = f"users/{uid}/"
-    blobs = client.list_blobs(bucket, prefix=prefix)
+    try:
+        params: list[str] = []
+        sql = """
+        SELECT
+            database_name,
+            source_type,
+            created_at
+        FROM knowledge_db
+        """
 
-    items = []
-    for blob in blobs:
-        name = blob.name.replace(prefix, "")
-        if not name.endswith(".sqlite"):
-            continue
-        if not name.startswith("knowledge_"):
-            continue
-        items.append({
-            "db_name": name,
-            "size": blob.size,
-            "updated": blob.updated.isoformat() if blob.updated else None
-        })
+        source_type_value = (source_type or "").strip()
+        if source_type_value:
+            sql += " WHERE source_type = ?"
+            params.append(source_type_value)
 
-    items.sort(key=lambda x: x["db_name"], reverse=True)
+        sql += " ORDER BY created_at DESC, database_name DESC"
 
-    return {
-        "ok": True,
-        "count": len(items),
-        "items": items
-    }
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+        items = []
+        for row in rows:
+            database_name = (row["database_name"] or "").strip()
+            if not database_name:
+                continue
+
+            items.append({
+                "database_name": database_name,
+                "source_type": row["source_type"],
+                "created_at": row["created_at"],
+            })
+
+        return {
+            "ok": True,
+            "count": len(items),
+            "items": items,
+        }
+
+    except sqlite3.Error as e:
+        logger.exception("list_knowledge_dbs sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    finally:
+        conn.close()
