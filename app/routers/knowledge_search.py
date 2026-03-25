@@ -53,6 +53,17 @@ class SearchRequest(BaseModel):
     mode: str = "plain_fts"
 
 
+class KnowledgeItemsResponse(BaseModel):
+    ok: bool
+    source_type: str
+    db_name: str
+    knowledge_type: str
+    page: int
+    page_size: int
+    total: int
+    items: list[dict]
+
+
 def ensure_firebase_initialized():
     if firebase_admin._apps:
         return
@@ -144,6 +155,73 @@ def _open_user_db(uid: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def _normalize_knowledge_type(value: str) -> str:
+    src = (value or "").strip().lower()
+    if src == "qa":
+        return "qa"
+    if src == "plain":
+        return "plain"
+    raise HTTPException(status_code=400, detail="knowledge_type must be qa or plain")
+
+
+def _assert_db_matches_source_type(uid: str, db_name: str, source_type: str) -> None:
+    conn = _open_user_db(uid)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM knowledge_db
+            WHERE database_name = ?
+              AND source_type = ?
+            LIMIT 1
+            """,
+            (db_name, source_type),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"knowledge db not found for source_type: db_name={db_name}, source_type={source_type}",
+            )
+    finally:
+        conn.close()
+
+
+def _build_items_count_sql() -> str:
+    return """
+    SELECT COUNT(*)
+    FROM knowledge_entries
+    WHERE knowledge_type = ?
+    """
+
+
+def _build_items_select_sql() -> str:
+    return """
+    SELECT
+        entry_id AS knowledge_id,
+        knowledge_type,
+        title,
+        question,
+        answer,
+        content,
+        source_type,
+        source_item_id AS source_id,
+        source_label,
+        sort_no,
+        created_at,
+        created_at AS updated_at,
+        '' AS status,
+        '' AS review_status,
+        '' AS job_id,
+        '' AS job_item_id
+    FROM knowledge_entries
+    WHERE knowledge_type = ?
+    ORDER BY sort_no ASC, created_at DESC, entry_id ASC
+    LIMIT ?
+    OFFSET ?
+    """
 
 def _get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -824,6 +902,61 @@ def list_knowledge_dbs(
 
     except sqlite3.Error as e:
         logger.exception("list_knowledge_dbs sqlite error")
+        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
+
+    finally:
+        conn.close()
+
+@router.get("/items", response_model=KnowledgeItemsResponse)
+def list_knowledge_items(
+    source_type: str = Query(...),
+    db_name: str = Query(...),
+    knowledge_type: str = Query(...),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+):
+    uid = get_uid_from_auth_header(authorization)
+
+    safe_db_name = _sanitize_db_name(db_name)
+    safe_source_type = (source_type or "").strip()
+    if not safe_source_type:
+        raise HTTPException(status_code=400, detail="source_type is required")
+
+    safe_knowledge_type = _normalize_knowledge_type(knowledge_type)
+
+    _assert_db_matches_source_type(uid, safe_db_name, safe_source_type)
+
+    conn = _open_knowledge_db(uid, safe_db_name)
+
+    try:
+        cur = conn.cursor()
+
+        count_sql = _build_items_count_sql()
+        cur.execute(count_sql, (safe_knowledge_type,))
+        total = int(cur.fetchone()[0] or 0)
+
+        offset = (page - 1) * page_size
+
+        select_sql = _build_items_select_sql()
+        cur.execute(select_sql, (safe_knowledge_type, page_size, offset))
+        rows = cur.fetchall()
+
+        items = [dict(row) for row in rows]
+
+        return KnowledgeItemsResponse(
+            ok=True,
+            source_type=safe_source_type,
+            db_name=safe_db_name,
+            knowledge_type=safe_knowledge_type,
+            page=page,
+            page_size=page_size,
+            total=total,
+            items=items,
+        )
+
+    except sqlite3.Error as e:
+        logger.exception("list_knowledge_items sqlite error")
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     finally:
