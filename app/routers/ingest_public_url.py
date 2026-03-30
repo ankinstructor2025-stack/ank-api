@@ -399,6 +399,42 @@ def remove_global_noise(soup: BeautifulSoup) -> None:
             tag.decompose()
 
 
+def is_noise_anchor(a: Tag) -> bool:
+    if not isinstance(a, Tag):
+        return True
+
+    href = (a.get("href") or "").strip().lower()
+    if not href:
+        return True
+
+    if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return True
+
+    # アンカー自身の class / id / aria-label
+    self_hint = get_tag_hint_text(a)
+    if self_hint and NOISE_HINT_PATTERN.search(self_hint):
+        return True
+
+    # 近い親だけ見る
+    parent = a.parent if isinstance(a.parent, Tag) else None
+    hop = 0
+    while isinstance(parent, Tag) and hop < 3:
+        parent_name = (parent.name or "").lower()
+
+        # 祖先が form の中なら検索導線の可能性が高い
+        if parent_name == "form":
+            return True
+
+        parent_hint = get_tag_hint_text(parent)
+        if parent_hint and NOISE_HINT_PATTERN.search(parent_hint):
+            return True
+
+        parent = parent.parent if isinstance(parent.parent, Tag) else None
+        hop += 1
+
+    return False
+
+
 def candidate_node_score(node: Tag) -> float:
     text = " ".join(node.stripped_strings)
     text = re.sub(r"\s+", " ", text).strip()
@@ -467,23 +503,36 @@ def remove_toc_like_nodes(main_node: Tag) -> None:
 
 def extract_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
-    remove_global_noise(soup)
+
+    # ここでは remove_global_noise を使わない
+    # 本文抽出用の強いノイズ除去はリンク抽出では副作用が大きすぎるため
+
+    raw_anchors = soup.find_all("a", href=True)
+    print(f"[DEBUG] raw_a_count={len(raw_anchors)}")
 
     urls: list[str] = []
     seen: set[str] = set()
-    for a in soup.find_all("a", href=True):
+
+    for a in raw_anchors:
+        if is_noise_anchor(a):
+            continue
+
         href = (a.get("href") or "").strip()
-        if not href or href.startswith("#"):
+        if not href:
             continue
-        lower = href.lower()
-        if lower.startswith(("javascript:", "mailto:", "tel:")):
-            continue
+
         abs_url = urljoin(base_url, href)
         norm = normalize_url(abs_url)
+
         if norm in seen:
             continue
+
         seen.add(norm)
         urls.append(norm)
+
+    print(f"[DEBUG] extract_links normalized_url_count={len(urls)}")
+    print(f"[DEBUG] extract_links normalized_url_sample={urls[:10]}")
+
     return urls
 
 
@@ -1004,7 +1053,7 @@ def build_page_results(
     print("[STEP] root extract_links start")
     root_links_all = extract_links(root_html, target_url)
     print(f"[STEP] root extract_links done count={len(root_links_all)}")
-    print(f"[STEP] root raw_links sample={root_links_all[:5]}")
+    print(f"[STEP] root raw_links sample={root_links_all[:10]}")
 
     seen_urls: set[str] = set()
 
