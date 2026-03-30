@@ -60,7 +60,6 @@ class CrawlRule:
     branch_first: bool
     priority_keywords: list[str]
     deprioritize_keywords: list[str]
-    max_children_per_page: int
 
 
 @dataclass
@@ -135,170 +134,160 @@ def is_html_like_url(url: str) -> bool:
     return not lower.endswith(blocked_exts)
 
 
-def config_error(message: str) -> HTTPException:
-    return HTTPException(status_code=500, detail=f"public_url.json invalid: {message}")
-
-
-def expect_dict(value: Any, path: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise config_error(f"{path} must be object")
-    return value
-
-
-def expect_list(value: Any, path: str) -> list[Any]:
-    if not isinstance(value, list):
-        raise config_error(f"{path} must be array")
-    return value
-
-
-def expect_bool(value: Any, path: str) -> bool:
+def _ensure_bool(conf: dict[str, Any], key: str, section: str) -> bool:
+    value = conf.get(key)
     if not isinstance(value, bool):
-        raise config_error(f"{path} must be boolean")
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must be boolean")
     return value
 
 
-def expect_int(value: Any, path: str, minimum: int | None = None, maximum: int | None = None) -> int:
+def _ensure_int(conf: dict[str, Any], key: str, section: str, min_value: int = 0) -> int:
+    value = conf.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise config_error(f"{path} must be integer")
-    if minimum is not None and value < minimum:
-        raise config_error(f"{path} must be >= {minimum}")
-    if maximum is not None and value > maximum:
-        raise config_error(f"{path} must be <= {maximum}")
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must be integer")
+    if value < min_value:
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must be >= {min_value}")
     return value
 
 
-def expect_number(value: Any, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise config_error(f"{path} must be number")
-    return float(value)
-
-
-def expect_string(value: Any, path: str, allow_empty: bool = False) -> str:
+def _ensure_str(conf: dict[str, Any], key: str, section: str, allow_empty: bool = False) -> str:
+    value = conf.get(key)
     if not isinstance(value, str):
-        raise config_error(f"{path} must be string")
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must be string")
     text = value.strip()
     if not allow_empty and not text:
-        raise config_error(f"{path} must not be empty")
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must not be empty")
     return text
 
 
-def expect_string_list(value: Any, path: str) -> list[str]:
-    items = expect_list(value, path)
-    result: list[str] = []
-    for idx, item in enumerate(items):
-        result.append(expect_string(item, f"{path}[{idx}]").lower())
-    return result
+def _ensure_str_list(conf: dict[str, Any], key: str, section: str) -> list[str]:
+    value = conf.get(key)
+    if not isinstance(value, list):
+        raise HTTPException(status_code=500, detail=f"{section}.{key} must be array")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise HTTPException(status_code=500, detail=f"{section}.{key}[{i}] must be string")
+        item_text = item.strip().lower()
+        if not item_text:
+            raise HTTPException(status_code=500, detail=f"{section}.{key}[{i}] must not be empty")
+        out.append(item_text)
+    return out
 
 
-def validate_threshold_rule(rule: Any, path: str) -> None:
-    item = expect_dict(rule, path)
+def _validate_score_rule_item(item: Any, section: str) -> None:
+    if not isinstance(item, dict):
+        raise HTTPException(status_code=500, detail=f"{section} item must be object")
     if "score" not in item:
-        raise config_error(f"{path}.score is required")
+        raise HTTPException(status_code=500, detail=f"{section}.score is required")
+    score = item.get("score")
+    if isinstance(score, bool) or not isinstance(score, int):
+        raise HTTPException(status_code=500, detail=f"{section}.score must be integer")
     if "lt" not in item and "gte" not in item:
-        raise config_error(f"{path} must have lt or gte")
-    if "lt" in item:
-        expect_number(item["lt"], f"{path}.lt")
-    if "gte" in item:
-        expect_number(item["gte"], f"{path}.gte")
-    expect_int(item["score"], f"{path}.score")
+        raise HTTPException(status_code=500, detail=f"{section} must have lt or gte")
+    for k in ("lt", "gte"):
+        if k in item and not isinstance(item.get(k), (int, float)):
+            raise HTTPException(status_code=500, detail=f"{section}.{k} must be number")
 
 
-def validate_threshold_rule_list(value: Any, path: str) -> None:
-    items = expect_list(value, path)
-    for idx, item in enumerate(items):
-        validate_threshold_rule(item, f"{path}[{idx}]")
+def validate_public_url_config(data: dict[str, Any]) -> dict[str, Any]:
+    if _ensure_str(data, "source_type", "root") != "public_url":
+        raise HTTPException(status_code=500, detail="source_type must be public_url")
 
+    crawl = data.get("crawl")
+    if not isinstance(crawl, dict):
+        raise HTTPException(status_code=500, detail="crawl must be object")
+    _ensure_bool(crawl, "same_domain_only", "crawl")
+    _ensure_bool(crawl, "include_root_page", "crawl")
+    _ensure_bool(crawl, "branch_first", "crawl")
+    _ensure_int(crawl, "max_depth", "crawl", min_value=1)
+    _ensure_int(crawl, "max_pages", "crawl", min_value=1)
+    _ensure_str_list(crawl, "priority_keywords", "crawl")
+    _ensure_str_list(crawl, "deprioritize_keywords", "crawl")
 
-def validate_keyword_score_map(value: Any, path: str) -> None:
-    obj = expect_dict(value, path)
-    for key, score in obj.items():
-        expect_string(key, f"{path}.{key}")
-        expect_int(score, f"{path}.{key}")
+    sources = data.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise HTTPException(status_code=500, detail="sources must be non-empty array")
+    seen_source_keys: set[str] = set()
+    for i, source in enumerate(sources):
+        section = f"sources[{i}]"
+        if not isinstance(source, dict):
+            raise HTTPException(status_code=500, detail=f"{section} must be object")
+        source_key = _ensure_str(source, "source_key", section)
+        _ensure_str(source, "label", section)
+        url = _ensure_str(source, "url", section)
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise HTTPException(status_code=500, detail=f"{section}.url must be absolute http/https url")
+        if source_key in seen_source_keys:
+            raise HTTPException(status_code=500, detail=f"duplicate source_key: {source_key}")
+        seen_source_keys.add(source_key)
 
+    page_scoring = data.get("page_scoring")
+    if not isinstance(page_scoring, dict):
+        raise HTTPException(status_code=500, detail="page_scoring must be object")
+    if _ensure_bool(page_scoring, "enabled", "page_scoring") is not True:
+        raise HTTPException(status_code=500, detail="page_scoring.enabled must be true")
+    filter_mode = _ensure_str(page_scoring, "filter_mode", "page_scoring")
+    if filter_mode not in ("active_filter", "score_only"):
+        raise HTTPException(status_code=500, detail="page_scoring.filter_mode must be active_filter or score_only")
+    default_decision = _ensure_str(page_scoring, "default_decision", "page_scoring")
+    if default_decision not in ("pass", "review", "reject"):
+        raise HTTPException(status_code=500, detail="page_scoring.default_decision must be pass/review/reject")
+    if isinstance(page_scoring.get("base_score"), bool) or not isinstance(page_scoring.get("base_score"), int):
+        raise HTTPException(status_code=500, detail="page_scoring.base_score must be integer")
+    if isinstance(page_scoring.get("keyword_cap"), bool) or not isinstance(page_scoring.get("keyword_cap"), int):
+        raise HTTPException(status_code=500, detail="page_scoring.keyword_cap must be integer")
 
-def validate_page_scoring_config(page_scoring: Any) -> dict[str, Any]:
-    cfg = expect_dict(page_scoring, "page_scoring")
-    expect_bool(cfg.get("enabled"), "page_scoring.enabled")
-    filter_mode = expect_string(cfg.get("filter_mode"), "page_scoring.filter_mode")
-    if filter_mode not in {"active_filter", "score_only"}:
-        raise config_error("page_scoring.filter_mode must be 'active_filter' or 'score_only'")
-    default_decision = expect_string(cfg.get("default_decision"), "page_scoring.default_decision")
-    if default_decision not in {"pass", "review", "reject"}:
-        raise config_error("page_scoring.default_decision must be one of pass/review/reject")
-    expect_int(cfg.get("base_score"), "page_scoring.base_score")
-    expect_int(cfg.get("keyword_cap"), "page_scoring.keyword_cap", minimum=0)
-
-    rules = expect_dict(cfg.get("rules"), "page_scoring.rules")
+    rules = page_scoring.get("rules")
+    if not isinstance(rules, dict):
+        raise HTTPException(status_code=500, detail="page_scoring.rules must be object")
     for key in ("title_keywords", "body_keywords", "url_keywords"):
-        if key not in rules:
-            raise config_error(f"page_scoring.rules.{key} is required")
-        validate_keyword_score_map(rules[key], f"page_scoring.rules.{key}")
+        sub = rules.get(key)
+        if not isinstance(sub, dict):
+            raise HTTPException(status_code=500, detail=f"page_scoring.rules.{key} must be object")
+        for kw, score in sub.items():
+            if not isinstance(kw, str) or not kw.strip():
+                raise HTTPException(status_code=500, detail=f"page_scoring.rules.{key} keyword must be non-empty string")
+            if isinstance(score, bool) or not isinstance(score, int):
+                raise HTTPException(status_code=500, detail=f"page_scoring.rules.{key}[{kw}] must be integer")
 
-    thresholds = expect_dict(cfg.get("thresholds"), "page_scoring.thresholds")
-    if "min_text_length" not in thresholds:
-        raise config_error("page_scoring.thresholds.min_text_length is required")
-    validate_threshold_rule(thresholds["min_text_length"], "page_scoring.thresholds.min_text_length")
+    thresholds = page_scoring.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise HTTPException(status_code=500, detail="page_scoring.thresholds must be object")
+    min_text_length = thresholds.get("min_text_length")
+    if not isinstance(min_text_length, dict):
+        raise HTTPException(status_code=500, detail="page_scoring.thresholds.min_text_length must be object")
+    _validate_score_rule_item(min_text_length, "page_scoring.thresholds.min_text_length")
     for key in ("text_length_bonus", "link_density", "short_line_ratio"):
-        if key not in thresholds:
-            raise config_error(f"page_scoring.thresholds.{key} is required")
-        validate_threshold_rule_list(thresholds[key], f"page_scoring.thresholds.{key}")
+        rule_list = thresholds.get(key)
+        if not isinstance(rule_list, list):
+            raise HTTPException(status_code=500, detail=f"page_scoring.thresholds.{key} must be array")
+        for idx, item in enumerate(rule_list):
+            _validate_score_rule_item(item, f"page_scoring.thresholds.{key}[{idx}]")
 
-    structure_rules = expect_dict(cfg.get("structure_rules"), "page_scoring.structure_rules")
+    structure_rules = page_scoring.get("structure_rules")
+    if not isinstance(structure_rules, dict):
+        raise HTTPException(status_code=500, detail="page_scoring.structure_rules must be object")
     for key in ("paragraph_count", "heading_count", "text_density", "sentence_ratio", "link_only_block_ratio", "nav_like_block_ratio"):
-        if key not in structure_rules:
-            raise config_error(f"page_scoring.structure_rules.{key} is required")
-        validate_threshold_rule_list(structure_rules[key], f"page_scoring.structure_rules.{key}")
+        rule_list = structure_rules.get(key)
+        if not isinstance(rule_list, list):
+            raise HTTPException(status_code=500, detail=f"page_scoring.structure_rules.{key} must be array")
+        for idx, item in enumerate(rule_list):
+            _validate_score_rule_item(item, f"page_scoring.structure_rules.{key}[{idx}]")
 
-    decisions = expect_dict(cfg.get("decisions"), "page_scoring.decisions")
+    decisions = page_scoring.get("decisions")
+    if not isinstance(decisions, dict):
+        raise HTTPException(status_code=500, detail="page_scoring.decisions must be object")
     for key in ("pass", "review", "reject"):
-        if key not in decisions:
-            raise config_error(f"page_scoring.decisions.{key} is required")
-        item = expect_dict(decisions[key], f"page_scoring.decisions.{key}")
-        if "gte" not in item and "lt" not in item:
-            raise config_error(f"page_scoring.decisions.{key} must have gte or lt")
-        if "gte" in item:
-            expect_int(item["gte"], f"page_scoring.decisions.{key}.gte")
-        if "lt" in item:
-            expect_int(item["lt"], f"page_scoring.decisions.{key}.lt")
+        item = decisions.get(key)
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=500, detail=f"page_scoring.decisions.{key} must be object")
+        for sub_key in ("gte", "lt"):
+            if sub_key in item and not isinstance(item.get(sub_key), int):
+                raise HTTPException(status_code=500, detail=f"page_scoring.decisions.{key}.{sub_key} must be integer")
 
-    return cfg
-
-
-def validate_public_url_config(data: Any) -> dict[str, Any]:
-    cfg = expect_dict(data, "root")
-    source_type = expect_string(cfg.get("source_type"), "source_type")
-    if source_type != "public_url":
-        raise config_error("source_type must be 'public_url'")
-
-    crawl = expect_dict(cfg.get("crawl"), "crawl")
-    expect_bool(crawl.get("same_domain_only"), "crawl.same_domain_only")
-    expect_bool(crawl.get("include_root_page"), "crawl.include_root_page")
-    expect_int(crawl.get("max_depth"), "crawl.max_depth", minimum=1)
-    expect_int(crawl.get("max_pages"), "crawl.max_pages", minimum=1)
-    expect_bool(crawl.get("branch_first"), "crawl.branch_first")
-    expect_string_list(crawl.get("priority_keywords"), "crawl.priority_keywords")
-    expect_string_list(crawl.get("deprioritize_keywords"), "crawl.deprioritize_keywords")
-    if "max_children_per_page" in crawl and crawl.get("max_children_per_page") is not None:
-        expect_int(crawl.get("max_children_per_page"), "crawl.max_children_per_page", minimum=1)
-
-    sources = expect_list(cfg.get("sources"), "sources")
-    if not sources:
-        raise config_error("sources must not be empty")
-    seen_keys: set[str] = set()
-    for idx, source in enumerate(sources):
-        item = expect_dict(source, f"sources[{idx}]")
-        source_key = expect_string(item.get("source_key"), f"sources[{idx}].source_key")
-        if source_key in seen_keys:
-            raise config_error(f"sources[{idx}].source_key is duplicated: {source_key}")
-        seen_keys.add(source_key)
-        expect_string(item.get("label"), f"sources[{idx}].label")
-        url_text = expect_string(item.get("url"), f"sources[{idx}].url")
-        parsed = urlparse(url_text)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise config_error(f"sources[{idx}].url must be absolute http/https URL")
-
-    validate_page_scoring_config(cfg.get("page_scoring"))
-    return cfg
+    return data
 
 
 def load_public_url_config() -> dict[str, Any]:
@@ -313,6 +302,8 @@ def load_public_url_config() -> dict[str, Any]:
             )
         text = blob.download_as_text(encoding="utf-8")
         data = json.loads(text)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=500, detail="invalid json structure")
         return validate_public_url_config(data)
     except HTTPException:
         raise
@@ -333,21 +324,28 @@ def get_public_url_source(config: dict[str, Any], source_key: str) -> dict[str, 
 
 
 def load_crawl_rule(config: dict[str, Any]) -> CrawlRule:
-    crawl_conf = expect_dict(config.get("crawl"), "crawl")
+    crawl_conf = config.get("crawl")
+    if not isinstance(crawl_conf, dict):
+        raise HTTPException(status_code=500, detail="crawl not found in public_url.json")
+
     return CrawlRule(
-        same_domain_only=expect_bool(crawl_conf.get("same_domain_only"), "crawl.same_domain_only"),
-        include_root_page=expect_bool(crawl_conf.get("include_root_page"), "crawl.include_root_page"),
-        max_depth=expect_int(crawl_conf.get("max_depth"), "crawl.max_depth", minimum=1),
-        max_pages=expect_int(crawl_conf.get("max_pages"), "crawl.max_pages", minimum=1),
-        branch_first=expect_bool(crawl_conf.get("branch_first"), "crawl.branch_first"),
-        priority_keywords=expect_string_list(crawl_conf.get("priority_keywords"), "crawl.priority_keywords"),
-        deprioritize_keywords=expect_string_list(crawl_conf.get("deprioritize_keywords"), "crawl.deprioritize_keywords"),
-        max_children_per_page=expect_int(crawl_conf.get("max_children_per_page", 40), "crawl.max_children_per_page", minimum=1),
+        same_domain_only=_ensure_bool(crawl_conf, "same_domain_only", "crawl"),
+        include_root_page=_ensure_bool(crawl_conf, "include_root_page", "crawl"),
+        max_depth=_ensure_int(crawl_conf, "max_depth", "crawl", min_value=1),
+        max_pages=_ensure_int(crawl_conf, "max_pages", "crawl", min_value=1),
+        branch_first=_ensure_bool(crawl_conf, "branch_first", "crawl"),
+        priority_keywords=_ensure_str_list(crawl_conf, "priority_keywords", "crawl"),
+        deprioritize_keywords=_ensure_str_list(crawl_conf, "deprioritize_keywords", "crawl"),
     )
 
 
 def load_page_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
-    return validate_page_scoring_config(config.get("page_scoring"))
+    page_scoring = config.get("page_scoring")
+    if not isinstance(page_scoring, dict):
+        raise HTTPException(status_code=500, detail="page_scoring not found in public_url.json")
+    if page_scoring.get("enabled") is not True:
+        raise HTTPException(status_code=500, detail="page_scoring.enabled must be true")
+    return page_scoring
 
 
 def get_source_url(source: dict[str, Any]) -> str:
@@ -467,99 +465,26 @@ def remove_toc_like_nodes(main_node: Tag) -> None:
                 tag.decompose()
 
 
-def anchor_text_score(text: str) -> int:
-    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
-    if not cleaned:
-        return 0
-    length = len(cleaned)
-    score = 0
-    if 4 <= length <= 80:
-        score += 20
-    elif 2 <= length <= 120:
-        score += 8
-    if re.search(r"faq|qa|q&a|よくある質問|質問|相談|手続|申請|届出|年金|保険|制度|給付|支給|届書|案内|一覧|詳細", cleaned, re.I):
-        score += 35
-    if re.search(r"次へ|前へ|戻る|top|home|ホーム|一覧へ戻る", cleaned, re.I):
-        score -= 40
-    return score
-
-
-def link_context_score(anchor: Tag, href: str, base_url: str, main_node: Tag) -> int:
-    score = 0
-    abs_url = normalize_url(urljoin(base_url, href))
-    if is_html_like_url(abs_url):
-        score += 10
-    parsed = urlparse(abs_url)
-    path = parsed.path.lower()
-    if path.endswith((".html", ".htm", "/")):
-        score += 6
-    if any(x in path for x in ["faq", "qa", "question", "answer", "detail", "guide", "info", "service"]):
-        score += 24
-    if any(x in path for x in ["pdf", "download", "search", "sitemap", "contact"]):
-        score -= 30
-
-    parent = anchor.parent if isinstance(anchor.parent, Tag) else None
-    if parent is not None:
-        parent_name = parent.name or ""
-        if parent_name in {"li", "dt", "dd", "p", "td", "th"}:
-            score += 8
-        hint = get_tag_hint_text(parent)
-        if hint and TOC_HINT_PATTERN.search(hint):
-            score += 10
-        if hint and NOISE_HINT_PATTERN.search(hint):
-            score -= 50
-
-    anchor_hint = get_tag_hint_text(anchor)
-    if anchor_hint and NOISE_HINT_PATTERN.search(anchor_hint):
-        score -= 50
-
-    text = anchor.get_text(" ", strip=True)
-    score += anchor_text_score(text)
-
-    try:
-        if main_node is not None and anchor in main_node.find_all("a", href=True):
-            score += 12
-    except Exception:
-        pass
-
-    depth = len([x for x in path.split("/") if x])
-    score += min(depth, 10) * 2
-    return score
-
-
 def extract_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     remove_global_noise(soup)
-    main_node = find_best_main_node(soup)
 
-    scored: dict[str, int] = {}
-    order: dict[str, int] = {}
-    seq = 0
-
-    def collect(anchor_root: Tag | BeautifulSoup, bonus: int = 0) -> None:
-        nonlocal seq
-        for a in anchor_root.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href or href.startswith("#"):
-                continue
-            lower = href.lower()
-            if lower.startswith(("javascript:", "mailto:", "tel:")):
-                continue
-            abs_url = urljoin(base_url, href)
-            norm = normalize_url(abs_url)
-            score = link_context_score(a, href, base_url, main_node) + bonus
-            if norm not in order:
-                order[norm] = seq
-                seq += 1
-            prev = scored.get(norm)
-            if prev is None or score > prev:
-                scored[norm] = score
-
-    collect(main_node, bonus=20)
-    collect(soup, bonus=0)
-
-    items = sorted(scored.items(), key=lambda x: (-x[1], order.get(x[0], 0)))
-    return [url for url, score in items if score > -40]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#"):
+            continue
+        lower = href.lower()
+        if lower.startswith(("javascript:", "mailto:", "tel:")):
+            continue
+        abs_url = urljoin(base_url, href)
+        norm = normalize_url(abs_url)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        urls.append(norm)
+    return urls
 
 
 def root_path_prefix(url: str) -> str:
@@ -630,9 +555,8 @@ def filter_child_urls(
         accepted.append(url)
 
     accepted.sort(key=lambda x: child_url_priority(x, current_url, root_url, rule), reverse=True)
-    limited = accepted[: rule.max_children_per_page]
-    seen_urls.update(limited)
-    return limited
+    seen_urls.update(accepted)
+    return accepted
 
 
 def calc_short_line_ratio(text: str) -> float:
