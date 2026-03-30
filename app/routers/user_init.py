@@ -99,7 +99,7 @@ def ensure_user_json_in_gcs(uid: str) -> dict:
     return {"created": True, "json_gcs_path": dest_path}
 
 
-PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = "asia-northeast1"
 
 def user_queue_name(uid: str) -> str:
