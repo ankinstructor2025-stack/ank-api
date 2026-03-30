@@ -990,23 +990,19 @@ def replace_url_page_content(conn: sqlite3.Connection, page_id: str, content_tex
 def build_page_results(
     target_url: str,
     rule: CrawlRule,
+    page_scoring: dict[str, Any],
 ) -> list[dict[str, Any]]:
 
-    print(f"\n=== START CRAWL === target={target_url}")
+    print(f"[START] build_page_results target_url={target_url}")
 
-    root_html = fetch_html(target_url)
+    root_res = fetch_html_response(target_url)
+    root_html = root_res.text
     root_links_all = extract_links(root_html, target_url)
 
-    print(f"[ROOT] raw_links_count={len(root_links_all)}")
-    print(f"[ROOT] raw_links_sample={root_links_all[:5]}")
-
     seen_urls: set[str] = set()
-
     level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
 
-    print(f"[ROOT] filtered_level1_count={len(level1_urls)}")
-    print(f"[ROOT] filtered_level1_sample={level1_urls[:5]}")
-    print(f"[ROOT] dropped_count={len(set(root_links_all) - set(level1_urls))}")
+    print(f"[ROOT] level1_urls={len(level1_urls)}")
 
     stack: list[CrawlNode] = [
         CrawlNode(url=url, parent_url=None, depth=1)
@@ -1015,36 +1011,59 @@ def build_page_results(
 
     page_results: list[dict[str, Any]] = []
 
+    # -----------------------------
+    # rootページ
+    # -----------------------------
     if rule.include_root_page:
+        print(f"[ROOT] processing root page")
+
         root_features = extract_page_features(root_html)
+
         root_judged = judge_page(
             url=target_url,
             title=root_features["title"],
             text=root_features["text"],
             text_length=root_features["text_length"],
             link_count=root_features["link_count"],
-        )
-        page_results.append(
-            {
-                "page_id": None,
-                "page_url": target_url,
-                "parent_url": None,
-                "parent_page_id": None,
-                "depth": 0,
-                "status": "new",
-                "child_count": len(level1_urls),
-                "score": root_judged["score"],
-                "page_type": root_judged["page_type"],
-                "is_usable": root_judged["is_usable"],
-                "judge_reason": root_judged["judge_reason"],
-                "created_at": now_iso(),
-            }
+            short_line_ratio=root_features["short_line_ratio"],
+            heading_count=root_features["heading_count"],
+            paragraph_count=root_features["paragraph_count"],
+            link_only_block_ratio=root_features["link_only_block_ratio"],
+            nav_like_block_ratio=root_features["nav_like_block_ratio"],
+            page_scoring=page_scoring,
         )
 
+        print(f"[ROOT] score={root_judged['score']} decision={root_judged['decision']}")
+
+        page_results.append({
+            "page_id": None,
+            "page_url": target_url,
+            "parent_url": None,
+            "parent_page_id": None,
+            "depth": 0,
+            "status": "new",
+            "child_count": len(level1_urls),
+            "title": root_features["title"],
+            "content_type": root_res.headers.get("Content-Type", "text/html"),
+            "http_status": root_res.status_code,
+            "fetched_at": now_iso(),
+            "text_length": root_features["text_length"],
+            "link_count": root_features["link_count"],
+            "short_line_ratio": root_features["short_line_ratio"],
+            "score": root_judged["score"],
+            "decision": root_judged["decision"],
+            "decision_reason": root_judged["decision_reason"],
+            "is_usable": root_judged["is_usable"],
+            "created_at": now_iso(),
+        })
+
+    # -----------------------------
+    # クロール
+    # -----------------------------
     while stack and len(page_results) < rule.max_pages:
         node = stack.pop()
 
-        print(f"\n[CRAWL] depth={node.depth} url={node.url}")
+        print(f"[PAGE] url={node.url} depth={node.depth}")
 
         page_info = {
             "page_id": None,
@@ -1054,40 +1073,44 @@ def build_page_results(
             "depth": node.depth,
             "status": "new",
             "child_count": 0,
+            "title": "",
+            "content_type": None,
+            "http_status": None,
+            "fetched_at": None,
+            "text_length": 0,
+            "link_count": 0,
+            "short_line_ratio": 0.0,
             "score": 0,
-            "page_type": "unknown",
+            "decision": "reject",
+            "decision_reason": "",
             "is_usable": 0,
-            "judge_reason": None,
             "created_at": now_iso(),
         }
 
         try:
-            html = fetch_html(node.url)
+            res = fetch_html_response(node.url)
+            html = res.text
+
+            print(f"[FETCH] status={res.status_code}")
+
             features = extract_page_features(html)
 
+            page_info["title"] = features["title"]
+            page_info["content_type"] = res.headers.get("Content-Type", "text/html")
+            page_info["http_status"] = res.status_code
+            page_info["fetched_at"] = now_iso()
+            page_info["text_length"] = features["text_length"]
+            page_info["link_count"] = features["link_count"]
+            page_info["short_line_ratio"] = features["short_line_ratio"]
+
             child_urls: list[str] = []
-
             if node.depth < rule.max_depth:
-
-                # -------- extract --------
                 child_urls_all = extract_links(html, node.url)
-
-                print(f"[EXTRACT] depth={node.depth}")
-                print(f"  raw_links_count={len(child_urls_all)}")
-                print(f"  raw_links_sample={child_urls_all[:5]}")
-
-                # -------- filter --------
                 child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
 
-                dropped = set(child_urls_all) - set(child_urls)
-
-                print(f"[FILTER] depth={node.depth}")
-                print(f"  filtered_count={len(child_urls)}")
-                print(f"  kept_sample={child_urls[:5]}")
-                print(f"  dropped_count={len(dropped)}")
-                print(f"  dropped_sample={list(dropped)[:5]}")
-
             page_info["child_count"] = len(child_urls)
+
+            print(f"[LINKS] child_count={len(child_urls)}")
 
             judged = judge_page(
                 url=node.url,
@@ -1095,21 +1118,25 @@ def build_page_results(
                 text=features["text"],
                 text_length=features["text_length"],
                 link_count=features["link_count"],
+                short_line_ratio=features["short_line_ratio"],
+                heading_count=features["heading_count"],
+                paragraph_count=features["paragraph_count"],
+                link_only_block_ratio=features["link_only_block_ratio"],
+                nav_like_block_ratio=features["nav_like_block_ratio"],
+                page_scoring=page_scoring,
             )
+
             page_info["score"] = judged["score"]
-            page_info["page_type"] = judged["page_type"]
+            page_info["decision"] = judged["decision"]
+            page_info["decision_reason"] = judged["decision_reason"]
             page_info["is_usable"] = judged["is_usable"]
-            page_info["judge_reason"] = judged["judge_reason"]
 
-            # -------- push --------
+            print(f"[JUDGE] score={judged['score']} decision={judged['decision']}")
+
             if node.depth < rule.max_depth:
-                print(f"[PUSH] depth={node.depth} -> {len(child_urls)} children")
-
                 for child_url in reversed(child_urls):
                     if len(page_results) + len(stack) >= rule.max_pages:
-                        print("[STOP] max_pages reached")
                         break
-
                     stack.append(
                         CrawlNode(
                             url=child_url,
@@ -1117,21 +1144,18 @@ def build_page_results(
                             depth=node.depth + 1,
                         )
                     )
-            else:
-                print(f"[STOP] max_depth reached at depth={node.depth}")
 
-        except HTTPException:
-            print(f"[ERROR] fetch_error url={node.url}")
+        except Exception as e:
+            print(f"[ERROR] url={node.url} error={e}")
 
             page_info["status"] = "fetch_error"
-            page_info["score"] = 0
-            page_info["page_type"] = "unknown"
+            page_info["decision"] = "reject"
             page_info["is_usable"] = 0
-            page_info["judge_reason"] = "fetch_error"
+            page_info["decision_reason"] = str(e)
 
         page_results.append(page_info)
 
-    print(f"\n=== END CRAWL total_pages={len(page_results)} ===")
+    print(f"[END] total_pages={len(page_results)}")
 
     return page_results
 
