@@ -2,6 +2,7 @@ fastapi~=0.115
 uvicorn[standard]~=0.30
 python-multipart~=0.0
 google-cloud-storage~=2.18
+google-cloud-tasks~=2.16
 firebase-admin~=6.5
 requests~=2.32
 ulid-py~=1.1
