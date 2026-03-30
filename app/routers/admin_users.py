@@ -1,5 +1,7 @@
 # routers/admin_users.py
+import json
 import os
+
 from fastapi import APIRouter, Header, HTTPException
 from google.cloud import storage, tasks_v2
 from google.api_core.exceptions import NotFound
@@ -14,11 +16,7 @@ router = APIRouter()
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = "asia-northeast1"
-
-# あなたのメールアドレスに置き換える
-ADMIN_EMAILS = {
-    "your-email@example.com",
-}
+ADMIN_EMAILS_BLOB_PATH = "template/admin_emails.json"
 
 
 def ensure_firebase_initialized():
@@ -27,6 +25,33 @@ def ensure_firebase_initialized():
     firebase_admin.initialize_app(
         options={"projectId": "ank-firebase"}
     )
+
+
+def load_admin_emails_from_gcs() -> set[str]:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(ADMIN_EMAILS_BLOB_PATH)
+
+    if not blob.exists():
+        raise RuntimeError(f"{ADMIN_EMAILS_BLOB_PATH} not found in GCS")
+
+    try:
+        text = blob.download_as_text(encoding="utf-8")
+        data = json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"failed to load {ADMIN_EMAILS_BLOB_PATH}: {e}")
+
+    emails = data.get("emails")
+    if not isinstance(emails, list):
+        raise RuntimeError(f"invalid format: {ADMIN_EMAILS_BLOB_PATH} must contain 'emails' array")
+
+    normalized = {
+        str(email).strip().lower()
+        for email in emails
+        if str(email).strip()
+    }
+
+    return normalized
 
 
 def get_admin_user(authorization: str | None) -> dict:
@@ -44,16 +69,19 @@ def get_admin_user(authorization: str | None) -> dict:
 
     try:
         decoded = fb_auth.verify_id_token(token)
-        email = decoded.get("email", "")
-        uid = decoded.get("uid", "")
+        email = str(decoded.get("email", "")).strip().lower()
+        uid = str(decoded.get("uid", "")).strip()
 
-        if not email or email not in ADMIN_EMAILS:
+        admin_emails = load_admin_emails_from_gcs()
+
+        if not email or email not in admin_emails:
             raise HTTPException(status_code=403, detail="Admin only")
 
         return {
             "uid": uid,
             "email": email,
         }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -62,16 +90,15 @@ def get_admin_user(authorization: str | None) -> dict:
 
 def list_user_prefixes() -> list[dict]:
     client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
 
-    # users/{uid}/ の uid 部分を拾う
     blobs = client.list_blobs(BUCKET_NAME, prefix="users/")
     uid_map = {}
 
     for blob in blobs:
         name = blob.name
-        # users/<uid>/...
         parts = name.split("/")
+
+        # users/<uid>/...
         if len(parts) >= 2 and parts[0] == "users" and parts[1]:
             uid = parts[1]
             if uid not in uid_map:
@@ -87,7 +114,6 @@ def list_user_prefixes() -> list[dict]:
 
 def delete_user_gcs_prefix(uid: str) -> dict:
     client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
     prefix = f"users/{uid}/"
 
     blobs = list(client.list_blobs(BUCKET_NAME, prefix=prefix))
