@@ -60,6 +60,7 @@ class CrawlRule:
     branch_first: bool
     priority_keywords: list[str]
     deprioritize_keywords: list[str]
+    max_children_per_page: int
 
 
 @dataclass
@@ -134,6 +135,172 @@ def is_html_like_url(url: str) -> bool:
     return not lower.endswith(blocked_exts)
 
 
+def config_error(message: str) -> HTTPException:
+    return HTTPException(status_code=500, detail=f"public_url.json invalid: {message}")
+
+
+def expect_dict(value: Any, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise config_error(f"{path} must be object")
+    return value
+
+
+def expect_list(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise config_error(f"{path} must be array")
+    return value
+
+
+def expect_bool(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise config_error(f"{path} must be boolean")
+    return value
+
+
+def expect_int(value: Any, path: str, minimum: int | None = None, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise config_error(f"{path} must be integer")
+    if minimum is not None and value < minimum:
+        raise config_error(f"{path} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise config_error(f"{path} must be <= {maximum}")
+    return value
+
+
+def expect_number(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise config_error(f"{path} must be number")
+    return float(value)
+
+
+def expect_string(value: Any, path: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise config_error(f"{path} must be string")
+    text = value.strip()
+    if not allow_empty and not text:
+        raise config_error(f"{path} must not be empty")
+    return text
+
+
+def expect_string_list(value: Any, path: str) -> list[str]:
+    items = expect_list(value, path)
+    result: list[str] = []
+    for idx, item in enumerate(items):
+        result.append(expect_string(item, f"{path}[{idx}]").lower())
+    return result
+
+
+def validate_threshold_rule(rule: Any, path: str) -> None:
+    item = expect_dict(rule, path)
+    if "score" not in item:
+        raise config_error(f"{path}.score is required")
+    if "lt" not in item and "gte" not in item:
+        raise config_error(f"{path} must have lt or gte")
+    if "lt" in item:
+        expect_number(item["lt"], f"{path}.lt")
+    if "gte" in item:
+        expect_number(item["gte"], f"{path}.gte")
+    expect_int(item["score"], f"{path}.score")
+
+
+def validate_threshold_rule_list(value: Any, path: str) -> None:
+    items = expect_list(value, path)
+    for idx, item in enumerate(items):
+        validate_threshold_rule(item, f"{path}[{idx}]")
+
+
+def validate_keyword_score_map(value: Any, path: str) -> None:
+    obj = expect_dict(value, path)
+    for key, score in obj.items():
+        expect_string(key, f"{path}.{key}")
+        expect_int(score, f"{path}.{key}")
+
+
+def validate_page_scoring_config(page_scoring: Any) -> dict[str, Any]:
+    cfg = expect_dict(page_scoring, "page_scoring")
+    expect_bool(cfg.get("enabled"), "page_scoring.enabled")
+    filter_mode = expect_string(cfg.get("filter_mode"), "page_scoring.filter_mode")
+    if filter_mode not in {"active_filter", "score_only"}:
+        raise config_error("page_scoring.filter_mode must be 'active_filter' or 'score_only'")
+    default_decision = expect_string(cfg.get("default_decision"), "page_scoring.default_decision")
+    if default_decision not in {"pass", "review", "reject"}:
+        raise config_error("page_scoring.default_decision must be one of pass/review/reject")
+    expect_int(cfg.get("base_score"), "page_scoring.base_score")
+    expect_int(cfg.get("keyword_cap"), "page_scoring.keyword_cap", minimum=0)
+
+    rules = expect_dict(cfg.get("rules"), "page_scoring.rules")
+    for key in ("title_keywords", "body_keywords", "url_keywords"):
+        if key not in rules:
+            raise config_error(f"page_scoring.rules.{key} is required")
+        validate_keyword_score_map(rules[key], f"page_scoring.rules.{key}")
+
+    thresholds = expect_dict(cfg.get("thresholds"), "page_scoring.thresholds")
+    if "min_text_length" not in thresholds:
+        raise config_error("page_scoring.thresholds.min_text_length is required")
+    validate_threshold_rule(thresholds["min_text_length"], "page_scoring.thresholds.min_text_length")
+    for key in ("text_length_bonus", "link_density", "short_line_ratio"):
+        if key not in thresholds:
+            raise config_error(f"page_scoring.thresholds.{key} is required")
+        validate_threshold_rule_list(thresholds[key], f"page_scoring.thresholds.{key}")
+
+    structure_rules = expect_dict(cfg.get("structure_rules"), "page_scoring.structure_rules")
+    for key in ("paragraph_count", "heading_count", "text_density", "sentence_ratio", "link_only_block_ratio", "nav_like_block_ratio"):
+        if key not in structure_rules:
+            raise config_error(f"page_scoring.structure_rules.{key} is required")
+        validate_threshold_rule_list(structure_rules[key], f"page_scoring.structure_rules.{key}")
+
+    decisions = expect_dict(cfg.get("decisions"), "page_scoring.decisions")
+    for key in ("pass", "review", "reject"):
+        if key not in decisions:
+            raise config_error(f"page_scoring.decisions.{key} is required")
+        item = expect_dict(decisions[key], f"page_scoring.decisions.{key}")
+        if "gte" not in item and "lt" not in item:
+            raise config_error(f"page_scoring.decisions.{key} must have gte or lt")
+        if "gte" in item:
+            expect_int(item["gte"], f"page_scoring.decisions.{key}.gte")
+        if "lt" in item:
+            expect_int(item["lt"], f"page_scoring.decisions.{key}.lt")
+
+    return cfg
+
+
+def validate_public_url_config(data: Any) -> dict[str, Any]:
+    cfg = expect_dict(data, "root")
+    source_type = expect_string(cfg.get("source_type"), "source_type")
+    if source_type != "public_url":
+        raise config_error("source_type must be 'public_url'")
+
+    crawl = expect_dict(cfg.get("crawl"), "crawl")
+    expect_bool(crawl.get("same_domain_only"), "crawl.same_domain_only")
+    expect_bool(crawl.get("include_root_page"), "crawl.include_root_page")
+    expect_int(crawl.get("max_depth"), "crawl.max_depth", minimum=1)
+    expect_int(crawl.get("max_pages"), "crawl.max_pages", minimum=1)
+    expect_bool(crawl.get("branch_first"), "crawl.branch_first")
+    expect_string_list(crawl.get("priority_keywords"), "crawl.priority_keywords")
+    expect_string_list(crawl.get("deprioritize_keywords"), "crawl.deprioritize_keywords")
+    if "max_children_per_page" in crawl and crawl.get("max_children_per_page") is not None:
+        expect_int(crawl.get("max_children_per_page"), "crawl.max_children_per_page", minimum=1)
+
+    sources = expect_list(cfg.get("sources"), "sources")
+    if not sources:
+        raise config_error("sources must not be empty")
+    seen_keys: set[str] = set()
+    for idx, source in enumerate(sources):
+        item = expect_dict(source, f"sources[{idx}]")
+        source_key = expect_string(item.get("source_key"), f"sources[{idx}].source_key")
+        if source_key in seen_keys:
+            raise config_error(f"sources[{idx}].source_key is duplicated: {source_key}")
+        seen_keys.add(source_key)
+        expect_string(item.get("label"), f"sources[{idx}].label")
+        url_text = expect_string(item.get("url"), f"sources[{idx}].url")
+        parsed = urlparse(url_text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise config_error(f"sources[{idx}].url must be absolute http/https URL")
+
+    validate_page_scoring_config(cfg.get("page_scoring"))
+    return cfg
+
+
 def load_public_url_config() -> dict[str, Any]:
     try:
         client = storage.Client()
@@ -146,9 +313,7 @@ def load_public_url_config() -> dict[str, Any]:
             )
         text = blob.download_as_text(encoding="utf-8")
         data = json.loads(text)
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=500, detail="invalid json structure")
-        return data
+        return validate_public_url_config(data)
     except HTTPException:
         raise
     except json.JSONDecodeError as e:
@@ -168,33 +333,21 @@ def get_public_url_source(config: dict[str, Any], source_key: str) -> dict[str, 
 
 
 def load_crawl_rule(config: dict[str, Any]) -> CrawlRule:
-    crawl_conf = config.get("crawl")
-    if not isinstance(crawl_conf, dict):
-        raise HTTPException(status_code=500, detail="crawl not found in public_url.json")
-
-    def as_list(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [str(x).strip().lower() for x in value if str(x).strip()]
-
+    crawl_conf = expect_dict(config.get("crawl"), "crawl")
     return CrawlRule(
-        same_domain_only=bool(crawl_conf.get("same_domain_only", True)),
-        include_root_page=bool(crawl_conf.get("include_root_page", False)),
-        max_depth=int(crawl_conf.get("max_depth", 4)),
-        max_pages=int(crawl_conf.get("max_pages", 200)),
-        branch_first=bool(crawl_conf.get("branch_first", True)),
-        priority_keywords=as_list(crawl_conf.get("priority_keywords", [])),
-        deprioritize_keywords=as_list(crawl_conf.get("deprioritize_keywords", [])),
+        same_domain_only=expect_bool(crawl_conf.get("same_domain_only"), "crawl.same_domain_only"),
+        include_root_page=expect_bool(crawl_conf.get("include_root_page"), "crawl.include_root_page"),
+        max_depth=expect_int(crawl_conf.get("max_depth"), "crawl.max_depth", minimum=1),
+        max_pages=expect_int(crawl_conf.get("max_pages"), "crawl.max_pages", minimum=1),
+        branch_first=expect_bool(crawl_conf.get("branch_first"), "crawl.branch_first"),
+        priority_keywords=expect_string_list(crawl_conf.get("priority_keywords"), "crawl.priority_keywords"),
+        deprioritize_keywords=expect_string_list(crawl_conf.get("deprioritize_keywords"), "crawl.deprioritize_keywords"),
+        max_children_per_page=expect_int(crawl_conf.get("max_children_per_page", 40), "crawl.max_children_per_page", minimum=1),
     )
 
 
 def load_page_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
-    page_scoring = config.get("page_scoring")
-    if not isinstance(page_scoring, dict):
-        raise HTTPException(status_code=500, detail="page_scoring not found in public_url.json")
-    if page_scoring.get("enabled") is not True:
-        raise HTTPException(status_code=500, detail="page_scoring.enabled must be true")
-    return page_scoring
+    return validate_page_scoring_config(config.get("page_scoring"))
 
 
 def get_source_url(source: dict[str, Any]) -> str:
@@ -314,16 +467,77 @@ def remove_toc_like_nodes(main_node: Tag) -> None:
                 tag.decompose()
 
 
+def anchor_text_score(text: str) -> int:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return 0
+    length = len(cleaned)
+    score = 0
+    if 4 <= length <= 80:
+        score += 20
+    elif 2 <= length <= 120:
+        score += 8
+    if re.search(r"faq|qa|q&a|よくある質問|質問|相談|手続|申請|届出|年金|保険|制度|給付|支給|届書|案内|一覧|詳細", cleaned, re.I):
+        score += 35
+    if re.search(r"次へ|前へ|戻る|top|home|ホーム|一覧へ戻る", cleaned, re.I):
+        score -= 40
+    return score
+
+
+def link_context_score(anchor: Tag, href: str, base_url: str, main_node: Tag) -> int:
+    score = 0
+    abs_url = normalize_url(urljoin(base_url, href))
+    if is_html_like_url(abs_url):
+        score += 10
+    parsed = urlparse(abs_url)
+    path = parsed.path.lower()
+    if path.endswith((".html", ".htm", "/")):
+        score += 6
+    if any(x in path for x in ["faq", "qa", "question", "answer", "detail", "guide", "info", "service"]):
+        score += 24
+    if any(x in path for x in ["pdf", "download", "search", "sitemap", "contact"]):
+        score -= 30
+
+    parent = anchor.parent if isinstance(anchor.parent, Tag) else None
+    if parent is not None:
+        parent_name = parent.name or ""
+        if parent_name in {"li", "dt", "dd", "p", "td", "th"}:
+            score += 8
+        hint = get_tag_hint_text(parent)
+        if hint and TOC_HINT_PATTERN.search(hint):
+            score += 10
+        if hint and NOISE_HINT_PATTERN.search(hint):
+            score -= 50
+
+    anchor_hint = get_tag_hint_text(anchor)
+    if anchor_hint and NOISE_HINT_PATTERN.search(anchor_hint):
+        score -= 50
+
+    text = anchor.get_text(" ", strip=True)
+    score += anchor_text_score(text)
+
+    try:
+        if main_node is not None and anchor in main_node.find_all("a", href=True):
+            score += 12
+    except Exception:
+        pass
+
+    depth = len([x for x in path.split("/") if x])
+    score += min(depth, 10) * 2
+    return score
+
+
 def extract_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     remove_global_noise(soup)
     main_node = find_best_main_node(soup)
-    remove_toc_like_nodes(main_node)
 
-    urls: list[str] = []
-    seen: set[str] = set()
+    scored: dict[str, int] = {}
+    order: dict[str, int] = {}
+    seq = 0
 
-    def collect(anchor_root: Tag | BeautifulSoup) -> None:
+    def collect(anchor_root: Tag | BeautifulSoup, bonus: int = 0) -> None:
+        nonlocal seq
         for a in anchor_root.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             if not href or href.startswith("#"):
@@ -333,14 +547,19 @@ def extract_links(html: str, base_url: str) -> list[str]:
                 continue
             abs_url = urljoin(base_url, href)
             norm = normalize_url(abs_url)
-            if norm not in seen:
-                seen.add(norm)
-                urls.append(norm)
+            score = link_context_score(a, href, base_url, main_node) + bonus
+            if norm not in order:
+                order[norm] = seq
+                seq += 1
+            prev = scored.get(norm)
+            if prev is None or score > prev:
+                scored[norm] = score
 
-    collect(main_node)
-    if len(urls) < 5:
-        collect(soup)
-    return urls
+    collect(main_node, bonus=20)
+    collect(soup, bonus=0)
+
+    items = sorted(scored.items(), key=lambda x: (-x[1], order.get(x[0], 0)))
+    return [url for url, score in items if score > -40]
 
 
 def root_path_prefix(url: str) -> str:
@@ -353,7 +572,7 @@ def root_path_prefix(url: str) -> str:
     return "/" + "/".join(parts[:-1])
 
 
-def child_url_priority(url: str, target_url: str, rule: CrawlRule) -> int:
+def child_url_priority(url: str, current_url: str, root_url: str, rule: CrawlRule) -> int:
     u = (url or "").lower()
     score = 0
 
@@ -364,13 +583,22 @@ def child_url_priority(url: str, target_url: str, rule: CrawlRule) -> int:
         if kw and kw in u:
             score -= 120
 
-    target_prefix = root_path_prefix(target_url).lower()
-    if target_prefix and target_prefix != "/" and target_prefix in u:
-        score += 40
+    current_prefix = root_path_prefix(current_url).lower()
+    if current_prefix and current_prefix != "/" and current_prefix in u:
+        score += 60
+
+    root_prefix = root_path_prefix(root_url).lower()
+    if root_prefix and root_prefix != "/" and root_prefix in u:
+        score += 25
+
+    current_path = urlparse(current_url).path.lower()
+    candidate_path = urlparse(u).path.lower()
+    if current_path and current_path != "/" and candidate_path.startswith(current_path.rsplit("/", 1)[0]):
+        score += 18
 
     path = urlparse(u).path
     depth = len([x for x in path.split("/") if x])
-    score += min(depth, 10) * 4
+    score += min(depth, 12) * 4
 
     if u.endswith(".html") or u.endswith(".htm"):
         score += 8
@@ -382,24 +610,29 @@ def child_url_priority(url: str, target_url: str, rule: CrawlRule) -> int:
 
 def filter_child_urls(
     urls: list[str],
-    target_url: str,
+    current_url: str,
+    root_url: str,
     rule: CrawlRule,
     seen_urls: set[str],
 ) -> list[str]:
-    result: list[str] = []
+    accepted: list[str] = []
+    local_seen: set[str] = set()
     for url in urls:
-        if rule.same_domain_only and not same_domain(url, target_url):
+        if rule.same_domain_only and not same_domain(url, root_url):
             continue
-        if url == target_url:
+        if url == current_url or url == root_url:
             continue
         if not is_html_like_url(url):
             continue
-        if url in seen_urls:
+        if url in seen_urls or url in local_seen:
             continue
-        seen_urls.add(url)
-        result.append(url)
-    result.sort(key=lambda x: child_url_priority(x, target_url, rule), reverse=True)
-    return result
+        local_seen.add(url)
+        accepted.append(url)
+
+    accepted.sort(key=lambda x: child_url_priority(x, current_url, root_url, rule), reverse=True)
+    limited = accepted[: rule.max_children_per_page]
+    seen_urls.update(limited)
+    return limited
 
 
 def calc_short_line_ratio(text: str) -> float:
@@ -835,7 +1068,7 @@ def build_page_results(target_url: str, rule: CrawlRule, page_scoring: dict[str,
     root_html = root_res.text
     root_links_all = extract_links(root_html, target_url)
     seen_urls: set[str] = set()
-    level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
+    level1_urls = filter_child_urls(root_links_all, target_url, target_url, rule, seen_urls)
 
     page_results: list[dict[str, Any]] = []
 
@@ -926,7 +1159,7 @@ def build_page_results(target_url: str, rule: CrawlRule, page_scoring: dict[str,
                 child_urls: list[str] = []
                 if node.depth < rule.max_depth:
                     child_urls_all = extract_links(html, node.url)
-                    child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
+                    child_urls = filter_child_urls(child_urls_all, node.url, target_url, rule, seen_urls)
                 page_info["child_count"] = len(child_urls)
 
                 judged = judge_page(
