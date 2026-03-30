@@ -1,5 +1,6 @@
 # routers/user_init.py
 import os
+import hashlib
 from fastapi import APIRouter, Header, HTTPException
 from google.cloud import storage, tasks_v2
 from google.api_core.exceptions import NotFound
@@ -103,8 +104,8 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = "asia-northeast1"
 
 def user_queue_name(uid: str) -> str:
-    return f"queue-{uid}"
-
+    h = hashlib.sha1(uid.encode()).hexdigest()[:16]
+    return f"q-{h}"
 
 def ensure_user_queue(uid: str) -> dict:
     client = tasks_v2.CloudTasksClient()
