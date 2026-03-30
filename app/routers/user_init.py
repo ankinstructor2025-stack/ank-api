@@ -1,7 +1,8 @@
 # routers/user_init.py
 import os
 from fastapi import APIRouter, Header, HTTPException
-from google.cloud import storage
+from google.cloud import storage, tasks_v2
+from google.api_core.exceptions import NotFound
 
 import firebase_admin
 from firebase_admin import auth as fb_auth, credentials
@@ -98,6 +99,46 @@ def ensure_user_json_in_gcs(uid: str) -> dict:
     return {"created": True, "json_gcs_path": dest_path}
 
 
+PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+LOCATION = "asia-northeast1"
+
+def user_queue_name(uid: str) -> str:
+    return f"queue-{uid}"
+
+
+def ensure_user_queue(uid: str) -> dict:
+    client = tasks_v2.CloudTasksClient()
+
+    if not PROJECT_ID:
+        raise RuntimeError("PROJECT_ID not found")
+
+    queue_id = user_queue_name(uid)
+
+    parent = client.common_location_path(PROJECT_ID, LOCATION)
+    queue_path = client.queue_path(PROJECT_ID, LOCATION, queue_id)
+
+    try:
+        client.get_queue(name=queue_path)
+        return {"created": False, "queue": queue_id}
+    except NotFound:
+        pass
+
+    queue = {
+        "name": queue_path,
+        "rate_limits": {
+            "max_dispatches_per_second": 1,
+            "max_concurrent_dispatches": 1,
+        },
+        "retry_config": {
+            "max_attempts": 3,
+        },
+    }
+
+    client.create_queue(parent=parent, queue=queue)
+
+    return {"created": True, "queue": queue_id}
+
+
 @router.post("/user/init")
 def user_init(authorization: str | None = Header(default=None)):
     uid = get_uid_from_auth_header(authorization)
@@ -105,11 +146,15 @@ def user_init(authorization: str | None = Header(default=None)):
     r_db = ensure_user_db_in_gcs(uid)
     r_json = ensure_user_json_in_gcs(uid)
 
+    r_queue = ensure_user_queue(uid)
+
     return {
         "ok": True,
         "user_id": uid,
         "db_created": r_db["created"],
         "json_created": r_json["created"],
+        "queue_created": r_queue["created"],
+        "queue_name": r_queue["queue"],
         "db_gcs_path": r_db["db_gcs_path"],
         "json_gcs_path": r_json["json_gcs_path"],
     }
