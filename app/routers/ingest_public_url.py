@@ -987,38 +987,17 @@ def replace_url_page_content(conn: sqlite3.Connection, page_id: str, content_tex
     return content_id, True
 
 
-def build_page_results(
-    target_url: str,
-    rule: CrawlRule,
-    page_scoring: dict[str, Any],
-) -> list[dict[str, Any]]:
-
-    print(f"[START] build_page_results target_url={target_url}")
-
+def build_page_results(target_url: str, rule: CrawlRule, page_scoring: dict[str, Any]) -> list[dict[str, Any]]:
     root_res = fetch_html_response(target_url)
     root_html = root_res.text
     root_links_all = extract_links(root_html, target_url)
-
     seen_urls: set[str] = set()
-    level1_urls = filter_child_urls(root_links_all, target_url, rule, seen_urls)
-
-    print(f"[ROOT] level1_urls={len(level1_urls)}")
-
-    stack: list[CrawlNode] = [
-        CrawlNode(url=url, parent_url=None, depth=1)
-        for url in reversed(level1_urls)
-    ]
+    level1_urls = filter_child_urls(root_links_all, target_url, target_url, rule, seen_urls)
 
     page_results: list[dict[str, Any]] = []
 
-    # -----------------------------
-    # rootページ
-    # -----------------------------
     if rule.include_root_page:
-        print(f"[ROOT] processing root page")
-
         root_features = extract_page_features(root_html)
-
         root_judged = judge_page(
             url=target_url,
             title=root_features["title"],
@@ -1032,130 +1011,114 @@ def build_page_results(
             nav_like_block_ratio=root_features["nav_like_block_ratio"],
             page_scoring=page_scoring,
         )
+        page_results.append(
+            {
+                "page_id": None,
+                "page_url": target_url,
+                "parent_url": None,
+                "parent_page_id": None,
+                "depth": 0,
+                "status": "new",
+                "child_count": len(level1_urls),
+                "title": root_features["title"],
+                "content_type": root_res.headers.get("Content-Type", "text/html"),
+                "http_status": root_res.status_code,
+                "fetched_at": now_iso(),
+                "text_length": root_features["text_length"],
+                "link_count": root_features["link_count"],
+                "short_line_ratio": root_features["short_line_ratio"],
+                "score": root_judged["score"],
+                "decision": root_judged["decision"],
+                "decision_reason": root_judged["decision_reason"],
+                "is_usable": root_judged["is_usable"],
+                "created_at": now_iso(),
+            }
+        )
 
-        print(f"[ROOT] score={root_judged['score']} decision={root_judged['decision']}")
+    if not rule.branch_first:
+        branch_seeds = list(reversed(level1_urls))
+        global_stack: list[CrawlNode] = [CrawlNode(url=u, parent_url=None, depth=1) for u in branch_seeds]
+        branch_groups: list[list[CrawlNode]] = [global_stack]
+    else:
+        branch_groups = [[CrawlNode(url=level1_url, parent_url=None, depth=1)] for level1_url in level1_urls]
 
-        page_results.append({
-            "page_id": None,
-            "page_url": target_url,
-            "parent_url": None,
-            "parent_page_id": None,
-            "depth": 0,
-            "status": "new",
-            "child_count": len(level1_urls),
-            "title": root_features["title"],
-            "content_type": root_res.headers.get("Content-Type", "text/html"),
-            "http_status": root_res.status_code,
-            "fetched_at": now_iso(),
-            "text_length": root_features["text_length"],
-            "link_count": root_features["link_count"],
-            "short_line_ratio": root_features["short_line_ratio"],
-            "score": root_judged["score"],
-            "decision": root_judged["decision"],
-            "decision_reason": root_judged["decision_reason"],
-            "is_usable": root_judged["is_usable"],
-            "created_at": now_iso(),
-        })
+    for branch_stack in branch_groups:
+        if len(page_results) >= rule.max_pages:
+            break
+        while branch_stack and len(page_results) < rule.max_pages:
+            node = branch_stack.pop()
+            page_info = {
+                "page_id": None,
+                "page_url": node.url,
+                "parent_url": node.parent_url,
+                "parent_page_id": None,
+                "depth": node.depth,
+                "status": "new",
+                "child_count": 0,
+                "title": "",
+                "content_type": None,
+                "http_status": None,
+                "fetched_at": None,
+                "text_length": 0,
+                "link_count": 0,
+                "short_line_ratio": 0.0,
+                "score": 0,
+                "decision": "reject",
+                "decision_reason": json.dumps({"score": 0, "reasons": [{"rule": "not_fetched", "score": 0}]}, ensure_ascii=False),
+                "is_usable": 0,
+                "created_at": now_iso(),
+            }
+            try:
+                res = fetch_html_response(node.url)
+                html = res.text
+                features = extract_page_features(html)
+                page_info["title"] = features["title"]
+                page_info["content_type"] = res.headers.get("Content-Type", "text/html")
+                page_info["http_status"] = res.status_code
+                page_info["fetched_at"] = now_iso()
+                page_info["text_length"] = features["text_length"]
+                page_info["link_count"] = features["link_count"]
+                page_info["short_line_ratio"] = features["short_line_ratio"]
 
-    # -----------------------------
-    # クロール
-    # -----------------------------
-    while stack and len(page_results) < rule.max_pages:
-        node = stack.pop()
+                child_urls: list[str] = []
+                if node.depth < rule.max_depth:
+                    child_urls_all = extract_links(html, node.url)
+                    child_urls = filter_child_urls(child_urls_all, node.url, target_url, rule, seen_urls)
+                page_info["child_count"] = len(child_urls)
 
-        print(f"[PAGE] url={node.url} depth={node.depth}")
+                judged = judge_page(
+                    url=node.url,
+                    title=features["title"],
+                    text=features["text"],
+                    text_length=features["text_length"],
+                    link_count=features["link_count"],
+                    short_line_ratio=features["short_line_ratio"],
+                    heading_count=features["heading_count"],
+                    paragraph_count=features["paragraph_count"],
+                    link_only_block_ratio=features["link_only_block_ratio"],
+                    nav_like_block_ratio=features["nav_like_block_ratio"],
+                    page_scoring=page_scoring,
+                )
+                page_info["score"] = judged["score"]
+                page_info["decision"] = judged["decision"]
+                page_info["decision_reason"] = judged["decision_reason"]
+                page_info["is_usable"] = judged["is_usable"]
 
-        page_info = {
-            "page_id": None,
-            "page_url": node.url,
-            "parent_url": node.parent_url,
-            "parent_page_id": None,
-            "depth": node.depth,
-            "status": "new",
-            "child_count": 0,
-            "title": "",
-            "content_type": None,
-            "http_status": None,
-            "fetched_at": None,
-            "text_length": 0,
-            "link_count": 0,
-            "short_line_ratio": 0.0,
-            "score": 0,
-            "decision": "reject",
-            "decision_reason": "",
-            "is_usable": 0,
-            "created_at": now_iso(),
-        }
+                if node.depth < rule.max_depth:
+                    for child_url in reversed(child_urls):
+                        if len(page_results) + len(branch_stack) >= rule.max_pages:
+                            break
+                        branch_stack.append(CrawlNode(url=child_url, parent_url=node.url, depth=node.depth + 1))
 
-        try:
-            res = fetch_html_response(node.url)
-            html = res.text
-
-            print(f"[FETCH] status={res.status_code}")
-
-            features = extract_page_features(html)
-
-            page_info["title"] = features["title"]
-            page_info["content_type"] = res.headers.get("Content-Type", "text/html")
-            page_info["http_status"] = res.status_code
-            page_info["fetched_at"] = now_iso()
-            page_info["text_length"] = features["text_length"]
-            page_info["link_count"] = features["link_count"]
-            page_info["short_line_ratio"] = features["short_line_ratio"]
-
-            child_urls: list[str] = []
-            if node.depth < rule.max_depth:
-                child_urls_all = extract_links(html, node.url)
-                child_urls = filter_child_urls(child_urls_all, target_url, rule, seen_urls)
-
-            page_info["child_count"] = len(child_urls)
-
-            print(f"[LINKS] child_count={len(child_urls)}")
-
-            judged = judge_page(
-                url=node.url,
-                title=features["title"],
-                text=features["text"],
-                text_length=features["text_length"],
-                link_count=features["link_count"],
-                short_line_ratio=features["short_line_ratio"],
-                heading_count=features["heading_count"],
-                paragraph_count=features["paragraph_count"],
-                link_only_block_ratio=features["link_only_block_ratio"],
-                nav_like_block_ratio=features["nav_like_block_ratio"],
-                page_scoring=page_scoring,
-            )
-
-            page_info["score"] = judged["score"]
-            page_info["decision"] = judged["decision"]
-            page_info["decision_reason"] = judged["decision_reason"]
-            page_info["is_usable"] = judged["is_usable"]
-
-            print(f"[JUDGE] score={judged['score']} decision={judged['decision']}")
-
-            if node.depth < rule.max_depth:
-                for child_url in reversed(child_urls):
-                    if len(page_results) + len(stack) >= rule.max_pages:
-                        break
-                    stack.append(
-                        CrawlNode(
-                            url=child_url,
-                            parent_url=node.url,
-                            depth=node.depth + 1,
-                        )
-                    )
-
-        except Exception as e:
-            print(f"[ERROR] url={node.url} error={e}")
-
-            page_info["status"] = "fetch_error"
-            page_info["decision"] = "reject"
-            page_info["is_usable"] = 0
-            page_info["decision_reason"] = str(e)
-
-        page_results.append(page_info)
-
-    print(f"[END] total_pages={len(page_results)}")
+            except HTTPException:
+                page_info["status"] = "fetch_error"
+                page_info["decision"] = "reject"
+                page_info["is_usable"] = 0
+                page_info["decision_reason"] = json.dumps(
+                    {"score": 0, "reasons": [{"rule": "fetch_error", "score": 0}]},
+                    ensure_ascii=False,
+                )
+            page_results.append(page_info)
 
     return page_results
 
