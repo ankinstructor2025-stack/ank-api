@@ -3,6 +3,7 @@ import hashlib
 from fastapi import APIRouter, Header, HTTPException
 from google.cloud import storage, tasks_v2
 from google.api_core.exceptions import NotFound
+from app.core.common import user_queue_name
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -98,11 +99,6 @@ def ensure_user_json_in_gcs(uid: str) -> dict:
 
     bucket.copy_blob(src_blob, bucket, new_name=dest_path)
     return {"created": True, "json_gcs_path": dest_path}
-
-
-def user_queue_name(uid: str) -> str:
-    h = hashlib.sha1(uid.encode()).hexdigest()[:16]
-    return f"q-{h}"
 
 
 def ensure_user_queue(uid: str) -> dict:
