@@ -3,19 +3,14 @@ import json
 import os
 
 from fastapi import APIRouter, Header, HTTPException
-from google.cloud import storage, tasks_v2
-from google.api_core.exceptions import NotFound
+from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
 
-from app.core.common import user_queue_name
-
 router = APIRouter()
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
-PROJECT_ID = os.getenv("PROJECT_ID")
-LOCATION = "asia-northeast1"
 ADMIN_EMAILS_BLOB_PATH = "template/admin_emails.json"
 
 
@@ -50,7 +45,6 @@ def load_admin_emails_from_gcs() -> set[str]:
         for email in emails
         if str(email).strip()
     }
-
     return normalized
 
 
@@ -69,28 +63,28 @@ def get_admin_user(authorization: str | None) -> dict:
 
     try:
         decoded = fb_auth.verify_id_token(token)
-        email = str(decoded.get("email", "")).strip().lower()
-        uid = str(decoded.get("uid", "")).strip()
-
-        admin_emails = load_admin_emails_from_gcs()
-
-        if not email or email not in admin_emails:
-            raise HTTPException(status_code=403, detail="Admin only")
-
-        return {
-            "uid": uid,
-            "email": email,
-        }
-
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
+
+    email = str(decoded.get("email", "")).strip().lower()
+    uid = str(decoded.get("uid", "")).strip()
+
+    try:
+        admin_emails = load_admin_emails_from_gcs()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not email or email not in admin_emails:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    return {
+        "uid": uid,
+        "email": email,
+    }
 
 
 def list_user_prefixes() -> list[dict]:
     client = storage.Client()
-
     blobs = client.list_blobs(BUCKET_NAME, prefix="users/")
     uid_map = {}
 
@@ -98,7 +92,6 @@ def list_user_prefixes() -> list[dict]:
         name = blob.name
         parts = name.split("/")
 
-        # users/<uid>/...
         if len(parts) >= 2 and parts[0] == "users" and parts[1]:
             uid = parts[1]
             if uid not in uid_map:
@@ -130,24 +123,6 @@ def delete_user_gcs_prefix(uid: str) -> dict:
     }
 
 
-def delete_user_queue(uid: str) -> dict:
-    client = tasks_v2.CloudTasksClient()
-
-    if not PROJECT_ID:
-        raise RuntimeError("PROJECT_ID not found")
-
-    queue_id = user_queue_name(uid)
-    queue_path = client.queue_path(PROJECT_ID, LOCATION, queue_id)
-
-    try:
-        client.get_queue(name=queue_path)
-    except NotFound:
-        return {"queue": queue_id, "deleted": False}
-
-    client.delete_queue(name=queue_path)
-    return {"queue": queue_id, "deleted": True}
-
-
 @router.get("/admin/users")
 def admin_list_users(authorization: str | None = Header(default=None)):
     admin = get_admin_user(authorization)
@@ -166,18 +141,10 @@ def admin_delete_user(uid: str, authorization: str | None = Header(default=None)
 
     gcs_result = delete_user_gcs_prefix(uid)
 
-    queue_errors = []
-    try:
-        queue_result = delete_user_queue(uid)
-    except Exception as e:
-        queue_result = {"queue": user_queue_name(uid), "deleted": False}
-        queue_errors.append(str(e))
-
     return {
-        "ok": len(queue_errors) == 0,
+        "ok": True,
         "admin_email": admin["email"],
         "uid": uid,
         "gcs": gcs_result,
-        "queue": queue_result,
-        "errors": queue_errors,
+        "errors": [],
     }
