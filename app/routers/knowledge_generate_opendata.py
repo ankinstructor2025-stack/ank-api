@@ -36,7 +36,7 @@ from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
 from .content_splitter_pdf import split_pdf_records
 from .content_detector import normalize_text
-from .common import enqueue_knowledge_job
+from app.core.common import enqueue_knowledge_job
 
 logger = logging.getLogger(__name__)
 
