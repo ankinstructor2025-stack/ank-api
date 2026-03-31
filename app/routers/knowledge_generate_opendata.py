@@ -621,6 +621,9 @@ def create_job_record(
             """
             INSERT INTO knowledge_jobs (
                 job_id,
+                queue_id,
+                task_name,
+                enqueued_at,
                 source_type,
                 source_name,
                 request_type,
@@ -634,7 +637,7 @@ def create_job_record(
                 finished_at,
                 error_message
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
+            VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
             """,
             (
                 job_id,
@@ -891,6 +894,39 @@ def finalize_job_item_error(
                 now_iso(),
                 error_message,
                 job_item_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_job_enqueue_info(
+    local_db_path: str,
+    job_id: str,
+    queue_id: str | None,
+    task_name: str | None,
+    enqueued_at: str | None,
+) -> None:
+    conn = open_user_db(local_db_path)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            UPDATE knowledge_jobs
+            SET queue_id = ?,
+                task_name = ?,
+                enqueued_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                queue_id,
+                task_name,
+                enqueued_at,
+                job_id,
             ),
         )
         conn.commit()
@@ -1532,24 +1568,6 @@ def run_opendata_job(
             detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
         )
 
-    current_status = try_read_status_payload(bucket, uid)
-    current_status_name = (current_status.get("status") or "").strip().lower()
-    if current_status_name in ("queued", "running"):
-        running_job_id = current_status.get("job_id")
-        if running_job_id == body.job_id:
-            return KnowledgeJobCreateResponse(
-                job_id=body.job_id,
-                selected_count=0,
-                created_item_count=0,
-                status=current_status_name or "queued",
-                prompt_previews=[],
-                debug_items=[],
-            )
-        raise HTTPException(
-            status_code=409,
-            detail=f"別のジョブが実行中です。完了後に再実行してください。 running_job_id={running_job_id or ''}",
-        )
-
     local_db_path = local_user_db_path(uid)
     replace_local_db_from_blob(db_blob, local_db_path)
 
@@ -1557,25 +1575,28 @@ def run_opendata_job(
         job_row = fetch_job_row(local_db_path, body.job_id)
         if not job_row:
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
+
         if job_row["source_type"] != SOURCE_TYPE:
             raise HTTPException(status_code=400, detail=f"job source_type must be '{SOURCE_TYPE}'")
 
         if job_row["status"] == "done":
-            set_job_done(
-                bucket,
-                uid,
-                body.job_id,
-                phase="extract_knowledge",
-                message="already done",
-                knowledge_count=int(job_row["qa_count"] or 0) + int(job_row["plain_count"] or 0),
-            )
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
-                selected_count=0,
+                selected_count=int(job_row["selected_count"] or 0),
                 created_item_count=0,
                 status="done",
                 prompt_previews=[],
                 debug_items=[],
+            )
+
+        status_payload = try_read_status_payload(bucket, uid)
+        running_status = str(status_payload.get("status") or "").lower()
+        running_job_id = str(status_payload.get("job_id") or "").strip()
+
+        if running_status in {"queued", "running"} and running_job_id and running_job_id != body.job_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"別のジョブが実行中です。完了後に再実行してください。\nrunning_job_id={running_job_id}",
             )
 
         requested_at = job_row["requested_at"] or now_iso()
@@ -1631,11 +1652,34 @@ def run_opendata_job(
         )
 
         try:
-            enqueue_knowledge_job(
+            enqueue_result = enqueue_knowledge_job(
                 source_type=SOURCE_TYPE,
                 uid=uid,
                 job_id=body.job_id,
             )
+
+            queue_id = str(
+                enqueue_result.get("queue_id")
+                or enqueue_result.get("selected_queue", {}).get("queue_id")
+                or ""
+            ).strip() or None
+
+            task_name = str(
+                enqueue_result.get("task_name")
+                or enqueue_result.get("created_task", {}).get("task_name")
+                or ""
+            ).strip() or None
+
+            update_job_enqueue_info(
+                local_db_path=local_db_path,
+                job_id=body.job_id,
+                queue_id=queue_id,
+                task_name=task_name,
+                enqueued_at=now_iso(),
+            )
+
+            upload_local_db(db_blob, local_db_path)
+
         except Exception as e:
             logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
             update_job_summary(
@@ -1661,7 +1705,7 @@ def run_opendata_job(
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
-            selected_count=0,
+            selected_count=int(job_row["selected_count"] or 0),
             created_item_count=0,
             status="queued",
             prompt_previews=[],
