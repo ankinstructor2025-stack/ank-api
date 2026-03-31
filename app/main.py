@@ -15,6 +15,7 @@ from app.routers.knowledge_generate_public_url import router as knowledge_genera
 from app.routers.knowledge_generate_upload import router as knowledge_generate_upload_router
 from app.routers.knowledge_refine import router as knowledge_refine_router
 from app.routers.knowledge_search import router as knowledge_search_router
+from app.routers.admin_task_queues import router as admin_task_queues_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_generate_upload_router, prefix="/v1")
     app.include_router(knowledge_refine_router, prefix="/v1")
     app.include_router(knowledge_search_router, prefix="/v1")
+    app.include_router(admin_task_queues_router, prefix="/v1")
     return app
 
 app = create_app()
