@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from google.cloud import tasks_v2
+from google.protobuf import duration_pb2  # ← 追加
 
 
 PROJECT_ID = os.getenv("PROJECT_ID")
@@ -22,10 +23,6 @@ SOURCE_TYPE_TO_WORKER_PATH = {
 
 
 def list_all_queues() -> list[dict]:
-    """
-    Cloud Tasks の指定ロケーションに存在するキューを全件取得する。
-    返却は扱いやすい dict の配列にしている。
-    """
     if not PROJECT_ID:
         raise RuntimeError("PROJECT_ID not found")
 
@@ -66,10 +63,6 @@ def list_all_queues() -> list[dict]:
 
 
 def select_best_queue() -> dict:
-    """
-    全キューの中から、もっとも待ちが少ないとみなせるキューを返す。
-    まずは tasks_count 優先、同点なら実行中件数が少ないものを優先。
-    """
     queues = list_all_queues()
 
     if not queues:
@@ -95,9 +88,6 @@ def get_queue_path(queue_id: str) -> str:
 
 
 def build_worker_url(worker_path: str) -> str:
-    """
-    Cloud Run のベースURLと worker path を結合する。
-    """
     if not CLOUD_RUN_BASE_URL:
         raise RuntimeError("CLOUD_RUN_BASE_URL not found")
 
@@ -134,10 +124,6 @@ def build_knowledge_task_payload(source_type: str, uid: str, job_id: str) -> dic
 
 
 def build_task_id(prefix: str, payload: dict[str, Any]) -> str:
-    """
-    Cloud Tasks の task 名に使う短いIDを生成する。
-    同一 payload の重複投入が起きた時にある程度安定するようにしている。
-    """
     base_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(base_text.encode("utf-8")).hexdigest()[:24]
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -145,10 +131,6 @@ def build_task_id(prefix: str, payload: dict[str, Any]) -> str:
 
 
 def build_schedule_time_proto(schedule_seconds: int):
-    """
-    指定秒後に実行する schedule_time を protobuf 形式で返す。
-    0以下なら None。
-    """
     if not schedule_seconds or schedule_seconds <= 0:
         return None
 
@@ -165,9 +147,6 @@ def create_http_task(
     task_id: Optional[str] = None,
     schedule_seconds: int = 0,
 ) -> dict[str, Any]:
-    """
-    Cloud Tasks に HTTP POST タスクを作成する。
-    """
     if not queue_id:
         raise RuntimeError("queue_id is empty")
     if not url:
@@ -192,7 +171,8 @@ def create_http_task(
             "url": url,
             "headers": request_headers,
             "body": body_bytes,
-        }
+        },
+        "dispatch_deadline": duration_pb2.Duration(seconds=3600),  # ← 修正
     }
 
     if task_id:
@@ -232,9 +212,6 @@ def enqueue_http_task_to_best_queue(
     task_prefix: str = "task",
     schedule_seconds: int = 0,
 ) -> dict[str, Any]:
-    """
-    最適キューを選んで HTTP タスクを投入する。
-    """
     best_queue = select_best_queue()
     queue_id = best_queue["queue_id"]
 
@@ -261,10 +238,6 @@ def enqueue_knowledge_job(
     job_id: str,
     schedule_seconds: int = 0,
 ) -> dict[str, Any]:
-    """
-    ナレッジ生成ジョブを Cloud Tasks に投入する共通関数。
-    各 router からはこれだけ呼べばよい。
-    """
     worker_path = get_worker_path_by_source_type(source_type)
     worker_url = build_worker_url(worker_path)
     payload = build_knowledge_task_payload(source_type=source_type, uid=uid, job_id=job_id)
