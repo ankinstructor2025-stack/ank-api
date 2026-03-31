@@ -3,7 +3,8 @@ import json
 import os
 
 from fastapi import APIRouter, Header, HTTPException
-from google.cloud import storage
+from google.cloud import storage, tasks_v2
+from google.api_core.exceptions import NotFound
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -12,6 +13,8 @@ router = APIRouter()
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 ADMIN_EMAILS_BLOB_PATH = "template/admin_emails.json"
+PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+TASKS_LOCATION = os.getenv("TASKS_LOCATION", "asia-northeast1")
 
 
 def ensure_firebase_initialized():
@@ -105,6 +108,76 @@ def list_user_prefixes() -> list[dict]:
     return sorted(uid_map.values(), key=lambda x: x["uid"])
 
 
+def get_queue_json_path(uid: str) -> str:
+    return f"users/{uid}/queue.json"
+
+
+def load_user_queue_info(uid: str) -> dict | None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(get_queue_json_path(uid))
+
+    if not blob.exists():
+        return None
+
+    try:
+        text = blob.download_as_text(encoding="utf-8")
+        if not text.strip():
+            return None
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise RuntimeError("queue.json is not a JSON object")
+        return data
+    except Exception as e:
+        raise RuntimeError(f"failed to load queue.json for uid={uid}: {e}")
+
+
+def build_queue_full_name(queue_name: str) -> str:
+    if not PROJECT_ID:
+        raise RuntimeError("PROJECT_ID or GOOGLE_CLOUD_PROJECT is not set")
+    return f"projects/{PROJECT_ID}/locations/{TASKS_LOCATION}/queues/{queue_name}"
+
+
+def delete_user_queue_from_json(uid: str) -> dict:
+    queue_info = load_user_queue_info(uid)
+
+    if not queue_info:
+        return {
+            "found": False,
+            "deleted": False,
+            "queue_name": None,
+            "queue_full_name": None,
+        }
+
+    queue_name = str(queue_info.get("queue_name", "")).strip()
+    queue_full_name = str(queue_info.get("queue_full_name", "")).strip()
+
+    if not queue_full_name and queue_name:
+        queue_full_name = build_queue_full_name(queue_name)
+
+    if not queue_full_name:
+        raise RuntimeError(f"queue.json invalid: queue_name/queue_full_name not found for uid={uid}")
+
+    client = tasks_v2.CloudTasksClient()
+
+    try:
+        client.delete_queue(name=queue_full_name)
+        return {
+            "found": True,
+            "deleted": True,
+            "queue_name": queue_name or None,
+            "queue_full_name": queue_full_name,
+        }
+    except NotFound:
+        return {
+            "found": True,
+            "deleted": False,
+            "queue_name": queue_name or None,
+            "queue_full_name": queue_full_name,
+            "reason": "queue not found",
+        }
+
+
 def delete_user_gcs_prefix(uid: str) -> dict:
     client = storage.Client()
     prefix = f"users/{uid}/"
@@ -139,12 +212,24 @@ def admin_list_users(authorization: str | None = Header(default=None)):
 def admin_delete_user(uid: str, authorization: str | None = Header(default=None)):
     admin = get_admin_user(authorization)
 
-    gcs_result = delete_user_gcs_prefix(uid)
+    errors = []
+    queue_result = None
+
+    try:
+        queue_result = delete_user_queue_from_json(uid)
+    except Exception as e:
+        errors.append(f"delete queue failed: {e}")
+
+    try:
+        gcs_result = delete_user_gcs_prefix(uid)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"delete user gcs failed: {e}")
 
     return {
-        "ok": True,
+        "ok": len(errors) == 0,
         "admin_email": admin["email"],
         "uid": uid,
+        "queue": queue_result,
         "gcs": gcs_result,
-        "errors": [],
+        "errors": errors,
     }
