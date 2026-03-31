@@ -1,9 +1,6 @@
 import os
-import hashlib
 from fastapi import APIRouter, Header, HTTPException
-from google.cloud import storage, tasks_v2
-from google.api_core.exceptions import NotFound
-from app.core.common import user_queue_name
+from google.cloud import storage
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -14,10 +11,6 @@ BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
 TEMPLATE_DB_PATH = "template/template.sqlite"
 TEMPLATE_JSON_PATH = "template/knowledge_generate.json"
-
-PROJECT_ID = os.getenv("PROJECT_ID")
-LOCATION = "asia-northeast1"
-
 
 # ユーザDBの保存先
 def user_db_path(uid: str) -> str:
@@ -101,37 +94,6 @@ def ensure_user_json_in_gcs(uid: str) -> dict:
     return {"created": True, "json_gcs_path": dest_path}
 
 
-def ensure_user_queue(uid: str) -> dict:
-    client = tasks_v2.CloudTasksClient()
-
-    if not PROJECT_ID:
-        raise RuntimeError("PROJECT_ID not found")
-
-    queue_id = user_queue_name(uid)
-    parent = client.common_location_path(PROJECT_ID, LOCATION)
-    queue_path = client.queue_path(PROJECT_ID, LOCATION, queue_id)
-
-    try:
-        client.get_queue(name=queue_path)
-        return {"created": False, "queue": queue_id}
-    except NotFound:
-        pass
-
-    queue = {
-        "name": queue_path,
-        "rate_limits": {
-            "max_dispatches_per_second": 1,
-            "max_concurrent_dispatches": 1,
-        },
-        "retry_config": {
-            "max_attempts": 3,
-        },
-    }
-
-    client.create_queue(parent=parent, queue=queue)
-    return {"created": True, "queue": queue_id}
-
-
 def delete_gcs_blob_if_exists(path: str) -> None:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -141,35 +103,10 @@ def delete_gcs_blob_if_exists(path: str) -> None:
         blob.delete()
 
 
-def delete_user_queue_by_name(queue_id: str) -> None:
-    client = tasks_v2.CloudTasksClient()
-
-    if not PROJECT_ID:
-        return
-
-    queue_path = client.queue_path(PROJECT_ID, LOCATION, queue_id)
-
-    try:
-        client.get_queue(name=queue_path)
-    except NotFound:
-        return
-
-    client.delete_queue(name=queue_path)
-
-
 def rollback_user_init(
     r_db: dict | None,
     r_json: dict | None,
-    r_queue: dict | None,
 ) -> None:
-    # queue -> json -> db の順で戻す
-    # 今回新規作成したものだけ削除する
-    if r_queue and r_queue.get("created"):
-        try:
-            delete_user_queue_by_name(r_queue["queue"])
-        except Exception:
-            pass
-
     if r_json and r_json.get("created"):
         try:
             delete_gcs_blob_if_exists(r_json["json_gcs_path"])
@@ -189,27 +126,23 @@ def user_init(authorization: str | None = Header(default=None)):
 
     r_db = None
     r_json = None
-    r_queue = None
 
     try:
         r_db = ensure_user_db_in_gcs(uid)
         r_json = ensure_user_json_in_gcs(uid)
-        r_queue = ensure_user_queue(uid)
 
         return {
             "ok": True,
             "user_id": uid,
             "db_created": r_db["created"],
             "json_created": r_json["created"],
-            "queue_created": r_queue["created"],
-            "queue_name": r_queue["queue"],
             "db_gcs_path": r_db["db_gcs_path"],
             "json_gcs_path": r_json["json_gcs_path"],
         }
 
     except HTTPException:
-        rollback_user_init(r_db, r_json, r_queue)
+        rollback_user_init(r_db, r_json)
         raise
     except Exception as e:
-        rollback_user_init(r_db, r_json, r_queue)
+        rollback_user_init(r_db, r_json)
         raise HTTPException(status_code=500, detail=f"user init failed: {e}")
