@@ -8,11 +8,6 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = os.getenv("TASKS_LOCATION", "asia-northeast1")
 
 
-def user_queue_name(uid: str) -> str:
-    h = hashlib.sha1(uid.encode()).hexdigest()[:16]
-    return f"q-{h}"
-
-
 def list_all_queues() -> list[dict]:
     """
     Cloud Tasks の指定ロケーションに存在するキューを全件取得する。
