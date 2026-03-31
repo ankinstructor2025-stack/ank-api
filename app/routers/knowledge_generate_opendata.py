@@ -6,7 +6,7 @@ import sqlite3
 import logging
 from typing import List, Optional, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from google.cloud import storage
 
@@ -24,6 +24,7 @@ from .knowledge_generate_common import (
     user_db_path,
     replace_local_db_from_blob,
     try_read_status_payload,
+    set_job_queued,
     set_job_running,
     set_job_progress,
     set_job_done,
@@ -35,6 +36,7 @@ from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
 from .content_splitter_pdf import split_pdf_records
 from .content_detector import normalize_text
+from .common import enqueue_knowledge_job
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ SOURCE_TYPE = "opendata"
 OPENDATA_QA_PROMPT_PATH = "template/opendata_qa_prompt.txt"
 OPENDATA_PLAIN_PROMPT_PATH = "template/opendata_plain_prompt.txt"
 OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
+WORKER_SHARED_TOKEN = os.getenv("WORKER_SHARED_TOKEN", "")
 
 
 class KnowledgeJobStatusResponse(BaseModel):
@@ -148,14 +151,11 @@ def get_required_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> Ch
 LOCK_TTL_SECONDS = 60 * 60 * 6
 
 
-
-
-
-
-
-
-
-
+def verify_worker_token(x_worker_token: str | None) -> None:
+    if not WORKER_SHARED_TOKEN:
+        return
+    if x_worker_token != WORKER_SHARED_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
 def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
@@ -1148,6 +1148,18 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
         dataset_name = first_item["parent_label"] if first_item else None
         row_count = int(first_item["row_count"] or 0) if first_item else 0
 
+        update_job_summary(
+            local_db_path=local_db_path,
+            job_id=job_id,
+            requested_at=requested_at,
+            status="running",
+            total_qa_count=total_qa_count,
+            total_plain_count=total_plain_count,
+            total_error_count=total_error_count,
+            error_message=None,
+        )
+        upload_local_db(db_blob, local_db_path)
+
         set_job_running(
             bucket,
             uid,
@@ -1348,6 +1360,12 @@ class KnowledgeRunRequest(BaseModel):
     job_id: str
 
 
+class WorkerRunRequest(BaseModel):
+    uid: str
+    job_id: str
+    source_type: Optional[str] = None
+
+
 def validate_request(body: KnowledgeJobCreateRequest) -> None:
     if body.source_type not in (None, "", SOURCE_TYPE):
         raise HTTPException(status_code=400, detail=f"source_type must be '{SOURCE_TYPE}'")
@@ -1499,7 +1517,6 @@ def create_opendata_job(
 @router.post("/run", response_model=KnowledgeJobCreateResponse)
 def run_opendata_job(
     body: KnowledgeRunRequest,
-    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
@@ -1516,14 +1533,15 @@ def run_opendata_job(
         )
 
     current_status = try_read_status_payload(bucket, uid)
-    if current_status.get("status") == "running":
+    current_status_name = (current_status.get("status") or "").strip().lower()
+    if current_status_name in ("queued", "running"):
         running_job_id = current_status.get("job_id")
         if running_job_id == body.job_id:
             return KnowledgeJobCreateResponse(
                 job_id=body.job_id,
                 selected_count=0,
                 created_item_count=0,
-                status="running",
+                status=current_status_name or "queued",
                 prompt_previews=[],
                 debug_items=[],
             )
@@ -1565,33 +1583,87 @@ def run_opendata_job(
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
+        conn = open_user_db(local_db_path)
+        try:
+            cur = conn.execute(
+                """
+                SELECT ji.parent_source_id, ji.parent_label, ji.row_count
+                FROM knowledge_job_items ji
+                WHERE ji.job_id = ?
+                ORDER BY ji.created_at, ji.job_item_id
+                LIMIT 1
+                """,
+                (body.job_id,),
+            )
+            first_item = cur.fetchone()
+        finally:
+            conn.close()
+
+        dataset_id = first_item["parent_source_id"] if first_item else None
+        dataset_name = first_item["parent_label"] if first_item else None
+        row_count = int(first_item["row_count"] or 0) if first_item else 0
+
         update_job_summary(
             local_db_path=local_db_path,
             job_id=body.job_id,
             requested_at=requested_at,
-            status="running",
+            status="queued",
             total_qa_count=total_qa_count,
             total_plain_count=total_plain_count,
             total_error_count=total_error_count,
             error_message=None,
         )
+        upload_local_db(db_blob, local_db_path)
 
-        set_job_running(
+        set_job_queued(
             bucket,
             uid,
             body.job_id,
             SOURCE_TYPE,
             phase="extract_knowledge",
-            message="job started",
+            message="job queued",
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            row_count=row_count,
+            qa_total=0,
+            plain_total=0,
+            chunk_total=0,
         )
 
-        background_tasks.add_task(run_opendata_job_background, uid, body.job_id)
+        try:
+            enqueue_knowledge_job(
+                source_type=SOURCE_TYPE,
+                uid=uid,
+                job_id=body.job_id,
+            )
+        except Exception as e:
+            logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
+            update_job_summary(
+                local_db_path=local_db_path,
+                job_id=body.job_id,
+                requested_at=requested_at,
+                status="error",
+                total_qa_count=total_qa_count,
+                total_plain_count=total_plain_count,
+                total_error_count=total_error_count + 1,
+                error_message=str(e),
+            )
+            upload_local_db(db_blob, local_db_path)
+            set_job_error(
+                bucket,
+                uid,
+                body.job_id,
+                str(e),
+                phase="extract_knowledge",
+                message="enqueue failed",
+            )
+            raise HTTPException(status_code=500, detail=f"enqueue failed: {type(e).__name__}: {e}")
 
         return KnowledgeJobCreateResponse(
             job_id=body.job_id,
             selected_count=0,
             created_item_count=0,
-            status="running",
+            status="queued",
             prompt_previews=[],
             debug_items=[],
         )
@@ -1603,6 +1675,25 @@ def run_opendata_job(
     except Exception as e:
         logger.exception("run_opendata_job failed")
         raise HTTPException(status_code=500, detail=f"run_opendata_job failed: {type(e).__name__}: {e}")
+
+
+@router.post("/_worker/run")
+def run_opendata_job_worker(
+    body: WorkerRunRequest,
+    x_worker_token: str | None = Header(default=None),
+):
+    verify_worker_token(x_worker_token)
+
+    if body.source_type not in (None, "", SOURCE_TYPE):
+        raise HTTPException(status_code=400, detail=f"source_type must be '{SOURCE_TYPE}'")
+
+    if not (body.uid or "").strip():
+        raise HTTPException(status_code=400, detail="uid is required")
+    if not (body.job_id or "").strip():
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    run_opendata_job_background(body.uid, body.job_id)
+    return {"ok": True, "job_id": body.job_id, "status": "done"}
 
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)

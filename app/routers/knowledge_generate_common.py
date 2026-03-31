@@ -287,6 +287,48 @@ def update_status_payload(
     return current
 
 
+def set_job_queued(
+    bucket: storage.Bucket,
+    uid: str,
+    job_id: str,
+    source_type: str,
+    *,
+    phase: str | None = None,
+    message: str | None = None,
+    dataset_id: str | None = None,
+    dataset_name: str | None = None,
+    row_count: int | None = None,
+    qa_total: int | None = None,
+    plain_total: int | None = None,
+    chunk_total: int | None = None,
+) -> dict[str, Any]:
+    current = ensure_status_payload(bucket, uid)
+    prev_started_at = current.get("started_at")
+
+    return update_status_payload(
+        bucket,
+        uid,
+        job_id=job_id,
+        source_type=source_type,
+        status="queued",
+        phase=phase,
+        message=message,
+        error_message=None,
+        started_at=prev_started_at if current.get("job_id") == job_id else None,
+        finished_at=None,
+        dataset_id=dataset_id,
+        dataset_name=dataset_name,
+        row_count=row_count,
+        knowledge_count=0,
+        qa_current=0,
+        qa_total=qa_total if qa_total is not None else 0,
+        plain_current=0,
+        plain_total=plain_total if plain_total is not None else 0,
+        chunk_current=0,
+        chunk_total=chunk_total if chunk_total is not None else 0,
+    )
+
+
 def set_job_running(
     bucket: storage.Bucket,
     uid: str,
@@ -418,6 +460,7 @@ def clear_job_status(bucket: storage.Bucket, uid: str) -> dict[str, Any]:
 
 
 # ---------- db helpers kept for job items ----------
+
 def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
     conn = open_user_db(local_db_path)
     try:
@@ -433,6 +476,7 @@ def fetch_job_row(local_db_path: str, job_id: str) -> sqlite3.Row | None:
         return cur.fetchone()
     finally:
         conn.close()
+
 
 def fetch_job_items(local_db_path: str, job_id: str) -> list[sqlite3.Row]:
     conn = open_user_db(local_db_path)
