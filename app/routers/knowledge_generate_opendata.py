@@ -1148,6 +1148,12 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=local_db_path,
+            job_id=job_id,
+        )
 
         set_job_running(
             bucket,
@@ -1256,6 +1262,13 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
                         total_error_count=total_error_count,
                         error_message=str(e),
                     )
+                    upload_local_db(db_blob, local_db_path)
+                    upsert_admin_job_from_task_db(
+                        bucket=bucket,
+                        uid=uid,
+                        task_local_db_path=local_db_path,
+                        job_id=job_id,
+                    )
                 except Exception:
                     logger.exception("failed to update job summary error: job_id=%s", job_id)
 
@@ -1280,6 +1293,13 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
             error_message=None,
         )
         upload_local_db(db_blob, local_db_path)
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=local_db_path,
+            job_id=job_id,
+        )
+
         set_job_done(
             bucket,
             uid,
@@ -1364,6 +1384,260 @@ def validate_request(body: KnowledgeJobCreateRequest) -> None:
     for item in body.items:
         if item.source_type not in (None, "", SOURCE_TYPE):
             raise HTTPException(status_code=400, detail=f"item.source_type must be '{SOURCE_TYPE}'")
+
+
+def upsert_admin_job_from_task_db(
+    bucket: storage.Bucket,
+    uid: str,
+    task_local_db_path: str,
+    job_id: str,
+) -> None:
+    admin_db_gcs_path = user_db_path(uid)
+    admin_db_blob = bucket.blob(admin_db_gcs_path)
+    if not admin_db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={admin_db_gcs_path}",
+        )
+
+    admin_local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(admin_db_blob, admin_local_db_path)
+
+    task_conn = open_user_db(task_local_db_path)
+    admin_conn = open_user_db(admin_local_db_path)
+
+    try:
+        task_row = task_conn.execute(
+            """
+            SELECT
+                job_id,
+                queue_id,
+                task_name,
+                enqueued_at,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                phase,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        if not task_row:
+            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found in task db: {job_id}")
+
+        admin_conn.execute("BEGIN")
+
+        admin_conn.execute(
+            """
+            INSERT INTO knowledge_jobs (
+                job_id,
+                queue_id,
+                task_name,
+                enqueued_at,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                phase,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                queue_id = excluded.queue_id,
+                task_name = excluded.task_name,
+                enqueued_at = excluded.enqueued_at,
+                source_type = excluded.source_type,
+                source_name = excluded.source_name,
+                request_type = excluded.request_type,
+                status = excluded.status,
+                phase = excluded.phase,
+                selected_count = excluded.selected_count,
+                qa_count = excluded.qa_count,
+                plain_count = excluded.plain_count,
+                error_count = excluded.error_count,
+                requested_at = excluded.request_at,
+                started_at = excluded.started_at,
+                finished_at = excluded.finished_at,
+                error_message = excluded.error_message
+            """,
+            (
+                task_row["job_id"],
+                task_row["queue_id"],
+                task_row["task_name"],
+                task_row["enqueued_at"],
+                task_row["source_type"],
+                task_row["source_name"],
+                task_row["request_type"],
+                task_row["status"],
+                task_row["phase"],
+                task_row["selected_count"],
+                task_row["qa_count"],
+                task_row["plain_count"],
+                task_row["error_count"],
+                task_row["requested_at"],
+                task_row["started_at"],
+                task_row["finished_at"],
+                task_row["error_message"],
+            ),
+        )
+
+        admin_conn.commit()
+        upload_local_db(admin_db_blob, admin_local_db_path)
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=local_db_path,
+            job_id=job_id,
+        )
+
+    except Exception:
+        admin_conn.rollback()
+        raise
+
+    finally:
+        task_conn.close()
+        admin_conn.close()
+
+
+def upsert_admin_job_from_task_db(
+    bucket: storage.Bucket,
+    uid: str,
+    task_local_db_path: str,
+    job_id: str,
+) -> None:
+    admin_db_gcs_path = user_db_path(uid)
+    admin_db_blob = bucket.blob(admin_db_gcs_path)
+    if not admin_db_blob.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"ank.db not found. call /v1/user/init first. path={admin_db_gcs_path}",
+        )
+
+    admin_local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(admin_db_blob, admin_local_db_path)
+
+    task_conn = open_user_db(task_local_db_path)
+    admin_conn = open_user_db(admin_local_db_path)
+
+    try:
+        task_row = task_conn.execute(
+            """
+            SELECT
+                job_id,
+                queue_id,
+                task_name,
+                enqueued_at,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                phase,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            FROM knowledge_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        if not task_row:
+            raise HTTPException(status_code=404, detail=f"knowledge_jobs not found in task db: {job_id}")
+
+        admin_conn.execute("BEGIN")
+        admin_conn.execute(
+            """
+            INSERT INTO knowledge_jobs (
+                job_id,
+                queue_id,
+                task_name,
+                enqueued_at,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                phase,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                queue_id = excluded.queue_id,
+                task_name = excluded.task_name,
+                enqueued_at = excluded.enqueued_at,
+                source_type = excluded.source_type,
+                source_name = excluded.source_name,
+                request_type = excluded.request_type,
+                status = excluded.status,
+                phase = excluded.phase,
+                selected_count = excluded.selected_count,
+                qa_count = excluded.qa_count,
+                plain_count = excluded.plain_count,
+                error_count = excluded.error_count,
+                requested_at = excluded.requested_at,
+                started_at = excluded.started_at,
+                finished_at = excluded.finished_at,
+                error_message = excluded.error_message
+            """,
+            (
+                task_row["job_id"],
+                task_row["queue_id"],
+                task_row["task_name"],
+                task_row["enqueued_at"],
+                task_row["source_type"],
+                task_row["source_name"],
+                task_row["request_type"],
+                task_row["status"],
+                task_row["phase"],
+                task_row["selected_count"],
+                task_row["qa_count"],
+                task_row["plain_count"],
+                task_row["error_count"],
+                task_row["requested_at"],
+                task_row["started_at"],
+                task_row["finished_at"],
+                task_row["error_message"],
+            ),
+        )
+        admin_conn.commit()
+        upload_local_db(admin_db_blob, admin_local_db_path)
+
+    except Exception:
+        admin_conn.rollback()
+        raise
+
+    finally:
+        task_conn.close()
+        admin_conn.close()
 
 
 @router.post("/job", response_model=KnowledgeJobCreateResponse)
@@ -1539,6 +1813,12 @@ def create_opendata_job(
         )
 
         upload_local_db(task_db_blob, task_local_db_path_value)
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=local_db_path,
+            job_id=job_id,
+        )
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
@@ -1625,6 +1905,19 @@ def run_opendata_job(
             error_message=None,
         )
         upload_local_db(task_db_blob, task_local_db_path_value)
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=task_local_db_path_value,
+            job_id=body.job_id,
+        )
+
+        upsert_admin_job_from_task_db(
+            bucket=bucket,
+            uid=uid,
+            task_local_db_path=task_local_db_path_value,
+            job_id=job_id,
+        )
 
         set_job_queued(
             bucket,
@@ -1667,6 +1960,18 @@ def run_opendata_job(
                 enqueued_at=now_iso(),
             )
             upload_local_db(task_db_blob, task_local_db_path_value)
+            upsert_admin_job_from_task_db(
+                bucket=bucket,
+                uid=uid,
+                task_local_db_path=task_local_db_path_value,
+                job_id=body.job_id,
+            )
+            upsert_admin_job_from_task_db(
+                bucket=bucket,
+                uid=uid,
+                task_local_db_path=local_db_path,
+                job_id=job_id,
+            )
 
         except Exception as e:
             logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
@@ -1684,6 +1989,12 @@ def run_opendata_job(
                 error_message=str(e),
             )
             upload_local_db(task_db_blob, task_local_db_path_value)
+            upsert_admin_job_from_task_db(
+                bucket=bucket,
+                uid=uid,
+                task_local_db_path=local_db_path,
+                job_id=job_id,
+            )
 
             set_job_error(
                 bucket,
