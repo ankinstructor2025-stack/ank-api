@@ -1378,16 +1378,16 @@ def create_opendata_job(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
-    db_blob = bucket.blob(db_gcs_path)
-    if not db_blob.exists():
+    source_db_gcs_path = user_db_path(uid)
+    source_db_blob = bucket.blob(source_db_gcs_path)
+    if not source_db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+            detail=f"ank.db not found. call /v1/user/init first. path={source_db_gcs_path}",
         )
 
-    local_db_path = local_user_db_path(uid)
-    replace_local_db_from_blob(db_blob, local_db_path)
+    source_local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(source_db_blob, source_local_db_path)
 
     try:
         qa_template_text = load_template_text(BUCKET_NAME, OPENDATA_QA_PROMPT_PATH)
@@ -1412,7 +1412,63 @@ def create_opendata_job(
             unique_items.append(item)
 
         selected_count = len(unique_items)
-        job_id, requested_at = create_job_record(local_db_path, body, selected_count)
+        job_id = new_id()
+        requested_at = now_iso()
+
+        ensure_task_db_from_template(bucket, uid, job_id)
+
+        task_db_gcs_path = user_task_db_path(uid, job_id)
+        task_db_blob = bucket.blob(task_db_gcs_path)
+        if not task_db_blob.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"task db not found after template copy: {task_db_gcs_path}",
+            )
+
+        task_local_db_path_value = local_task_db_path(uid, job_id)
+        replace_local_db_from_blob(task_db_blob, task_local_db_path_value)
+
+        conn = open_user_db(task_local_db_path_value)
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                """
+                INSERT INTO knowledge_jobs (
+                    job_id,
+                    queue_id,
+                    task_name,
+                    enqueued_at,
+                    source_type,
+                    source_name,
+                    request_type,
+                    status,
+                    selected_count,
+                    qa_count,
+                    plain_count,
+                    error_count,
+                    requested_at,
+                    started_at,
+                    finished_at,
+                    error_message
+                )
+                VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
+                """,
+                (
+                    job_id,
+                    SOURCE_TYPE,
+                    body.source_name or "オープンデータ",
+                    body.request_type,
+                    "done" if body.preview_only else "new",
+                    selected_count,
+                    requested_at,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
         prompt_previews: List[PromptPreviewItem] = []
         debug_items: List[KnowledgeDebugItem] = []
@@ -1420,7 +1476,8 @@ def create_opendata_job(
 
         for item in unique_items:
             prepared = prepare_job_item(
-                local_db_path=local_db_path,
+                source_local_db_path=source_local_db_path,
+                task_local_db_path=task_local_db_path_value,
                 bucket=bucket,
                 job_id=job_id,
                 item=item,
@@ -1429,7 +1486,7 @@ def create_opendata_job(
             )
 
             prompts = build_prompts_for_existing_job_item(
-                local_db_path=local_db_path,
+                local_db_path=task_local_db_path_value,
                 job_item_id=prepared["job_item_id"],
                 qa_chunk_conf=qa_chunk_conf,
                 plain_chunk_conf=plain_chunk_conf,
@@ -1471,7 +1528,7 @@ def create_opendata_job(
 
         initial_status = "done" if body.preview_only else "new"
         update_job_summary(
-            local_db_path=local_db_path,
+            local_db_path=task_local_db_path_value,
             job_id=job_id,
             requested_at=requested_at,
             status=initial_status,
@@ -1481,7 +1538,7 @@ def create_opendata_job(
             error_message=None,
         )
 
-        upload_local_db(db_blob, local_db_path)
+        upload_local_db(task_db_blob, task_local_db_path_value)
 
         return KnowledgeJobCreateResponse(
             job_id=job_id,
