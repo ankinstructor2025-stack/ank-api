@@ -130,15 +130,6 @@ def build_task_id(prefix: str, payload: dict[str, Any]) -> str:
     return f"{prefix}-{timestamp}-{digest}"
 
 
-def build_schedule_time_proto(schedule_seconds: int):
-    if not schedule_seconds or schedule_seconds <= 0:
-        return None
-
-    dt = datetime.now(timezone.utc) + timedelta(seconds=int(schedule_seconds))
-    ts = dt.isoformat().replace("+00:00", "Z")
-    return ts
-
-
 def create_http_task(
     queue_id: str,
     url: str,
@@ -178,10 +169,6 @@ def create_http_task(
     if task_id:
         task_name = f"{parent}/tasks/{task_id}"
         task["name"] = task_name
-
-    schedule_time = build_schedule_time_proto(schedule_seconds)
-    if schedule_time:
-        task["schedule_time"] = schedule_time
 
     created = client.create_task(parent=parent, task=task)
 
