@@ -1578,8 +1578,7 @@ def run_opendata_job(
         if running_status in {"queued", "running"} and running_job_id and running_job_id != body.job_id:
             raise HTTPException(
                 status_code=409,
-                detail=f"別のジョブが実行中です。完了後に再実行してください。
-running_job_id={running_job_id}",
+                detail=f"別のジョブが実行中です。完了後に再実行してください。running_job_id={running_job_id}",
             )
 
         task_db_gcs_path = user_task_db_path(uid, body.job_id)
