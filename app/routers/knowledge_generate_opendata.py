@@ -1912,13 +1912,6 @@ def run_opendata_job(
             job_id=body.job_id,
         )
 
-        upsert_admin_job_from_task_db(
-            bucket=bucket,
-            uid=uid,
-            task_local_db_path=task_local_db_path_value,
-            job_id=job_id,
-        )
-
         set_job_queued(
             bucket,
             uid,
@@ -1966,12 +1959,6 @@ def run_opendata_job(
                 task_local_db_path=task_local_db_path_value,
                 job_id=body.job_id,
             )
-            upsert_admin_job_from_task_db(
-                bucket=bucket,
-                uid=uid,
-                task_local_db_path=task_local_db_path_value,
-                job_id=job_id,
-            )
 
         except Exception as e:
             logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
@@ -1993,7 +1980,7 @@ def run_opendata_job(
                 bucket=bucket,
                 uid=uid,
                 task_local_db_path=task_local_db_path_value,
-                job_id=job_id,
+                job_id=body.job_id,
             )
 
             set_job_error(
