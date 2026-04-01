@@ -1473,7 +1473,7 @@ def upsert_admin_job_from_task_db(
                 qa_count = excluded.qa_count,
                 plain_count = excluded.plain_count,
                 error_count = excluded.error_count,
-                requested_at = excluded.request_at,
+                requested_at = excluded.requested_at,
                 started_at = excluded.started_at,
                 finished_at = excluded.finished_at,
                 error_message = excluded.error_message
@@ -1816,7 +1816,7 @@ def create_opendata_job(
         upsert_admin_job_from_task_db(
             bucket=bucket,
             uid=uid,
-            task_local_db_path=local_db_path,
+            task_local_db_path=task_local_db_path_value,
             job_id=job_id,
         )
 
@@ -1969,7 +1969,7 @@ def run_opendata_job(
             upsert_admin_job_from_task_db(
                 bucket=bucket,
                 uid=uid,
-                task_local_db_path=local_db_path,
+                task_local_db_path=task_local_db_path_value,
                 job_id=job_id,
             )
 
@@ -1992,7 +1992,7 @@ def run_opendata_job(
             upsert_admin_job_from_task_db(
                 bucket=bucket,
                 uid=uid,
-                task_local_db_path=local_db_path,
+                task_local_db_path=task_local_db_path_value,
                 job_id=job_id,
             )
 
