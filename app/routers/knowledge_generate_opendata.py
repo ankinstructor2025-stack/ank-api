@@ -1570,21 +1570,30 @@ def run_opendata_job(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    # 取り込み元DB(ank.db)は参照専用
-    source_db_gcs_path = user_db_path(uid)
-    source_db_blob = bucket.blob(source_db_gcs_path)
-    if not source_db_blob.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={source_db_gcs_path}",
-        )
-
-    source_local_db_path = local_user_db_path(uid)
-    replace_local_db_from_blob(source_db_blob, source_local_db_path)
-
     try:
-        # job定義は ank.db 側で確認
-        job_row = fetch_job_row(source_local_db_path, body.job_id)
+        status_payload = try_read_status_payload(bucket, uid)
+        running_status = str(status_payload.get("status") or "").lower()
+        running_job_id = str(status_payload.get("job_id") or "").strip()
+
+        if running_status in {"queued", "running"} and running_job_id and running_job_id != body.job_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"別のジョブが実行中です。完了後に再実行してください。
+running_job_id={running_job_id}",
+            )
+
+        task_db_gcs_path = user_task_db_path(uid, body.job_id)
+        task_db_blob = bucket.blob(task_db_gcs_path)
+        if not task_db_blob.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"task db not found: {task_db_gcs_path}",
+            )
+
+        task_local_db_path_value = local_task_db_path(uid, body.job_id)
+        replace_local_db_from_blob(task_db_blob, task_local_db_path_value)
+
+        job_row = fetch_job_row(task_local_db_path_value, body.job_id)
         if not job_row:
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
 
@@ -1601,38 +1610,13 @@ def run_opendata_job(
                 debug_items=[],
             )
 
-        status_payload = try_read_status_payload(bucket, uid)
-        running_status = str(status_payload.get("status") or "").lower()
-        running_job_id = str(status_payload.get("job_id") or "").strip()
-
-        if running_status in {"queued", "running"} and running_job_id and running_job_id != body.job_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"別のジョブが実行中です。完了後に再実行してください。\nrunning_job_id={running_job_id}",
-            )
-
         requested_at = job_row["requested_at"] or now_iso()
         total_qa_count = int(job_row["qa_count"] or 0)
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        # task DB を GCS 上に作成
-        ensure_task_db_from_template(bucket, uid, body.job_id)
-
-        task_db_gcs_path = user_task_db_path(uid, body.job_id)
-        task_db_blob = bucket.blob(task_db_gcs_path)
-        if not task_db_blob.exists():
-            raise HTTPException(
-                status_code=500,
-                detail=f"task db not found after template copy: {task_db_gcs_path}",
-            )
-
-        task_local_db_path = local_task_db_path(uid, body.job_id)
-        replace_local_db_from_blob(task_db_blob, task_local_db_path)
-
-        # task DB 側に knowledge_jobs を初期登録
         update_job_summary(
-            local_db_path=task_local_db_path,
+            local_db_path=task_local_db_path_value,
             job_id=body.job_id,
             requested_at=requested_at,
             status="queued",
@@ -1641,7 +1625,7 @@ def run_opendata_job(
             total_error_count=total_error_count,
             error_message=None,
         )
-        upload_local_db(task_db_blob, task_local_db_path)
+        upload_local_db(task_db_blob, task_local_db_path_value)
 
         set_job_queued(
             bucket,
@@ -1674,24 +1658,24 @@ def run_opendata_job(
                 or ""
             ).strip() or None
 
-            replace_local_db_from_blob(task_db_blob, task_local_db_path)
+            replace_local_db_from_blob(task_db_blob, task_local_db_path_value)
 
             update_job_enqueue_info(
-                local_db_path=task_local_db_path,
+                local_db_path=task_local_db_path_value,
                 job_id=body.job_id,
                 queue_id=queue_id,
                 task_name=task_name,
                 enqueued_at=now_iso(),
             )
-            upload_local_db(task_db_blob, task_local_db_path)
+            upload_local_db(task_db_blob, task_local_db_path_value)
 
         except Exception as e:
             logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
 
-            replace_local_db_from_blob(task_db_blob, task_local_db_path)
+            replace_local_db_from_blob(task_db_blob, task_local_db_path_value)
 
             update_job_summary(
-                local_db_path=task_local_db_path,
+                local_db_path=task_local_db_path_value,
                 job_id=body.job_id,
                 requested_at=requested_at,
                 status="error",
@@ -1700,7 +1684,7 @@ def run_opendata_job(
                 total_error_count=total_error_count + 1,
                 error_message=str(e),
             )
-            upload_local_db(task_db_blob, task_local_db_path)
+            upload_local_db(task_db_blob, task_local_db_path_value)
 
             set_job_error(
                 bucket,
