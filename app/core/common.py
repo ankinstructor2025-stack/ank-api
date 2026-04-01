@@ -172,7 +172,7 @@ def create_http_task(
             "headers": request_headers,
             "body": body_bytes,
         },
-        "dispatch_deadline": duration_pb2.Duration(seconds=3600),  # ← 修正
+        "dispatch_deadline": duration_pb2.Duration(seconds=1800),  # ← 修正
     }
 
     if task_id:
