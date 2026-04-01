@@ -244,7 +244,7 @@ def enqueue_knowledge_job(
 
     headers: dict[str, str] = {}
     if WORKER_SHARED_TOKEN:
-        headers["X-Worker-Token"] = WORKER_SHARED_TOKEN
+        headers["x-worker-token"] = WORKER_SHARED_TOKEN
 
     result = enqueue_http_task_to_best_queue(
         url=worker_url,
