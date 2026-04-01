@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 JST = ZoneInfo("Asia/Tokyo")
 STATUS_JSON_FILENAME = "knowledge_generate.json"
 
+TASK_TEMPLATE_DB_PATH = "template/task_template.sqlite"
+
 
 # ---------- basic helpers ----------
 
@@ -43,6 +45,14 @@ def local_user_db_path(uid: str) -> str:
 
 def local_status_json_path(uid: str) -> str:
     return f"/tmp/knowledge_generate_{uid}.json"
+
+
+def user_task_db_path(uid: str, job_id: str) -> str:
+    return f"users/{uid}/{job_id}.db"
+
+
+def local_task_db_path(uid: str, job_id: str) -> str:
+    return f"/tmp/{uid}_{job_id}.db"
 
 
 def load_json_safe(text: str | bytes | None) -> Any | None:
@@ -540,3 +550,48 @@ def fetch_next_new_job_item(local_db_path: str, job_id: str) -> sqlite3.Row | No
         return cur.fetchone()
     finally:
         conn.close()
+
+
+def ensure_task_db_from_template(bucket: storage.Bucket, uid: str, job_id: str) -> dict[str, Any]:
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    src_blob = bucket.blob(TASK_TEMPLATE_DB_PATH)
+    if not src_blob.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"task template db not found: {TASK_TEMPLATE_DB_PATH}",
+        )
+
+    dest_path = user_task_db_path(uid, job_id)
+    dest_blob = bucket.blob(dest_path)
+
+    if dest_blob.exists():
+        return {
+            "created": False,
+            "db_gcs_path": dest_path,
+        }
+
+    bucket.copy_blob(src_blob, bucket, new_name=dest_path)
+
+    return {
+        "created": True,
+        "db_gcs_path": dest_path,
+    }
+
+
+def replace_local_task_db_from_gcs(bucket: storage.Bucket, uid: str, job_id: str) -> tuple[storage.Blob, str]:
+    db_gcs_path = user_task_db_path(uid, job_id)
+    db_blob = bucket.blob(db_gcs_path)
+
+    if not db_blob.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"task db not found: {db_gcs_path}",
+        )
+
+    local_db_path = local_task_db_path(uid, job_id)
+    replace_local_db_from_blob(db_blob, local_db_path)
+    return db_blob, local_db_path

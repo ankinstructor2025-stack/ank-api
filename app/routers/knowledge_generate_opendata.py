@@ -17,11 +17,14 @@ from .knowledge_generate_common import (
     load_chunk_config,
     load_template_text,
     local_user_db_path,
+    local_task_db_path,
     new_id,
     now_iso,
     open_user_db,
     upload_local_db,
     user_db_path,
+    user_task_db_path,
+    ensure_task_db_from_template,
     replace_local_db_from_blob,
     try_read_status_payload,
     set_job_queued,
@@ -107,50 +110,6 @@ def get_required_opendata_chunk_conf(chunk_config: dict, prompt_type: str) -> Ch
 
     return ChunkConfig(max_chars=max_chars, max_items=max_items, overlap_items=overlap_items)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-LOCK_TTL_SECONDS = 60 * 60 * 6
-
-
 def verify_worker_token(x_worker_token: str | None) -> None:
     if not WORKER_SHARED_TOKEN:
         return
@@ -158,8 +117,8 @@ def verify_worker_token(x_worker_token: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
-def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3.Row]:
-    conn = open_user_db(local_db_path)
+def fetch_opendata_file_rows(source_local_db_path: str, source_id: str) -> list[sqlite3.Row]:
+    conn = open_user_db(source_local_db_path)
     try:
         cur = conn.execute(
             """
@@ -183,13 +142,6 @@ def fetch_opendata_file_rows(local_db_path: str, source_id: str) -> list[sqlite3
         return cur.fetchall()
     finally:
         conn.close()
-
-
-
-
-
-
-
 
 def fetch_opendata_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row:
     cur = conn.execute(
@@ -659,7 +611,8 @@ def create_job_record(
 
 
 def prepare_job_item(
-    local_db_path: str,
+    source_local_db_path: str,
+    task_local_db_path: str,
     bucket: storage.Bucket,
     job_id: str,
     item: "KnowledgeTargetItem",
@@ -670,13 +623,13 @@ def prepare_job_item(
     if not source_id:
         raise HTTPException(status_code=400, detail="parent_source_id is required")
 
-    file_rows = fetch_opendata_file_rows(local_db_path, source_id)
+    file_rows = fetch_opendata_file_rows(source_local_db_path, source_id)
     if not file_rows:
         raise HTTPException(status_code=400, detail=f"opendata_document_files not found: {source_id}")
 
     job_item_id = new_id()
 
-    conn = open_user_db(local_db_path)
+    conn = open_user_db(task_local_db_path)
     try:
         conn.execute("BEGIN")
 
@@ -1110,21 +1063,21 @@ def run_opendata_job_background(uid: str, job_id: str) -> None:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
+    db_gcs_path = user_task_db_path(uid, job_id)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
-        logger.error("ank.db not found in background: %s", db_gcs_path)
+        logger.error("task db not found in background: %s", db_gcs_path)
         set_job_error(
             bucket,
             uid,
             job_id,
-            f"ank.db not found: {db_gcs_path}",
+            f"task db not found: {db_gcs_path}",
             phase="extract_knowledge",
-            message="ank.db not found",
+            message="task db not found",
         )
         return
 
-    local_db_path = local_user_db_path(uid)
+    local_db_path = local_task_db_path(uid, job_id)
 
     try:
         replace_local_db_from_blob(db_blob, local_db_path)
@@ -1560,19 +1513,21 @@ def run_opendata_job(
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
-    db_blob = bucket.blob(db_gcs_path)
-    if not db_blob.exists():
+    # 取り込み元DB(ank.db)は参照専用
+    source_db_gcs_path = user_db_path(uid)
+    source_db_blob = bucket.blob(source_db_gcs_path)
+    if not source_db_blob.exists():
         raise HTTPException(
             status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+            detail=f"ank.db not found. call /v1/user/init first. path={source_db_gcs_path}",
         )
 
-    local_db_path = local_user_db_path(uid)
-    replace_local_db_from_blob(db_blob, local_db_path)
+    source_local_db_path = local_user_db_path(uid)
+    replace_local_db_from_blob(source_db_blob, source_local_db_path)
 
     try:
-        job_row = fetch_job_row(local_db_path, body.job_id)
+        # job定義は ank.db 側で確認
+        job_row = fetch_job_row(source_local_db_path, body.job_id)
         if not job_row:
             raise HTTPException(status_code=404, detail=f"knowledge_jobs not found: {body.job_id}")
 
@@ -1604,28 +1559,23 @@ def run_opendata_job(
         total_plain_count = int(job_row["plain_count"] or 0)
         total_error_count = int(job_row["error_count"] or 0)
 
-        conn = open_user_db(local_db_path)
-        try:
-            cur = conn.execute(
-                """
-                SELECT ji.parent_source_id, ji.parent_label, ji.row_count
-                FROM knowledge_job_items ji
-                WHERE ji.job_id = ?
-                ORDER BY ji.created_at, ji.job_item_id
-                LIMIT 1
-                """,
-                (body.job_id,),
+        # task DB を GCS 上に作成
+        ensure_task_db_from_template(bucket, uid, body.job_id)
+
+        task_db_gcs_path = user_task_db_path(uid, body.job_id)
+        task_db_blob = bucket.blob(task_db_gcs_path)
+        if not task_db_blob.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"task db not found after template copy: {task_db_gcs_path}",
             )
-            first_item = cur.fetchone()
-        finally:
-            conn.close()
 
-        dataset_id = first_item["parent_source_id"] if first_item else None
-        dataset_name = first_item["parent_label"] if first_item else None
-        row_count = int(first_item["row_count"] or 0) if first_item else 0
+        task_local_db_path = local_task_db_path(uid, body.job_id)
+        replace_local_db_from_blob(task_db_blob, task_local_db_path)
 
+        # task DB 側に knowledge_jobs を初期登録
         update_job_summary(
-            local_db_path=local_db_path,
+            local_db_path=task_local_db_path,
             job_id=body.job_id,
             requested_at=requested_at,
             status="queued",
@@ -1634,7 +1584,7 @@ def run_opendata_job(
             total_error_count=total_error_count,
             error_message=None,
         )
-        upload_local_db(db_blob, local_db_path)
+        upload_local_db(task_db_blob, task_local_db_path)
 
         set_job_queued(
             bucket,
@@ -1643,9 +1593,6 @@ def run_opendata_job(
             SOURCE_TYPE,
             phase="extract_knowledge",
             message="job queued",
-            dataset_id=dataset_id,
-            dataset_name=dataset_name,
-            row_count=row_count,
             qa_total=0,
             plain_total=0,
             chunk_total=0,
@@ -1670,20 +1617,24 @@ def run_opendata_job(
                 or ""
             ).strip() or None
 
+            replace_local_db_from_blob(task_db_blob, task_local_db_path)
+
             update_job_enqueue_info(
-                local_db_path=local_db_path,
+                local_db_path=task_local_db_path,
                 job_id=body.job_id,
                 queue_id=queue_id,
                 task_name=task_name,
                 enqueued_at=now_iso(),
             )
-
-            upload_local_db(db_blob, local_db_path)
+            upload_local_db(task_db_blob, task_local_db_path)
 
         except Exception as e:
             logger.exception("enqueue opendata job failed: job_id=%s", body.job_id)
+
+            replace_local_db_from_blob(task_db_blob, task_local_db_path)
+
             update_job_summary(
-                local_db_path=local_db_path,
+                local_db_path=task_local_db_path,
                 job_id=body.job_id,
                 requested_at=requested_at,
                 status="error",
@@ -1692,7 +1643,8 @@ def run_opendata_job(
                 total_error_count=total_error_count + 1,
                 error_message=str(e),
             )
-            upload_local_db(db_blob, local_db_path)
+            upload_local_db(task_db_blob, task_local_db_path)
+
             set_job_error(
                 bucket,
                 uid,
