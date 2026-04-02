@@ -254,3 +254,33 @@ def enqueue_knowledge_job(
         "selected_queue": result["selected_queue"],
         "created_task": result["created_task"],
     }
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    # 改行統一
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # タブ→スペース（地味に効く）
+    text = text.replace("\t", " ")
+
+    # 行単位でtrim
+    lines = [line.strip() for line in text.split("\n")]
+
+    # 空行削除して再結合
+    return "\n".join(line for line in lines if line)
+
+def user_db_path(uid: str) -> str:
+    return f"users/{uid}/ank.db"
+
+def local_user_db_path(uid: str) -> str:
+    return f"/tmp/ank_{uid}.db"
+
+def user_task_db_path(uid: str, job_id: str) -> str:
+    return f"users/{uid}/{job_id}.db"
+
+def local_task_db_path(uid: str, job_id: str) -> str:
+    return f"/tmp/{uid}_{job_id}.db"
