@@ -277,13 +277,13 @@ def insert_job_chunks(
                 job_item_id,
                 source_type,
                 chunk_no,
-                prompt_type,
                 prompt,
+                prompt_type,
                 row_count,
                 status,
-                retry_count,
                 task_name,
                 queue_id,
+                retry_count,
                 response_text,
                 result_json,
                 error_message,
@@ -292,19 +292,28 @@ def insert_job_chunks(
                 started_at,
                 finished_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                new_id(),
+                row.get("chunk_id") or new_id(),
                 job_id,
                 job_item_id,
                 source_type,
                 row.get("chunk_no", 0),
-                row.get("prompt_type", ""),
                 row.get("prompt", ""),
+                row.get("prompt_type", ""),
                 row.get("row_count", 0),
                 row.get("status", "new"),
-                now_iso(),
+                row.get("task_name"),
+                row.get("queue_id"),
+                row.get("retry_count", 0),
+                row.get("response_text"),
+                row.get("result_json"),
+                row.get("error_message"),
+                row.get("created_at", now_iso()),
+                row.get("queued_at"),
+                row.get("started_at"),
+                row.get("finished_at"),
             ),
         )
         count += 1
