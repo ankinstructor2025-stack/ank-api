@@ -37,6 +37,7 @@ from .knowledge_generate_public_url import (
 )
 
 from app.core.common import local_user_db_path
+from app.router.user_init import get_uid_from_auth_header
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge_generate"])
 
@@ -200,7 +201,8 @@ def create_job(body: KnowledgeJobCreateRequest):
     if not body.items:
         raise HTTPException(status_code=400, detail="items is empty")
 
-    local_db_path = local_user_db_path(body.uid)
+    uid = get_uid_from_auth_header(request.headers.get("Authorization"))
+    local_db_path = local_user_db_path(uid)
 
     job_id, requested_at = create_job_record(
         local_db_path=local_db_path,
