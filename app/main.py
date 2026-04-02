@@ -14,7 +14,6 @@ from app.routers.knowledge_refine import router as knowledge_refine_router
 from app.routers.knowledge_search import router as knowledge_search_router
 from app.routers.admin_task_queues import router as admin_task_queues_router
 
-
 def create_app() -> FastAPI:
     app = FastAPI()
     setup_cors(app)
