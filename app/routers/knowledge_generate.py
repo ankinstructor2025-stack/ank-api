@@ -111,7 +111,6 @@ def insert_job_chunks(
     conn,
     job_id: str,
     job_item_id: str,
-    source_type: str,
     chunk_rows: list[dict[str, Any]],
 ) -> int:
     count = 0
@@ -122,11 +121,9 @@ def insert_job_chunks(
                 chunk_id,
                 job_id,
                 job_item_id,
-                source_type,
                 chunk_no,
                 prompt_type,
                 prompt,
-                row_count,
                 status,
                 retry_count,
                 task_name,
@@ -141,7 +138,7 @@ def insert_job_chunks(
             )
             VALUES (
                 hex(randomblob(16)),
-                ?, ?, ?, ?, ?, ?, ?, ?, 0,
+                ?, ?, ?, ?, ?, ?, 0,
                 NULL, NULL, NULL, NULL, NULL,
                 CURRENT_TIMESTAMP, NULL, NULL, NULL
             )
@@ -149,11 +146,9 @@ def insert_job_chunks(
             (
                 job_id,
                 job_item_id,
-                source_type,
                 row.get("chunk_no", 0),
                 row.get("prompt_type", ""),
                 row.get("prompt", ""),
-                row.get("row_count", 0),
                 row.get("status", "new"),
             ),
         )
@@ -200,7 +195,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     else:
         raise HTTPException(status_code=400, detail=f"unsupported source_type: {source_type}")
 
-    insert_job_chunks(conn, job_id, job_item_id, source_type, chunk_rows)
+    insert_job_chunks(conn, job_id, job_item_id, chunk_rows)
     return job_item_id
 
 
