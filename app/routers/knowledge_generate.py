@@ -113,7 +113,9 @@ def insert_job_chunks(
     job_item_id: str,
     chunk_rows: list[dict[str, Any]],
 ) -> int:
+
     count = 0
+
     for row in chunk_rows:
         conn.execute(
             """
@@ -122,12 +124,12 @@ def insert_job_chunks(
                 job_id,
                 job_item_id,
                 chunk_no,
-                prompt_type,
                 prompt,
+                prompt_type,
                 status,
-                retry_count,
                 task_name,
                 queue_id,
+                retry_count,
                 response_text,
                 result_json,
                 error_message,
@@ -138,21 +140,24 @@ def insert_job_chunks(
             )
             VALUES (
                 hex(randomblob(16)),
-                ?, ?, ?, ?, ?, ?, 0,
-                NULL, NULL, NULL, NULL, NULL,
-                CURRENT_TIMESTAMP, NULL, NULL, NULL
+                ?, ?, ?, ?, ?, ?,
+                NULL, NULL, 0,
+                NULL, NULL, NULL,
+                CURRENT_TIMESTAMP,
+                NULL, NULL, NULL
             )
             """,
             (
                 job_id,
                 job_item_id,
-                row.get("chunk_no", 0),
-                row.get("prompt_type", ""),
-                row.get("prompt", ""),
+                row["chunk_no"],
+                row["prompt"],
+                row["prompt_type"],
                 row.get("status", "new"),
             ),
         )
         count += 1
+
     return count
 
 
