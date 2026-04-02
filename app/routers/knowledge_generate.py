@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .knowledge_generate_common import (
@@ -37,7 +37,7 @@ from .knowledge_generate_public_url import (
 )
 
 from app.core.common import local_user_db_path
-
+from app.routers.user_init import get_uid_from_auth_header
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge_generate"])
 
@@ -90,30 +90,6 @@ class KnowledgeJobStatusResponse(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error_message: Optional[str] = None
-
-
-
-
-def get_uid_from_auth_header(authorization: str | None) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-
-    token = authorization.replace("Bearer ", "", 1).strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Empty bearer token")
-
-    ensure_firebase_initialized()
-    try:
-        decoded = fb_auth.verify_id_token(token)
-        uid = decoded.get("uid")
-        if not uid:
-            raise HTTPException(status_code=401, detail="uid not found in token")
-        return uid
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
 def validate_source_type(source_type: str) -> None:
@@ -219,7 +195,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
 
 
 @router.post("/job", response_model=KnowledgeJobCreateResponse)
-def create_job(body: KnowledgeJobCreateRequest):
+def create_job(request: Request, body: KnowledgeJobCreateRequest):
     validate_source_type(body.source_type)
 
     if not body.items:
@@ -229,7 +205,7 @@ def create_job(body: KnowledgeJobCreateRequest):
     local_db_path = local_user_db_path(uid)
 
     job_id, requested_at = create_job_record(
-        local_db_path=local_db_path,
+        uid=uid,
         source_type=body.source_type,
         source_name=body.source_name or body.source_type,
         request_type=body.request_type,
