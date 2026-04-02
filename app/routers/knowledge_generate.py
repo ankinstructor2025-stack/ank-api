@@ -11,6 +11,8 @@ from .knowledge_generate_common import (
     create_job_record,
     create_job_item_record,
     open_user_db,
+    insert_opendata_contents_from_files,
+    insert_job_chunks,
 )
 
 from .knowledge_generate_kokkai import SOURCE_TYPE as KOKKAI_SOURCE_TYPE
@@ -74,6 +76,7 @@ class KnowledgeJobCreateRequest(BaseModel):
     items: list[KnowledgeTargetItem] = Field(default_factory=list)
     preview_only: bool = False
 
+
 class KnowledgeRunRequest(BaseModel):
     job_id: str
 
@@ -105,60 +108,6 @@ def validate_source_type(source_type: str) -> None:
         raise HTTPException(status_code=400, detail=f"unsupported source_type: {source_type}")
 
 
-def insert_job_chunks(
-    conn,
-    job_id: str,
-    job_item_id: str,
-    chunk_rows: list[dict[str, Any]],
-) -> int:
-
-    count = 0
-
-    for row in chunk_rows:
-        conn.execute(
-            """
-            INSERT INTO knowledge_job_chunks (
-                chunk_id,
-                job_id,
-                job_item_id,
-                chunk_no,
-                prompt,
-                prompt_type,
-                status,
-                task_name,
-                queue_id,
-                retry_count,
-                response_text,
-                result_json,
-                error_message,
-                created_at,
-                queued_at,
-                started_at,
-                finished_at
-            )
-            VALUES (
-                hex(randomblob(16)),
-                ?, ?, ?, ?, ?, ?,
-                NULL, NULL, 0,
-                NULL, NULL, NULL,
-                CURRENT_TIMESTAMP,
-                NULL, NULL, NULL
-            )
-            """,
-            (
-                job_id,
-                job_item_id,
-                row["chunk_no"],
-                row["prompt"],
-                row["prompt_type"],
-                row.get("status", "new"),
-            ),
-        )
-        count += 1
-
-    return count
-
-
 def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTargetItem) -> str:
     source_type = item.source_type
     validate_source_type(source_type)
@@ -181,35 +130,13 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
         chunk_rows = build_kokkai_chunk_rows(conn, job_item_id)
 
     elif source_type == OPENDATA_SOURCE_TYPE:
-        chunks = build_opendata_chunk_rows(conn, job_item_id)
-
-        if not chunks:
-            return
-
-        for c in chunks:
-            conn.execute(
-                """
-                INSERT INTO knowledge_chunks (
-                    job_id,
-                    job_item_id,
-                    chunk_no,
-                    prompt_type,
-                    prompt,
-                    status,
-                    created_at
-                )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    job_item_id,
-                    c["chunk_no"],
-                    c["prompt_type"],
-                    c["prompt"],
-                    "new",
-                    now_iso(),
-                ),
-            )
+        insert_opendata_contents_from_files(
+            conn=conn,
+            job_id=job_id,
+            job_item_id=job_item_id,
+            source_id=item.parent_source_id or "",
+        )
+        chunk_rows = build_opendata_chunk_rows(conn, job_item_id)
 
     elif source_type == UPLOAD_SOURCE_TYPE:
         file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
@@ -224,7 +151,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     else:
         raise HTTPException(status_code=400, detail=f"unsupported source_type: {source_type}")
 
-    insert_job_chunks(conn, job_id, job_item_id, chunk_rows)
+    insert_job_chunks(conn, job_id, job_item_id, source_type, chunk_rows)
     return job_item_id
 
 
@@ -341,8 +268,8 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
 
         for item in body.items:
             prepare_job_item(conn, local_user_path, job_id, item)
-        conn.commit()
 
+        conn.commit()
         upload_job_task_db(uid, job_id, local_task_path)
     except Exception:
         conn.rollback()
