@@ -7,21 +7,12 @@ from typing import Any
 from .knowledge_generate_common import (
     load_chunk_config,
     load_template_text,
-    now_iso,
-    open_user_db,
+    PROMPT_TEMPLATE_PATHS,
 )
 
 from app.core.common import normalize_text
 
 SOURCE_TYPE = "opendata"
-
-BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
-
-# ===== テンプレート =====
-OPENDATA_QA_PROMPT_PATH = "template/opendata_qa_prompt.txt"
-OPENDATA_PLAIN_PROMPT_PATH = "template/opendata_plain_prompt.txt"
-OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
-
 
 # =========================
 # chunk config取得
@@ -65,7 +56,7 @@ def build_opendata_chunk_rows(
 ) -> list[dict[str, Any]]:
 
     # ===== chunk設定読み込み =====
-    chunk_config = load_chunk_config(OPENAI_CHUNK_CONFIG_PATH)
+    chunk_config = load_chunk_config()
 
     qa_conf = get_required_opendata_chunk_conf(chunk_config, "qa")
     plain_conf = get_required_opendata_chunk_conf(chunk_config, "plain")
@@ -77,8 +68,13 @@ def build_opendata_chunk_rows(
     plain_overlap = plain_conf.get("overlap", 0)
 
     # ===== テンプレート読み込み（ここ重要）=====
-    qa_template = load_template_text(OPENDATA_QA_PROMPT_PATH)
-    plain_template = load_template_text(OPENDATA_PLAIN_PROMPT_PATH)
+    qa_template = load_template_text(
+        PROMPT_TEMPLATE_PATHS["opendata"]["qa"]
+    )
+
+    plain_template = load_template_text(
+        PROMPT_TEMPLATE_PATHS["opendata"]["plain"]
+    )
 
     if not qa_template:
         raise RuntimeError("QA prompt template is empty")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from datetime import datetime
@@ -9,7 +10,27 @@ from typing import Any
 from app.core.common import local_user_db_path
 
 JST = ZoneInfo("Asia/Tokyo")
+BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
+CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
+PROMPT_TEMPLATE_PATHS = {
+    "opendata": {
+        "qa": "template/opendata_qa_prompt.txt",
+        "plain": "template/opendata_plain_prompt.txt",
+    },
+    "kokkai": {
+        "qa": "template/kokkai_qa_prompt.txt",
+        "plain": "template/kokkai_plain_prompt.txt",
+    },
+    "upload": {
+        "qa": "template/upload_qa_prompt.txt",
+        "plain": "template/upload_plain_prompt.txt",
+    },
+    "public_url": {
+        "qa": "template/public_url_qa_prompt.txt",
+        "plain": "template/public_url_plain_prompt.txt",
+    },
+}
 
 def now_iso() -> str:
     return datetime.now(tz=JST).isoformat()
@@ -31,13 +52,32 @@ def open_user_db_by_uid(uid: str) -> sqlite3.Connection:
     return open_user_db(local_db_path)
 
 
-def load_template_text(bucket_name: str, path: str) -> str:
-    return ""
+def load_template_text(path: str) -> str:
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(path)
+
+    if not blob.exists():
+        return ""
+
+    return blob.download_as_text(encoding="utf-8")
 
 
-def load_chunk_config(bucket_name: str, config_path: str) -> dict[str, Any]:
-    return {}
+def load_chunk_config() -> dict[str, Any]:
+    from google.cloud import storage
+    import json
 
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(CHUNK_CONFIG_PATH)
+
+    if not blob.exists():
+        return {}
+
+    text = blob.download_as_text(encoding="utf-8")
+    return json.loads(text)
 
 # -----------------------------
 # JOB
