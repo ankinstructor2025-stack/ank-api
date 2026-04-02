@@ -36,6 +36,8 @@ from .knowledge_generate_public_url import (
     build_public_url_chunk_rows,
 )
 
+from app.core.common import local_user_db_path
+
 router = APIRouter(prefix="/knowledge", tags=["knowledge_generate"])
 
 
@@ -57,12 +59,12 @@ class KnowledgeTargetItem(BaseModel):
 
 
 class KnowledgeJobCreateRequest(BaseModel):
+    uid: str
     source_type: str
     source_name: Optional[str] = None
     request_type: str = "extract_knowledge"
     items: list[KnowledgeTargetItem] = Field(default_factory=list)
     preview_only: bool = False
-
 
 class KnowledgeRunRequest(BaseModel):
     job_id: str
@@ -199,7 +201,7 @@ def create_job(body: KnowledgeJobCreateRequest):
     if not body.items:
         raise HTTPException(status_code=400, detail="items is empty")
 
-    local_db_path = os.getenv("KNOWLEDGE_LOCAL_DB_PATH", "/tmp/ank.db")
+    local_db_path = local_user_db_path(body.uid)
 
     job_id, requested_at = create_job_record(
         local_db_path=local_db_path,
@@ -241,8 +243,8 @@ def run_job(body: KnowledgeRunRequest):
 
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
-def get_status(job_id: str):
-    local_db_path = os.getenv("KNOWLEDGE_LOCAL_DB_PATH", "/tmp/ank.db")
+def get_status(uid: str, job_id: str):
+    local_db_path = local_user_db_path(uid)
 
     conn = open_user_db(local_db_path)
     try:
