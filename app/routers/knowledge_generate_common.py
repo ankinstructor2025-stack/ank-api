@@ -231,7 +231,6 @@ def insert_opendata_contents_from_files(
         conn.execute(
             """
             INSERT INTO knowledge_contents (
-                content_id,
                 job_id,
                 job_item_id,
                 source_type,
@@ -239,10 +238,9 @@ def insert_opendata_contents_from_files(
                 sort_no,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                new_id(),
                 job_id,
                 job_item_id,
                 "opendata",
