@@ -137,7 +137,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
             job_item_id=job_item_id,
             source_id=item.parent_source_id or "",
         )
-        chunk_rows = build_opendata_chunk_rows(conn, job_item_id)
+        chunk_rows = build_opendata_chunk_rows(conn, job_id, job_item_id)
 
     elif source_type == UPLOAD_SOURCE_TYPE:
         file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
