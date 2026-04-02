@@ -233,6 +233,47 @@ def upload_job_task_db(uid: str, job_id: str, local_path: str) -> None:
     blob.upload_from_filename(local_path)
 
 
+def insert_task_job_record(
+    conn,
+    job_id: str,
+    source_type: str,
+    source_name: str,
+    request_type: str,
+    selected_count: int,
+    preview_only: bool,
+    requested_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO knowledge_jobs (
+            job_id,
+            source_type,
+            source_name,
+            request_type,
+            status,
+            selected_count,
+            qa_count,
+            plain_count,
+            error_count,
+            requested_at,
+            started_at,
+            finished_at,
+            error_message
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL, NULL)
+        """,
+        (
+            job_id,
+            source_type,
+            source_name,
+            request_type,
+            "done" if preview_only else "new",
+            selected_count,
+            requested_at,
+        ),
+    )
+
+
 @router.post("/job", response_model=KnowledgeJobCreateResponse)
 def create_job(request: Request, body: KnowledgeJobCreateRequest):
     validate_source_type(body.source_type)
@@ -257,6 +298,18 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
     conn = open_user_db(local_task_path)
     try:
         conn.execute("BEGIN")
+
+        insert_task_job_record(
+            conn=conn,
+            job_id=job_id,
+            source_type=body.source_type,
+            source_name=body.source_name or body.source_type,
+            request_type=body.request_type,
+            selected_count=len(body.items),
+            preview_only=body.preview_only,
+            requested_at=requested_at,
+        )
+
         for item in body.items:
             prepare_job_item(conn, local_user_path, job_id, item)
         conn.commit()
