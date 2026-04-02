@@ -21,7 +21,6 @@ from .knowledge_generate_kokkai import (
 )
 from .knowledge_generate_opendata import SOURCE_TYPE as OPENDATA_SOURCE_TYPE
 from .knowledge_generate_opendata import (
-    insert_opendata_contents,
     build_opendata_chunk_rows,
 )
 from .knowledge_generate_upload import SOURCE_TYPE as UPLOAD_SOURCE_TYPE
@@ -182,9 +181,35 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
         chunk_rows = build_kokkai_chunk_rows(conn, job_item_id)
 
     elif source_type == OPENDATA_SOURCE_TYPE:
-        source_rows = fetch_opendata_file_rows(local_db_path, item.parent_source_id or "")
-        insert_opendata_contents(conn, job_id, job_item_id, source_rows)
-        chunk_rows = build_opendata_chunk_rows(conn, job_item_id)
+        chunks = build_opendata_chunk_rows(conn, job_item_id)
+
+        if not chunks:
+            return
+
+        for c in chunks:
+            conn.execute(
+                """
+                INSERT INTO knowledge_chunks (
+                    job_id,
+                    job_item_id,
+                    chunk_no,
+                    prompt_type,
+                    prompt,
+                    status,
+                    created_at
+                )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    job_item_id,
+                    c["chunk_no"],
+                    c["prompt_type"],
+                    c["prompt"],
+                    "new",
+                    now_iso(),
+                ),
+            )
 
     elif source_type == UPLOAD_SOURCE_TYPE:
         file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
