@@ -132,6 +132,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     elif source_type == OPENDATA_SOURCE_TYPE:
         insert_opendata_contents_from_files(
             conn=conn,
+            local_db_path=local_db_path,
             job_id=job_id,
             job_item_id=job_item_id,
             source_id=item.parent_source_id or "",

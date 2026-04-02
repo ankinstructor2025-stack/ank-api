@@ -191,27 +191,33 @@ def create_job_item_record(
 
 def insert_opendata_contents_from_files(
     conn: sqlite3.Connection,
+    local_db_path: str,
     job_id: str,
     job_item_id: str,
     source_id: str,
 ) -> int:
 
-    cur = conn.execute(
-        """
-        SELECT
-            file_id,
-            file_no,
-            logical_name,
-            gcs_path,
-            ext
-        FROM opendata_document_files
-        WHERE source_id = ?
-        ORDER BY file_no
-        """,
-        (source_id,),
-    )
+    src_conn = open_user_db(local_db_path)
+    try:
+        cur = src_conn.execute(
+            """
+            SELECT
+                file_id,
+                file_no,
+                logical_name,
+                gcs_path,
+                ext
+            FROM opendata_document_files
+            WHERE source_id = ?
+            ORDER BY file_no
+            """,
+            (source_id,),
+        )
 
-    rows = cur.fetchall()
+        rows = cur.fetchall()
+    finally:
+        src_conn.close()
+
     if not rows:
         return 0
 
@@ -240,7 +246,7 @@ def insert_opendata_contents_from_files(
                 job_id,
                 job_item_id,
                 "opendata",
-                gcs_path,                 # ← PDFのGCSパスをそのまま入れる
+                gcs_path,
                 r["file_no"],
                 now_iso(),
             ),
