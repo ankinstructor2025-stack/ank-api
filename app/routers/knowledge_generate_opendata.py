@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from .knowledge_generate_common import (
@@ -11,7 +12,24 @@ from .knowledge_generate_common import (
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
 
+
 SOURCE_TYPE = "opendata"
+
+
+# =========================
+# 共通
+# =========================
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def build_chunk_id(
+    job_id: str,
+    job_item_id: str,
+    prompt_type: str,
+    chunk_no: int,
+) -> str:
+    return f"{job_id}_{job_item_id}_{prompt_type}_{chunk_no}"
 
 
 # =========================
@@ -79,6 +97,7 @@ def fetch_opendata_content_rows(
 # =========================
 def build_opendata_chunk_rows(
     conn: sqlite3.Connection,
+    job_id: str,
     job_item_id: str,
 ) -> list[dict[str, Any]]:
 
@@ -107,9 +126,10 @@ def build_opendata_chunk_rows(
 
     rows = fetch_opendata_content_rows(conn, job_item_id)
     if not rows:
-        raise RuntimeError("knowledge_contents is empty for job_item_id")
+        raise RuntimeError(f"knowledge_contents is empty for job_item_id={job_item_id}")
 
     row_count = len(rows)
+    created_at = utc_now_iso()
     chunk_rows: list[dict[str, Any]] = []
 
     # =========================
@@ -131,12 +151,16 @@ def build_opendata_chunk_rows(
 
         chunk_rows.append(
             {
+                "chunk_id": build_chunk_id(job_id, job_item_id, "qa", chunk.chunk_no),
+                "job_id": job_id,
                 "job_item_id": job_item_id,
                 "source_type": SOURCE_TYPE,
                 "chunk_no": chunk.chunk_no,
-                "prompt_type": "qa",
                 "prompt": prompt,
+                "prompt_type": "qa",
+                "row_count": chunk.item_count,
                 "status": "new",
+                "created_at": created_at,
             }
         )
 
@@ -159,12 +183,16 @@ def build_opendata_chunk_rows(
 
         chunk_rows.append(
             {
+                "chunk_id": build_chunk_id(job_id, job_item_id, "plain", chunk.chunk_no),
+                "job_id": job_id,
                 "job_item_id": job_item_id,
                 "source_type": SOURCE_TYPE,
                 "chunk_no": chunk.chunk_no,
-                "prompt_type": "plain",
                 "prompt": prompt,
+                "prompt_type": "plain",
+                "row_count": chunk.item_count,
                 "status": "new",
+                "created_at": created_at,
             }
         )
 
@@ -175,44 +203,54 @@ def build_opendata_chunk_rows(
 
 
 # =========================
-# CHUNK登録
+# knowledge_job_chunks登録
 # =========================
 def insert_opendata_chunks(
     conn: sqlite3.Connection,
+    job_id: str,
     job_item_id: str,
 ) -> int:
 
-    chunk_rows = build_opendata_chunk_rows(conn, job_item_id)
+    chunk_rows = build_opendata_chunk_rows(conn, job_id, job_item_id)
 
     conn.execute(
         """
-        DELETE FROM CHUNK
-        WHERE job_item_id = ?
+        DELETE FROM knowledge_job_chunks
+        WHERE job_id = ?
+          AND job_item_id = ?
           AND source_type = ?
         """,
-        (job_item_id, SOURCE_TYPE),
+        (job_id, job_item_id, SOURCE_TYPE),
     )
 
     for row in chunk_rows:
         conn.execute(
             """
-            INSERT INTO CHUNK (
+            INSERT INTO knowledge_job_chunks (
+                chunk_id,
+                job_id,
                 job_item_id,
                 source_type,
                 chunk_no,
-                prompt_type,
                 prompt,
-                status
+                prompt_type,
+                row_count,
+                status,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                row["chunk_id"],
+                row["job_id"],
                 row["job_item_id"],
                 row["source_type"],
                 row["chunk_no"],
-                row["prompt_type"],
                 row["prompt"],
+                row["prompt_type"],
+                row["row_count"],
                 row["status"],
+                row["created_at"],
             ),
         )
 
