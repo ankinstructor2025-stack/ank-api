@@ -132,9 +132,6 @@ def build_opendata_chunk_rows(
     created_at = utc_now_iso()
     chunk_rows: list[dict[str, Any]] = []
 
-    # =========================
-    # QA chunk
-    # =========================
     qa_chunks = build_chunks(rows, qa_chunk_config)
 
     for chunk in qa_chunks:
@@ -164,12 +161,12 @@ def build_opendata_chunk_rows(
             }
         )
 
-    # =========================
-    # PLAIN chunk
-    # =========================
     plain_chunks = build_chunks(rows, plain_chunk_config)
+    plain_chunk_no_base = len(qa_chunks)
 
     for chunk in plain_chunks:
+        actual_chunk_no = plain_chunk_no_base + chunk.chunk_no
+
         prompt = build_opendata_prompt_text(
             job_item_id=job_item_id,
             prompt_template=plain_template,
@@ -183,11 +180,11 @@ def build_opendata_chunk_rows(
 
         chunk_rows.append(
             {
-                "chunk_id": build_chunk_id(job_id, job_item_id, "plain", chunk.chunk_no),
+                "chunk_id": build_chunk_id(job_id, job_item_id, "plain", actual_chunk_no),
                 "job_id": job_id,
                 "job_item_id": job_item_id,
                 "source_type": SOURCE_TYPE,
-                "chunk_no": chunk.chunk_no,
+                "chunk_no": actual_chunk_no,
                 "prompt": prompt,
                 "prompt_type": "plain",
                 "row_count": chunk.item_count,
