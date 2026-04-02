@@ -21,7 +21,6 @@ from .knowledge_generate_kokkai import (
 )
 from .knowledge_generate_opendata import SOURCE_TYPE as OPENDATA_SOURCE_TYPE
 from .knowledge_generate_opendata import (
-    fetch_opendata_file_rows,
     insert_opendata_contents,
     build_opendata_chunk_rows,
 )
