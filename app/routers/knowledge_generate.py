@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Optional
+from google.cloud import storage
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -11,6 +12,7 @@ from .knowledge_generate_common import (
     create_job_item_record,
     open_user_db,
 )
+
 from .knowledge_generate_kokkai import SOURCE_TYPE as KOKKAI_SOURCE_TYPE
 from .knowledge_generate_kokkai import (
     fetch_kokkai_source_rows,
@@ -36,10 +38,18 @@ from .knowledge_generate_public_url import (
     build_public_url_chunk_rows,
 )
 
-from app.core.common import local_user_db_path
+from app.core.common import (
+    local_user_db_path,
+    user_task_db_path,
+    local_task_db_path,
+)
 from app.routers.user_init import get_uid_from_auth_header
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge_generate"])
+
+
+BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
+TASK_TEMPLATE_DB_PATH = "template/task_template.sqlite"
 
 
 SOURCE_TYPES = {
@@ -194,6 +204,40 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     return job_item_id
 
 
+def ensure_job_task_db(uid: str, job_id: str) -> str:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    src_blob = bucket.blob(TASK_TEMPLATE_DB_PATH)
+    if not src_blob.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Task template DB not found: gs://{BUCKET_NAME}/{TASK_TEMPLATE_DB_PATH}"
+        )
+
+    task_gcs_path = user_task_db_path(uid, job_id)
+    task_blob = bucket.blob(task_gcs_path)
+
+    if not task_blob.exists():
+        bucket.copy_blob(src_blob, bucket, new_name=task_gcs_path)
+
+    local_task_path = local_task_db_path(uid, job_id)
+    os.makedirs(os.path.dirname(local_task_path), exist_ok=True)
+
+    bucket.blob(task_gcs_path).download_to_filename(local_task_path)
+    return local_task_path
+
+
+def upload_job_task_db(uid: str, job_id: str, local_path: str) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    task_gcs_path = user_task_db_path(uid, job_id)
+    blob = bucket.blob(task_gcs_path)
+
+    blob.upload_from_filename(local_path)
+
+
 @router.post("/job", response_model=KnowledgeJobCreateResponse)
 def create_job(request: Request, body: KnowledgeJobCreateRequest):
     validate_source_type(body.source_type)
@@ -202,7 +246,7 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
         raise HTTPException(status_code=400, detail="items is empty")
 
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
-    local_db_path = local_user_db_path(uid)
+    local_user_path = local_user_db_path(uid)
 
     job_id, requested_at = create_job_record(
         uid=uid,
@@ -213,12 +257,16 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
         preview_only=body.preview_only,
     )
 
-    conn = open_user_db(local_db_path)
+    local_task_path = ensure_job_task_db(uid, job_id)
+
+    conn = open_user_db(local_task_path)
     try:
         conn.execute("BEGIN")
         for item in body.items:
-            prepare_job_item(conn, local_db_path, job_id, item)
+            prepare_job_item(conn, local_user_path, job_id, item)
         conn.commit()
+
+        upload_job_task_db(uid, job_id, local_task_path)
     except Exception:
         conn.rollback()
         raise
