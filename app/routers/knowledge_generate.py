@@ -59,7 +59,6 @@ class KnowledgeTargetItem(BaseModel):
 
 
 class KnowledgeJobCreateRequest(BaseModel):
-    uid: str
     source_type: str
     source_name: Optional[str] = None
     request_type: str = "extract_knowledge"
