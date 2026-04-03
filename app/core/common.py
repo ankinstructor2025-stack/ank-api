@@ -6,6 +6,13 @@ from google.cloud import storage
 
 BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
+CLOUD_RUN_BASE_URL = os.getenv("CLOUD_RUN_BASE_URL")
+
+if not CLOUD_RUN_BASE_URL:
+    raise RuntimeError("CLOUD_RUN_BASE_URL is not set")
+
+CLOUD_RUN_BASE_URL = CLOUD_RUN_BASE_URL.rstrip("/")
+
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
