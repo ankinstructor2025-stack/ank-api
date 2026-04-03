@@ -375,6 +375,20 @@ def execute_chunk(body: dict):
 
         items = result.get("items") or result.get("qas") or result.get("data") or []
 
+        qa_count = 0
+        plain_count = 0
+
+        if prompt_type == "qa":
+            qa_count = len(items)
+        elif prompt_type == "plain":
+            plain_count = len(items)
+
+        print(
+            f"[TASK RESPONSE] job_id={job_id} chunk_no={row['chunk_no']} "
+            f"prompt_type={prompt_type} qa_count={qa_count} plain_count={plain_count}",
+            flush=True
+        )
+
         for i, item in enumerate(items):
             if prompt_type == "qa":
                 conn.execute("""
