@@ -304,23 +304,37 @@ def run_job(body: KnowledgeRunRequest, request: Request):
             FROM knowledge_job_chunks
             ORDER BY chunk_no
         """)
-
         rows = cur.fetchall()
+        total_chunks = len(rows)
 
-        for row in rows:
-            prompt = row["prompt"]
+        print(f"[RUN START] job_id={job_id} total_chunks={total_chunks}", flush=True)
+
+        for idx, row in enumerate(rows, start=1):
+            chunk_id = row["chunk_id"]
+            chunk_no = row["chunk_no"]
             prompt_type = row["prompt_type"]
+            prompt = row["prompt"]
+
+            print(
+                f"[CHUNK START] job_id={job_id} progress={idx}/{total_chunks} "
+                f"chunk_no={chunk_no} chunk_id={chunk_id} prompt_type={prompt_type} "
+                f"prompt_len={len(prompt or '')}",
+                flush=True
+            )
 
             result = run_llm_json(
                 prompt,
-                log_prefix=f"job={job_id} chunk={row['chunk_no']}"
+                log_prefix=f"job={job_id} chunk={chunk_no}"
             )
 
-            # ★ここ重要（構造に合わせる）
             items = result.get("items") or result.get("qas") or result.get("data") or []
+            print(
+                f"[CHUNK RESPONSE] job_id={job_id} progress={idx}/{total_chunks} "
+                f"chunk_no={chunk_no} item_count={len(items)}",
+                flush=True
+            )
 
             for i, item in enumerate(items):
-
                 if prompt_type == "qa":
                     conn.execute("""
                         INSERT INTO knowledge_items (
@@ -369,8 +383,20 @@ def run_job(body: KnowledgeRunRequest, request: Request):
                         now_iso()
                     ))
 
+            conn.commit()
+
+            print(
+                f"[CHUNK DONE] job_id={job_id} progress={idx}/{total_chunks} "
+                f"chunk_no={chunk_no}",
+                flush=True
+            )
+
+        print(f"[RUN DONE] job_id={job_id} total_chunks={total_chunks}", flush=True)
         conn.commit()
 
+    except Exception as e:
+        print(f"[RUN ERROR] job_id={job_id} error={e}", flush=True)
+        raise
     finally:
         conn.close()
 
@@ -378,7 +404,6 @@ def run_job(body: KnowledgeRunRequest, request: Request):
         "job_id": job_id,
         "status": "done"
     }
-
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
 def get_status(uid: str, job_id: str):
