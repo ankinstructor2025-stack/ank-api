@@ -425,6 +425,7 @@ def execute_chunk(body: dict):
                 ))
 
         conn.commit()
+        upload_job_task_db(uid, job_id, local_task_path)
 
     except Exception as e:
         print(f"[TASK ERROR] {e}", flush=True)
