@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from google.cloud import storage
+
 from .knowledge_generate_common import (
+    BUCKET_NAME,
+    PROMPT_TEMPLATE_PATHS,
     load_chunk_config,
     load_template_text,
-    PROMPT_TEMPLATE_PATHS,
 )
+from .content_detector import detect_content_kind
+from .content_splitter_csv import split_csv_records
+from .content_splitter_pdf import split_pdf_records
+from .content_splitter_text import split_text_records
 from .openai_chunking import ChunkConfig, build_chunks
 from .openai_prompt_builder import build_opendata_prompt_text
 
@@ -16,9 +24,6 @@ from .openai_prompt_builder import build_opendata_prompt_text
 SOURCE_TYPE = "opendata"
 
 
-# =========================
-# 共通
-# =========================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -32,14 +37,10 @@ def build_chunk_id(
     return f"{job_id}_{job_item_id}_{prompt_type}_{chunk_no}"
 
 
-# =========================
-# chunk config取得（エラー前提）
-# =========================
 def get_required_opendata_chunk_conf(
     chunk_config: dict[str, Any],
     prompt_type: str,
 ) -> dict[str, Any]:
-
     if not chunk_config:
         raise RuntimeError("openai_chunk.json is empty or not loaded")
 
@@ -68,9 +69,6 @@ def to_chunk_config(conf: dict[str, Any]) -> ChunkConfig:
     )
 
 
-# =========================
-# content取得
-# =========================
 def fetch_opendata_content_rows(
     conn: sqlite3.Connection,
     job_item_id: str,
@@ -85,22 +83,191 @@ def fetch_opendata_content_rows(
             sort_no
         FROM knowledge_contents
         WHERE job_item_id = ?
-        ORDER BY sort_no
+        ORDER BY sort_no, row_id
         """,
         (job_item_id,),
     )
     return cur.fetchall()
 
 
-# =========================
-# chunk生成
-# =========================
+def fetch_job_item_info(
+    conn: sqlite3.Connection,
+    job_item_id: str,
+) -> sqlite3.Row:
+    cur = conn.execute(
+        """
+        SELECT
+            job_item_id,
+            parent_source_id,
+            parent_key1,
+            parent_key2,
+            parent_label,
+            row_count
+        FROM knowledge_job_items
+        WHERE job_item_id = ?
+        LIMIT 1
+        """,
+        (job_item_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"knowledge_job_items not found: job_item_id={job_item_id}")
+    return row
+
+
+def download_gcs_binary(gcs_path: str) -> bytes:
+    if not gcs_path:
+        raise RuntimeError("gcs_path is empty")
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(gcs_path)
+
+    if not blob.exists():
+        raise RuntimeError(f"GCS blob not found: gs://{BUCKET_NAME}/{gcs_path}")
+
+    return blob.download_as_bytes()
+
+
+def stringify_csv_row(row: dict[str, Any]) -> str:
+    values = []
+    for key, value in row.items():
+        key_text = str(key or "").strip()
+        value_text = str(value or "").strip()
+        if not key_text and not value_text:
+            continue
+        if key_text:
+            values.append(f"{key_text}: {value_text}")
+        else:
+            values.append(value_text)
+    return " | ".join(values).strip()
+
+
+def convert_json_text_to_records(text: str, max_rows: int = 2000) -> list[dict[str, Any]]:
+    try:
+        obj = json.loads(text)
+        pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+        return split_text_records(pretty.encode("utf-8"), max_rows=max_rows)
+    except Exception:
+        return split_text_records(text.encode("utf-8"), max_rows=max_rows)
+
+
+def split_binary_by_kind(
+    binary: bytes,
+    *,
+    kind: str,
+    max_rows: int = 2000,
+) -> list[dict[str, Any]]:
+    kind_norm = (kind or "").strip().lower()
+
+    if kind_norm == "csv":
+        return split_csv_records(binary, max_rows=max_rows)
+
+    if kind_norm == "pdf":
+        return split_pdf_records(binary, max_rows=max_rows)
+
+    if kind_norm == "json":
+        text = binary.decode("utf-8", errors="ignore")
+        return convert_json_text_to_records(text, max_rows=max_rows)
+
+    return split_text_records(binary, max_rows=max_rows)
+
+
+def expand_opendata_contents_to_chunk_inputs(
+    conn: sqlite3.Connection,
+    job_item_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    job_item = fetch_job_item_info(conn, job_item_id)
+    content_rows = fetch_opendata_content_rows(conn, job_item_id)
+
+    if not content_rows:
+        raise RuntimeError(f"knowledge_contents is empty for job_item_id={job_item_id}")
+
+    expanded_rows: list[dict[str, Any]] = []
+    global_sort_no = 1
+
+    for content_row in content_rows:
+        file_sort_no = int(content_row["sort_no"] or 0)
+        content_text = (content_row["content_text"] or "").strip()
+        explicit_content_type = (content_row["content_type"] or "").strip().lower()
+        source_item_id = (content_row["source_item_id"] or "").strip()
+        row_id = (content_row["row_id"] or "").strip()
+
+        if not content_text:
+            continue
+
+        is_gcs_path = "/" in content_text or "." in content_text
+
+        if is_gcs_path:
+            binary = download_gcs_binary(content_text)
+            detected_kind = explicit_content_type or detect_content_kind(
+                filename=content_text.rsplit("/", 1)[-1],
+                source_path=content_text,
+            )
+            records = split_binary_by_kind(binary, kind=detected_kind, max_rows=2000)
+            base_source_item_id = source_item_id or content_text
+            base_row_id = row_id or content_text
+            content_kind = detected_kind or "text"
+        else:
+            records = convert_json_text_to_records(content_text, max_rows=2000)
+            base_source_item_id = source_item_id or f"{job_item_id}:{file_sort_no}"
+            base_row_id = row_id or f"{job_item_id}:{file_sort_no}"
+            content_kind = explicit_content_type or "text"
+
+        local_index = 0
+
+        for record in records:
+            local_index += 1
+
+            if isinstance(record, dict):
+                if content_kind == "csv":
+                    text = stringify_csv_row(record)
+                elif content_kind == "pdf":
+                    text = str(record.get("text") or "").strip()
+                else:
+                    text = str(record.get("text") or "").strip()
+
+                if content_kind == "pdf":
+                    suffix = f"page_{record.get('page', local_index)}"
+                else:
+                    suffix = str(local_index)
+            else:
+                text = str(record or "").strip()
+                suffix = str(local_index)
+
+            if not text:
+                continue
+
+            expanded_rows.append(
+                {
+                    "sort_no": global_sort_no,
+                    "content_text": text,
+                    "source_item_id": f"{base_source_item_id}:{suffix}",
+                    "content_type": content_kind,
+                    "row_id": f"{base_row_id}:{suffix}",
+                }
+            )
+            global_sort_no += 1
+
+    if not expanded_rows:
+        raise RuntimeError(f"expanded content is empty for job_item_id={job_item_id}")
+
+    metadata = {
+        "parent_source_id": job_item["parent_source_id"],
+        "parent_key1": job_item["parent_key1"],
+        "parent_key2": job_item["parent_key2"],
+        "parent_label": job_item["parent_label"],
+        "row_count": int(job_item["row_count"] or 0),
+    }
+
+    return expanded_rows, metadata
+
+
 def build_opendata_chunk_rows(
     conn: sqlite3.Connection,
     job_id: str,
     job_item_id: str,
 ) -> list[dict[str, Any]]:
-
     chunk_config = load_chunk_config()
     if not chunk_config:
         raise RuntimeError("openai_chunk.json could not be loaded from GCS")
@@ -111,12 +278,8 @@ def build_opendata_chunk_rows(
     qa_chunk_config = to_chunk_config(qa_conf)
     plain_chunk_config = to_chunk_config(plain_conf)
 
-    qa_template = load_template_text(
-        PROMPT_TEMPLATE_PATHS["opendata"]["qa"]
-    )
-    plain_template = load_template_text(
-        PROMPT_TEMPLATE_PATHS["opendata"]["plain"]
-    )
+    qa_template = load_template_text(PROMPT_TEMPLATE_PATHS["opendata"]["qa"])
+    plain_template = load_template_text(PROMPT_TEMPLATE_PATHS["opendata"]["plain"])
 
     if not qa_template:
         raise RuntimeError("QA prompt template is empty")
@@ -124,26 +287,23 @@ def build_opendata_chunk_rows(
     if not plain_template:
         raise RuntimeError("PLAIN prompt template is empty")
 
-    rows = fetch_opendata_content_rows(conn, job_item_id)
-    if not rows:
-        raise RuntimeError(f"knowledge_contents is empty for job_item_id={job_item_id}")
-
-    row_count = len(rows)
+    expanded_rows, metadata = expand_opendata_contents_to_chunk_inputs(conn, job_item_id)
+    total_input_count = len(expanded_rows)
     created_at = utc_now_iso()
+
     chunk_rows: list[dict[str, Any]] = []
 
-    qa_chunks = build_chunks(rows, qa_chunk_config)
-
+    qa_chunks = build_chunks(expanded_rows, qa_chunk_config)
     for chunk in qa_chunks:
         prompt = build_opendata_prompt_text(
             job_item_id=job_item_id,
             prompt_template=qa_template,
             chunk=chunk,
-            parent_source_id=job_item_id,
-            parent_key1=SOURCE_TYPE,
-            parent_key2="json",
-            parent_label=f"{SOURCE_TYPE}:{job_item_id}",
-            row_count=row_count,
+            parent_source_id=metadata["parent_source_id"],
+            parent_key1=metadata["parent_key1"],
+            parent_key2=metadata["parent_key2"],
+            parent_label=metadata["parent_label"],
+            row_count=metadata["row_count"] or total_input_count,
         )
 
         chunk_rows.append(
@@ -161,7 +321,7 @@ def build_opendata_chunk_rows(
             }
         )
 
-    plain_chunks = build_chunks(rows, plain_chunk_config)
+    plain_chunks = build_chunks(expanded_rows, plain_chunk_config)
     plain_chunk_no_base = len(qa_chunks)
 
     for chunk in plain_chunks:
@@ -171,11 +331,11 @@ def build_opendata_chunk_rows(
             job_item_id=job_item_id,
             prompt_template=plain_template,
             chunk=chunk,
-            parent_source_id=job_item_id,
-            parent_key1=SOURCE_TYPE,
-            parent_key2="json",
-            parent_label=f"{SOURCE_TYPE}:{job_item_id}",
-            row_count=row_count,
+            parent_source_id=metadata["parent_source_id"],
+            parent_key1=metadata["parent_key1"],
+            parent_key2=metadata["parent_key2"],
+            parent_label=metadata["parent_label"],
+            row_count=metadata["row_count"] or total_input_count,
         )
 
         chunk_rows.append(
@@ -199,15 +359,11 @@ def build_opendata_chunk_rows(
     return chunk_rows
 
 
-# =========================
-# knowledge_job_chunks登録
-# =========================
 def insert_opendata_chunks(
     conn: sqlite3.Connection,
     job_id: str,
     job_item_id: str,
 ) -> int:
-
     chunk_rows = build_opendata_chunk_rows(conn, job_id, job_item_id)
 
     conn.execute(
