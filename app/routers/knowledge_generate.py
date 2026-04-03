@@ -324,7 +324,7 @@ def run_job(body: KnowledgeRunRequest, request: Request):
             task = {
                 "http_request": {
                     "http_method": tasks_v2.HttpMethod.POST,
-                    "url": f"{CLOUD_RUN_BASE_URL}/task/execute_chunk",
+                    "url": f"{CLOUD_RUN_BASE_URL}/knowledge/task/execute_chunk",
                     "headers": {"Content-Type": "application/json"},
                     "body": base64.b64encode(json.dumps(payload).encode()).decode(),
                 }
