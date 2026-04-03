@@ -6,6 +6,7 @@ from google.cloud import storage
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from app.core.common import CLOUD_RUN_BASE_URL
 
 from .knowledge_generate_common import (
     create_job_record,
@@ -323,7 +324,7 @@ def run_job(body: KnowledgeRunRequest, request: Request):
             task = {
                 "http_request": {
                     "http_method": tasks_v2.HttpMethod.POST,
-                    "url": f"https://YOUR_CLOUD_RUN_URL/task/execute_chunk",
+                    "url": f"{CLOUD_RUN_BASE_URL}/task/execute_chunk",
                     "headers": {"Content-Type": "application/json"},
                     "body": base64.b64encode(json.dumps(payload).encode()).decode(),
                 }
