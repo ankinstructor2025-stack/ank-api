@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,11 @@ from .openai_chunking import ChunkConfig, build_chunks, render_chunk_text
 
 
 SOURCE_TYPE = "opendata"
+
+TOC_SECTION_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*[章節].*$")
+TOC_BULLET_SECTION_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*節\s*●.*$")
+FIGURE_TITLE_RE = re.compile(r"^図表[0-9０-９\-－—―\.]+.*$")
+SHORT_WEAK_TEXT_RE = re.compile(r"^[\wぁ-んァ-ヶ一-龥・。．、，\-\s]+$")
 
 
 def utc_now_iso() -> str:
@@ -193,6 +199,26 @@ def is_probably_gcs_path(text: str) -> bool:
     return False
 
 
+def should_skip_pdf_chunk_input_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+
+    # 目次・柱に近い短い章節見出しだけの断片
+    if len(s) <= 80 and (TOC_SECTION_RE.fullmatch(s) or TOC_BULLET_SECTION_RE.fullmatch(s)):
+        return True
+
+    # 図表タイトルだけの短い断片
+    if len(s) <= 100 and FIGURE_TITLE_RE.fullmatch(s):
+        return True
+
+    # URL除去後などに残る弱い短文
+    if len(s) <= 20 and SHORT_WEAK_TEXT_RE.fullmatch(s):
+        return True
+
+    return False
+
+
 def build_records_from_content_row(
     content_row: sqlite3.Row,
     job_item_id: str,
@@ -218,7 +244,7 @@ def build_records_from_content_row(
         content_kind = detected_kind or "text"
         return records, base_source_item_id, base_row_id, content_kind
 
-    records = convert_json_text_to_records(content_text, max_rows=2000)
+    records = convert_json_text_to_records(content_text, max_rows=max_rows)
     base_source_item_id = source_item_id or f"{job_item_id}:{file_sort_no}"
     base_row_id = row_id or f"{job_item_id}:{file_sort_no}"
     content_kind = explicit_content_type or "text"
@@ -256,6 +282,9 @@ def expand_opendata_contents_to_chunk_inputs(
 
             text = record_to_content_text(content_kind, record)
             if not text:
+                continue
+
+            if content_kind == "pdf" and should_skip_pdf_chunk_input_text(text):
                 continue
 
             suffix = record_to_suffix(content_kind, record, local_index)

@@ -17,8 +17,6 @@ PAGE_NO_ONLY_RE = re.compile(r"^\d{1,4}$")
 INDD_LINE_RE = re.compile(r"^.*\.indd.*$", re.IGNORECASE)
 DATETIME_RE = re.compile(r"\d{4}/\d{2}/\d{2}\s+\d{1,2}:\d{2}:\d{2}")
 URL_RE = re.compile(r"https?://\S+")
-SECTION_HEADER_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*[章節].*$")
-BULLET_SECTION_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*節\s*●.*$")
 ONLY_SYMBOLS_RE = re.compile(r"^[\s\.\-–—・●○◯。､,，:：/／\(\)（）]+$")
 
 
@@ -49,12 +47,6 @@ def should_drop_line(line: str) -> bool:
         return True
 
     if ONLY_SYMBOLS_RE.fullmatch(line):
-        return True
-
-    if (SECTION_HEADER_RE.fullmatch(line) or BULLET_SECTION_RE.fullmatch(line)) and len(line) <= 40:
-        return True
-
-    if len(line) <= 8 and re.fullmatch(r"[\wぁ-んァ-ヶ一-龥。．、，・ ]*", line):
         return True
 
     return False
