@@ -79,6 +79,32 @@ def to_chunk_config(conf: dict[str, Any]) -> ChunkConfig:
     )
 
 
+def prompt_reserved_chars(prompt_template: str) -> int:
+    template = (prompt_template or "").strip()
+    if not template:
+        raise RuntimeError("prompt template is empty")
+    return len(template) + 2
+
+
+def to_prompt_safe_chunk_config(
+    base_config: ChunkConfig,
+    prompt_template: str,
+) -> ChunkConfig:
+    reserved = prompt_reserved_chars(prompt_template)
+    usable_chars = int(base_config.max_chars) - reserved
+
+    if usable_chars <= 0:
+        raise RuntimeError(
+            f"max_chars is too small for prompt template. max_chars={base_config.max_chars}, reserved={reserved}"
+        )
+
+    return ChunkConfig(
+        max_chars=usable_chars,
+        max_items=int(base_config.max_items),
+        overlap_items=int(base_config.overlap_items),
+    )
+
+
 def fetch_opendata_content_rows(
     conn: sqlite3.Connection,
     job_item_id: str,
@@ -229,19 +255,15 @@ def is_probably_toc_or_cover_text(text: str) -> bool:
     if COVER_LIKE_RE.search(s) and len(s) <= 200:
         return True
 
-    # 表紙・説明・目次の初期ページに多い短い章節見出しだけの断片
     if len(s) <= 120 and (TOC_SECTION_RE.fullmatch(s) or TOC_BULLET_SECTION_RE.fullmatch(s)):
         return True
 
-    # 図表タイトルだけの短い断片
     if len(s) <= 120 and FIGURE_TITLE_RE.fullmatch(s):
         return True
 
-    # URL除去後に残る弱い短文
     if len(s) <= 20 and ONLY_SHORT_WEAK_TEXT_RE.fullmatch(s):
         return True
 
-    # 章見出しが続くだけで本文が乏しい断片
     if len(s) <= 250 and HEADER_REPEAT_RE.search(s) and "第1節" in s and "・・・・" in s:
         return True
 
@@ -253,12 +275,10 @@ def should_skip_pdf_chunk_input_text(text: str, page_no: int | None = None) -> b
     if not s:
         return True
 
-    # 先頭ページ付近は表紙・目次ノイズを厳しめに落とす
     if page_no is not None and page_no <= 5:
         if is_probably_toc_or_cover_text(s):
             return True
 
-    # 全ページ共通
     if is_probably_toc_or_cover_text(s):
         return True
 
@@ -363,9 +383,25 @@ def expand_opendata_contents_to_chunk_inputs(
 def build_prompt_text(
     prompt_template: str,
     chunk,
+    *,
+    max_prompt_chars: int | None = None,
 ) -> str:
-    chunk_text = render_chunk_text(chunk, include_source_item_id=False)
-    return f"{prompt_template.strip()}\n\n{chunk_text}".strip()
+    template = (prompt_template or "").strip()
+    if not template:
+        raise RuntimeError("prompt template is empty")
+
+    chunk_text = render_chunk_text(chunk, include_source_item_id=False).strip()
+    if not chunk_text:
+        raise RuntimeError("chunk_text is empty")
+
+    prompt = f"{template}\n\n{chunk_text}".strip()
+
+    if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
+        raise RuntimeError(
+            f"prompt exceeds max_chars after template merge: len={len(prompt)}, max_chars={max_prompt_chars}, chunk_no={chunk.chunk_no}"
+        )
+
+    return prompt
 
 
 def build_opendata_chunk_rows(
@@ -380,8 +416,8 @@ def build_opendata_chunk_rows(
     qa_conf = get_required_opendata_chunk_conf(chunk_config, "qa")
     plain_conf = get_required_opendata_chunk_conf(chunk_config, "plain")
 
-    qa_chunk_config = to_chunk_config(qa_conf)
-    plain_chunk_config = to_chunk_config(plain_conf)
+    qa_chunk_config_raw = to_chunk_config(qa_conf)
+    plain_chunk_config_raw = to_chunk_config(plain_conf)
 
     qa_template = load_template_text(PROMPT_TEMPLATE_PATHS["opendata"]["qa"])
     plain_template = load_template_text(PROMPT_TEMPLATE_PATHS["opendata"]["plain"])
@@ -392,6 +428,9 @@ def build_opendata_chunk_rows(
     if not plain_template:
         raise RuntimeError("PLAIN prompt template is empty")
 
+    qa_chunk_config = to_prompt_safe_chunk_config(qa_chunk_config_raw, qa_template)
+    plain_chunk_config = to_prompt_safe_chunk_config(plain_chunk_config_raw, plain_template)
+
     expanded_rows = expand_opendata_contents_to_chunk_inputs(conn, job_item_id)
     created_at = utc_now_iso()
 
@@ -399,7 +438,11 @@ def build_opendata_chunk_rows(
 
     qa_chunks = build_chunks(expanded_rows, qa_chunk_config)
     for chunk in qa_chunks:
-        prompt = build_prompt_text(qa_template, chunk)
+        prompt = build_prompt_text(
+            qa_template,
+            chunk,
+            max_prompt_chars=qa_chunk_config_raw.max_chars,
+        )
 
         chunk_rows.append(
             {
@@ -421,7 +464,11 @@ def build_opendata_chunk_rows(
 
     for chunk in plain_chunks:
         actual_chunk_no = plain_chunk_no_base + chunk.chunk_no
-        prompt = build_prompt_text(plain_template, chunk)
+        prompt = build_prompt_text(
+            plain_template,
+            chunk,
+            max_prompt_chars=plain_chunk_config_raw.max_chars,
+        )
 
         chunk_rows.append(
             {

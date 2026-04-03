@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -70,12 +71,92 @@ def _estimate_joined_chars(items: list[ChunkItem]) -> int:
     return sum(len(x.text) for x in items) + (len(items) - 1) * 2
 
 
+def _split_text_by_limit(text: str, max_chars: int) -> list[str]:
+    s = normalize_text(text)
+    if not s:
+        return []
+
+    if len(s) <= max_chars:
+        return [s]
+
+    parts: list[str] = []
+    rest = s
+
+    while rest:
+        if len(rest) <= max_chars:
+            parts.append(rest.strip())
+            break
+
+        window = rest[:max_chars]
+
+        split_pos = -1
+
+        # 句点・終端記号優先
+        for m in re.finditer(r"[。．！？!?]\s*", window):
+            split_pos = m.end()
+
+        # なければ読点や区切り
+        if split_pos <= 0:
+            for m in re.finditer(r"[、，,；;:]\s*", window):
+                split_pos = m.end()
+
+        # それもなければ空白
+        if split_pos <= 0:
+            split_pos = window.rfind(" ")
+
+        # 最後は強制分割
+        if split_pos <= 0:
+            split_pos = max_chars
+
+        head = rest[:split_pos].strip()
+        if head:
+            parts.append(head)
+
+        rest = rest[split_pos:].strip()
+
+    return [x for x in parts if x]
+
+
+def _split_item_if_needed(item: ChunkItem, max_chars: int) -> list[ChunkItem]:
+    text = normalize_text(item.text)
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [item]
+
+    split_texts = _split_text_by_limit(text, max_chars)
+    if not split_texts:
+        return []
+
+    split_items: list[ChunkItem] = []
+    for idx, split_text in enumerate(split_texts, start=1):
+        suffix = f":part_{idx}" if len(split_texts) > 1 else ""
+        split_items.append(
+            ChunkItem(
+                sort_no=item.sort_no,
+                text=split_text,
+                source_item_id=(item.source_item_id or None) if not suffix else f"{item.source_item_id or ''}{suffix}".strip() or None,
+                content_type=item.content_type,
+                row_id=(item.row_id or None) if not suffix else f"{item.row_id or ''}{suffix}".strip() or None,
+            )
+        )
+
+    return split_items
+
+
 def build_chunks(
     rows: Iterable[Any],
     config: ChunkConfig,
     *,
     allowed_content_types: Optional[set[str]] = None,
 ) -> list[Chunk]:
+    if int(config.max_chars) <= 0:
+        raise RuntimeError("ChunkConfig.max_chars must be greater than 0")
+
+    if int(config.max_items) <= 0:
+        raise RuntimeError("ChunkConfig.max_items must be greater than 0")
+
     items: list[ChunkItem] = []
 
     for row in rows:
@@ -88,7 +169,8 @@ def build_chunks(
             if ct not in allowed_content_types:
                 continue
 
-        items.append(item)
+        split_items = _split_item_if_needed(item, int(config.max_chars))
+        items.extend(split_items)
 
     if not items:
         return []
@@ -112,6 +194,12 @@ def build_chunks(
 
             if current and (current_chars + sep_len + candidate_len) > config.max_chars:
                 break
+
+            # 念のため単体超過はここでも拒否
+            if not current and candidate_len > config.max_chars:
+                raise RuntimeError(
+                    f"single chunk item exceeds max_chars: len={candidate_len}, max_chars={config.max_chars}, source_item_id={candidate.source_item_id}"
+                )
 
             current.append(candidate)
             current_chars += sep_len + candidate_len
@@ -151,10 +239,8 @@ def render_chunk_lines(
     lines: list[str] = []
 
     for item in chunk.items:
-        if include_source_item_id and item.source_item_id:
-            lines.append(f"[{item.sort_no}] ({item.source_item_id}) {item.text}")
-        else:
-            lines.append(f"[{item.sort_no}] {item.text}")
+        if item.text:
+            lines.append(item.text)
 
     return lines
 
