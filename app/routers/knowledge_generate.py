@@ -287,12 +287,96 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
 
 
 @router.post("/run")
-def run_job(body: KnowledgeRunRequest):
-    # 第一段階: まだ実行しない
+def run_job(body: KnowledgeRunRequest, request: Request):
+    from .knowledge_generate_common import open_user_db, now_iso, new_id
+    from app.core.openai_llm_client import run_llm_json
+    import json
+
+    uid = get_uid_from_auth_header(request.headers.get("Authorization"))
+    job_id = body.job_id
+
+    local_task_path = local_task_db_path(uid, job_id)
+    conn = open_user_db(local_task_path)
+
+    try:
+        cur = conn.execute("""
+            SELECT chunk_id, job_id, job_item_id, prompt, prompt_type, chunk_no
+            FROM knowledge_job_chunks
+            ORDER BY chunk_no
+        """)
+
+        rows = cur.fetchall()
+
+        for row in rows:
+            prompt = row["prompt"]
+            prompt_type = row["prompt_type"]
+
+            result = run_llm_json(
+                prompt,
+                log_prefix=f"job={job_id} chunk={row['chunk_no']}"
+            )
+
+            # ★ここ重要（構造に合わせる）
+            items = result.get("items") or result.get("qas") or result.get("data") or []
+
+            for i, item in enumerate(items):
+
+                if prompt_type == "qa":
+                    conn.execute("""
+                        INSERT INTO knowledge_items (
+                            knowledge_id,
+                            job_id,
+                            job_item_id,
+                            knowledge_type,
+                            question,
+                            answer,
+                            sort_no,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_id(),
+                        row["job_id"],
+                        row["job_item_id"],
+                        "qa",
+                        item.get("question"),
+                        item.get("answer"),
+                        i,
+                        now_iso(),
+                        now_iso()
+                    ))
+
+                elif prompt_type == "plain":
+                    conn.execute("""
+                        INSERT INTO knowledge_items (
+                            knowledge_id,
+                            job_id,
+                            job_item_id,
+                            knowledge_type,
+                            content,
+                            sort_no,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_id(),
+                        row["job_id"],
+                        row["job_item_id"],
+                        "plain",
+                        item.get("content"),
+                        i,
+                        now_iso(),
+                        now_iso()
+                    ))
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
     return {
-        "job_id": body.job_id,
-        "status": "accepted",
-        "message": "第一段階の仮実装です。CHUNK作成後の実行は未実装です。",
+        "job_id": job_id,
+        "status": "done"
     }
 
 
