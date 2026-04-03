@@ -13,6 +13,11 @@ MULTI_NEWLINES_RE = re.compile(r"\n{3,}")
 BROKEN_NUMBER_LINES_RE = re.compile(r"(?:\n?\d+){8,}")
 LONG_DIGITS_RE = re.compile(r"\d{20,}")
 
+LINE_NO_RE = re.compile(r"^\[\d+\]\s*")
+PAGE_NO_ONLY_RE = re.compile(r"^\d{1,4}$")
+INDD_LINE_RE = re.compile(r"^.*\.indd.*$", re.IGNORECASE)
+DATETIME_RE = re.compile(r"\d{4}/\d{2}/\d{2}\s+\d{1,2}:\d{2}:\d{2}")
+
 
 def clean_pdf_text(text: str) -> str:
     """
@@ -28,12 +33,43 @@ def clean_pdf_text(text: str) -> str:
     # 制御文字除去
     text = CONTROL_CHARS_RE.sub("", text)
 
+    # 行単位のノイズ除去
+    cleaned_lines: list[str] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            cleaned_lines.append("")
+            continue
+
+        # 先頭の [142] などを除去
+        line = LINE_NO_RE.sub("", line).strip()
+
+        # 行中の日時除去
+        line = DATETIME_RE.sub("", line).strip()
+
+        # .indd 行は除去
+        if INDD_LINE_RE.fullmatch(line):
+            continue
+
+        # 単独ページ番号は除去
+        if PAGE_NO_ONLY_RE.fullmatch(line):
+            continue
+
+        cleaned_lines.append(line)
+
+    text = "\n".join(cleaned_lines)
+
     # 明らかに壊れた数字列を軽く除去
     text = BROKEN_NUMBER_LINES_RE.sub(" ", text)
     text = LONG_DIGITS_RE.sub(" ", text)
 
     # 空白整理
     text = MULTI_SPACES_RE.sub(" ", text)
+
+    # 単独改行はスペースに寄せる
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+
+    # 連続改行整理
     text = MULTI_NEWLINES_RE.sub("\n\n", text)
 
     return text.strip()
