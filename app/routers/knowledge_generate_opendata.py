@@ -17,8 +17,7 @@ from .content_detector import detect_content_kind
 from .content_splitter_csv import split_csv_records
 from .content_splitter_pdf import split_pdf_records
 from .content_splitter_text import split_text_records
-from .openai_chunking import ChunkConfig, build_chunks
-from .openai_prompt_builder import build_opendata_prompt_text
+from .openai_chunking import ChunkConfig, build_chunks, render_chunk_text
 
 
 SOURCE_TYPE = "opendata"
@@ -88,31 +87,6 @@ def fetch_opendata_content_rows(
         (job_item_id,),
     )
     return cur.fetchall()
-
-
-def fetch_job_item_info(
-    conn: sqlite3.Connection,
-    job_item_id: str,
-) -> sqlite3.Row:
-    cur = conn.execute(
-        """
-        SELECT
-            job_item_id,
-            parent_source_id,
-            parent_key1,
-            parent_key2,
-            parent_label,
-            row_count
-        FROM knowledge_job_items
-        WHERE job_item_id = ?
-        LIMIT 1
-        """,
-        (job_item_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise RuntimeError(f"knowledge_job_items not found: job_item_id={job_item_id}")
-    return row
 
 
 def download_gcs_binary(gcs_path: str) -> bytes:
@@ -254,8 +228,7 @@ def build_records_from_content_row(
 def expand_opendata_contents_to_chunk_inputs(
     conn: sqlite3.Connection,
     job_item_id: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    job_item = fetch_job_item_info(conn, job_item_id)
+) -> list[dict[str, Any]]:
     content_rows = fetch_opendata_content_rows(conn, job_item_id)
 
     if not content_rows:
@@ -301,15 +274,15 @@ def expand_opendata_contents_to_chunk_inputs(
     if not expanded_rows:
         raise RuntimeError(f"expanded content is empty for job_item_id={job_item_id}")
 
-    metadata = {
-        "parent_source_id": job_item["parent_source_id"],
-        "parent_key1": job_item["parent_key1"],
-        "parent_key2": job_item["parent_key2"],
-        "parent_label": job_item["parent_label"],
-        "row_count": int(job_item["row_count"] or 0),
-    }
+    return expanded_rows
 
-    return expanded_rows, metadata
+
+def build_prompt_text(
+    prompt_template: str,
+    chunk,
+) -> str:
+    chunk_text = render_chunk_text(chunk, include_source_item_id=False)
+    return f"{prompt_template.strip()}\n\n{chunk_text}".strip()
 
 
 def build_opendata_chunk_rows(
@@ -336,24 +309,14 @@ def build_opendata_chunk_rows(
     if not plain_template:
         raise RuntimeError("PLAIN prompt template is empty")
 
-    expanded_rows, metadata = expand_opendata_contents_to_chunk_inputs(conn, job_item_id)
-    total_input_count = len(expanded_rows)
+    expanded_rows = expand_opendata_contents_to_chunk_inputs(conn, job_item_id)
     created_at = utc_now_iso()
 
     chunk_rows: list[dict[str, Any]] = []
 
     qa_chunks = build_chunks(expanded_rows, qa_chunk_config)
     for chunk in qa_chunks:
-        prompt = build_opendata_prompt_text(
-            job_item_id=job_item_id,
-            prompt_template=qa_template,
-            chunk=chunk,
-            parent_source_id=metadata["parent_source_id"],
-            parent_key1=metadata["parent_key1"],
-            parent_key2=metadata["parent_key2"],
-            parent_label=metadata["parent_label"],
-            row_count=metadata["row_count"] or total_input_count,
-        )
+        prompt = build_prompt_text(qa_template, chunk)
 
         chunk_rows.append(
             {
@@ -375,17 +338,7 @@ def build_opendata_chunk_rows(
 
     for chunk in plain_chunks:
         actual_chunk_no = plain_chunk_no_base + chunk.chunk_no
-
-        prompt = build_opendata_prompt_text(
-            job_item_id=job_item_id,
-            prompt_template=plain_template,
-            chunk=chunk,
-            parent_source_id=metadata["parent_source_id"],
-            parent_key1=metadata["parent_key1"],
-            parent_key2=metadata["parent_key2"],
-            parent_label=metadata["parent_label"],
-            row_count=metadata["row_count"] or total_input_count,
-        )
+        prompt = build_prompt_text(plain_template, chunk)
 
         chunk_rows.append(
             {
