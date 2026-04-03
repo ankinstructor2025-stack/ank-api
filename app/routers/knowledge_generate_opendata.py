@@ -26,7 +26,12 @@ SOURCE_TYPE = "opendata"
 TOC_SECTION_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*[章節].*$")
 TOC_BULLET_SECTION_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*節\s*●.*$")
 FIGURE_TITLE_RE = re.compile(r"^図表[0-9０-９\-－—―\.]+.*$")
-SHORT_WEAK_TEXT_RE = re.compile(r"^[\wぁ-んァ-ヶ一-龥・。．、，\-\s]+$")
+ONLY_SHORT_WEAK_TEXT_RE = re.compile(r"^[\wぁ-んァ-ヶ一-龥・。．、，\-\s]+$")
+BRACKET_LINE_NO_RE = re.compile(r"^\[\d+\]\s*")
+TOC_WORD_RE = re.compile(r"(目\s*次|図\s*表\s*目\s*次)")
+HEADER_REPEAT_RE = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*章\s+.*")
+COVER_LIKE_RE = re.compile(r"(提出|表紙|この用紙は|食育推進施策)")
+DOT_LEADER_RE = re.compile(r"[\.．・]{4,}|…{2,}")
 
 
 def utc_now_iso() -> str:
@@ -172,6 +177,17 @@ def record_to_content_text(
     return str(record or "").strip()
 
 
+def normalize_chunk_input_text(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+
+    s = BRACKET_LINE_NO_RE.sub("", s).strip()
+    s = re.sub(r"\s{2,}", " ", s)
+
+    return s.strip()
+
+
 def record_to_suffix(
     content_kind: str,
     record: Any,
@@ -199,21 +215,51 @@ def is_probably_gcs_path(text: str) -> bool:
     return False
 
 
-def should_skip_pdf_chunk_input_text(text: str) -> bool:
+def is_probably_toc_or_cover_text(text: str) -> bool:
     s = (text or "").strip()
     if not s:
         return True
 
-    # 目次・柱に近い短い章節見出しだけの断片
-    if len(s) <= 80 and (TOC_SECTION_RE.fullmatch(s) or TOC_BULLET_SECTION_RE.fullmatch(s)):
+    if TOC_WORD_RE.search(s):
+        return True
+
+    if DOT_LEADER_RE.search(s):
+        return True
+
+    if COVER_LIKE_RE.search(s) and len(s) <= 200:
+        return True
+
+    # 表紙・説明・目次の初期ページに多い短い章節見出しだけの断片
+    if len(s) <= 120 and (TOC_SECTION_RE.fullmatch(s) or TOC_BULLET_SECTION_RE.fullmatch(s)):
         return True
 
     # 図表タイトルだけの短い断片
-    if len(s) <= 100 and FIGURE_TITLE_RE.fullmatch(s):
+    if len(s) <= 120 and FIGURE_TITLE_RE.fullmatch(s):
         return True
 
-    # URL除去後などに残る弱い短文
-    if len(s) <= 20 and SHORT_WEAK_TEXT_RE.fullmatch(s):
+    # URL除去後に残る弱い短文
+    if len(s) <= 20 and ONLY_SHORT_WEAK_TEXT_RE.fullmatch(s):
+        return True
+
+    # 章見出しが続くだけで本文が乏しい断片
+    if len(s) <= 250 and HEADER_REPEAT_RE.search(s) and "第1節" in s and "・・・・" in s:
+        return True
+
+    return False
+
+
+def should_skip_pdf_chunk_input_text(text: str, page_no: int | None = None) -> bool:
+    s = normalize_chunk_input_text(text)
+    if not s:
+        return True
+
+    # 先頭ページ付近は表紙・目次ノイズを厳しめに落とす
+    if page_no is not None and page_no <= 5:
+        if is_probably_toc_or_cover_text(s):
+            return True
+
+    # 全ページ共通
+    if is_probably_toc_or_cover_text(s):
         return True
 
     return False
@@ -244,7 +290,7 @@ def build_records_from_content_row(
         content_kind = detected_kind or "text"
         return records, base_source_item_id, base_row_id, content_kind
 
-    records = convert_json_text_to_records(content_text, max_rows=max_rows)
+    records = convert_json_text_to_records(content_text, max_rows=2000)
     base_source_item_id = source_item_id or f"{job_item_id}:{file_sort_no}"
     base_row_id = row_id or f"{job_item_id}:{file_sort_no}"
     content_kind = explicit_content_type or "text"
@@ -281,10 +327,18 @@ def expand_opendata_contents_to_chunk_inputs(
             local_index += 1
 
             text = record_to_content_text(content_kind, record)
+            text = normalize_chunk_input_text(text)
             if not text:
                 continue
 
-            if content_kind == "pdf" and should_skip_pdf_chunk_input_text(text):
+            page_no = None
+            if content_kind == "pdf" and isinstance(record, dict):
+                try:
+                    page_no = int(record.get("page", 0) or 0)
+                except Exception:
+                    page_no = None
+
+            if content_kind == "pdf" and should_skip_pdf_chunk_input_text(text, page_no=page_no):
                 continue
 
             suffix = record_to_suffix(content_kind, record, local_index)

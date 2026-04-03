@@ -14,6 +14,7 @@ LONG_DIGITS_RE = re.compile(r"\d{20,}")
 
 LINE_NO_RE = re.compile(r"^\[\d+\]\s*")
 PAGE_NO_ONLY_RE = re.compile(r"^\d{1,4}$")
+ROMAN_PAGE_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
 INDD_LINE_RE = re.compile(r"^.*\.indd.*$", re.IGNORECASE)
 DATETIME_RE = re.compile(r"\d{4}/\d{2}/\d{2}\s+\d{1,2}:\d{2}:\d{2}")
 URL_RE = re.compile(r"https?://\S+")
@@ -44,6 +45,9 @@ def should_drop_line(line: str) -> bool:
         return True
 
     if PAGE_NO_ONLY_RE.fullmatch(line):
+        return True
+
+    if ROMAN_PAGE_RE.fullmatch(line):
         return True
 
     if ONLY_SYMBOLS_RE.fullmatch(line):
