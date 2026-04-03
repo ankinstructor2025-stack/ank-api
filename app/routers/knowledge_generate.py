@@ -393,9 +393,8 @@ def execute_chunk(body: dict):
                             question,
                             answer,
                             sort_no,
-                            created_at,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         new_id(),
                         row["job_id"],
@@ -404,7 +403,6 @@ def execute_chunk(body: dict):
                         item.get("question"),
                         item.get("answer"),
                         i,
-                        now_iso(),
                         now_iso()
                     ))
 
@@ -417,9 +415,8 @@ def execute_chunk(body: dict):
                             knowledge_type,
                             content,
                             sort_no,
-                            created_at,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (
                         new_id(),
                         row["job_id"],
@@ -427,7 +424,6 @@ def execute_chunk(body: dict):
                         "plain",
                         item.get("content"),
                         i,
-                        now_iso(),
                         now_iso()
                     ))
 
