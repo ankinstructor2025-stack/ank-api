@@ -130,20 +130,27 @@ def download_gcs_binary(gcs_path: str) -> bytes:
 
 
 def stringify_csv_row(row: dict[str, Any]) -> str:
-    values = []
+    values: list[str] = []
+
     for key, value in row.items():
         key_text = str(key or "").strip()
         value_text = str(value or "").strip()
+
         if not key_text and not value_text:
             continue
+
         if key_text:
             values.append(f"{key_text}: {value_text}")
         else:
             values.append(value_text)
+
     return " | ".join(values).strip()
 
 
-def convert_json_text_to_records(text: str, max_rows: int = 2000) -> list[dict[str, Any]]:
+def convert_json_text_to_records(
+    text: str,
+    max_rows: int = 2000,
+) -> list[dict[str, Any]]:
     try:
         obj = json.loads(text)
         pretty = json.dumps(obj, ensure_ascii=False, indent=2)
@@ -173,6 +180,77 @@ def split_binary_by_kind(
     return split_text_records(binary, max_rows=max_rows)
 
 
+def record_to_content_text(
+    content_kind: str,
+    record: Any,
+) -> str:
+    if isinstance(record, dict):
+        if content_kind == "csv":
+            return stringify_csv_row(record)
+        return str(record.get("text") or "").strip()
+
+    return str(record or "").strip()
+
+
+def record_to_suffix(
+    content_kind: str,
+    record: Any,
+    local_index: int,
+) -> str:
+    if content_kind == "pdf" and isinstance(record, dict):
+        return f"page_{record.get('page', local_index)}"
+    return str(local_index)
+
+
+def is_probably_gcs_path(text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+
+    if value.startswith("users/"):
+        return True
+
+    if value.startswith("template/"):
+        return True
+
+    if value.count("/") >= 2 and "." in value.rsplit("/", 1)[-1]:
+        return True
+
+    return False
+
+
+def build_records_from_content_row(
+    content_row: sqlite3.Row,
+    job_item_id: str,
+    file_sort_no: int,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    content_text = (content_row["content_text"] or "").strip()
+    explicit_content_type = (content_row["content_type"] or "").strip().lower()
+    source_item_id = (content_row["source_item_id"] or "").strip()
+    row_id = (content_row["row_id"] or "").strip()
+
+    if not content_text:
+        return [], "", "", ""
+
+    if is_probably_gcs_path(content_text):
+        binary = download_gcs_binary(content_text)
+        detected_kind = explicit_content_type or detect_content_kind(
+            filename=content_text.rsplit("/", 1)[-1],
+            source_path=content_text,
+        )
+        records = split_binary_by_kind(binary, kind=detected_kind, max_rows=2000)
+        base_source_item_id = source_item_id or content_text
+        base_row_id = row_id or content_text
+        content_kind = detected_kind or "text"
+        return records, base_source_item_id, base_row_id, content_kind
+
+    records = convert_json_text_to_records(content_text, max_rows=2000)
+    base_source_item_id = source_item_id or f"{job_item_id}:{file_sort_no}"
+    base_row_id = row_id or f"{job_item_id}:{file_sort_no}"
+    content_kind = explicit_content_type or "text"
+    return records, base_source_item_id, base_row_id, content_kind
+
+
 def expand_opendata_contents_to_chunk_inputs(
     conn: sqlite3.Connection,
     job_item_id: str,
@@ -188,55 +266,26 @@ def expand_opendata_contents_to_chunk_inputs(
 
     for content_row in content_rows:
         file_sort_no = int(content_row["sort_no"] or 0)
-        content_text = (content_row["content_text"] or "").strip()
-        explicit_content_type = (content_row["content_type"] or "").strip().lower()
-        source_item_id = (content_row["source_item_id"] or "").strip()
-        row_id = (content_row["row_id"] or "").strip()
 
-        if not content_text:
+        records, base_source_item_id, base_row_id, content_kind = build_records_from_content_row(
+            content_row=content_row,
+            job_item_id=job_item_id,
+            file_sort_no=file_sort_no,
+        )
+
+        if not records:
             continue
-
-        is_gcs_path = "/" in content_text or "." in content_text
-
-        if is_gcs_path:
-            binary = download_gcs_binary(content_text)
-            detected_kind = explicit_content_type or detect_content_kind(
-                filename=content_text.rsplit("/", 1)[-1],
-                source_path=content_text,
-            )
-            records = split_binary_by_kind(binary, kind=detected_kind, max_rows=2000)
-            base_source_item_id = source_item_id or content_text
-            base_row_id = row_id or content_text
-            content_kind = detected_kind or "text"
-        else:
-            records = convert_json_text_to_records(content_text, max_rows=2000)
-            base_source_item_id = source_item_id or f"{job_item_id}:{file_sort_no}"
-            base_row_id = row_id or f"{job_item_id}:{file_sort_no}"
-            content_kind = explicit_content_type or "text"
 
         local_index = 0
 
         for record in records:
             local_index += 1
 
-            if isinstance(record, dict):
-                if content_kind == "csv":
-                    text = stringify_csv_row(record)
-                elif content_kind == "pdf":
-                    text = str(record.get("text") or "").strip()
-                else:
-                    text = str(record.get("text") or "").strip()
-
-                if content_kind == "pdf":
-                    suffix = f"page_{record.get('page', local_index)}"
-                else:
-                    suffix = str(local_index)
-            else:
-                text = str(record or "").strip()
-                suffix = str(local_index)
-
+            text = record_to_content_text(content_kind, record)
             if not text:
                 continue
+
+            suffix = record_to_suffix(content_kind, record, local_index)
 
             expanded_rows.append(
                 {
