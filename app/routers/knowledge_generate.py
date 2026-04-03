@@ -368,7 +368,10 @@ def execute_chunk(body: dict):
         prompt = row["prompt"]
         prompt_type = row["prompt_type"]
 
-        result = run_llm_json(prompt)
+        result = run_llm_json(
+            prompt,
+            log_prefix=f"job={job_id} chunk={row['chunk_no']}"
+        )
 
         items = result.get("items") or result.get("qas") or result.get("data") or []
 
