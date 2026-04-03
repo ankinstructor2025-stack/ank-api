@@ -288,122 +288,148 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
 
 @router.post("/run")
 def run_job(body: KnowledgeRunRequest, request: Request):
-    from .knowledge_generate_common import open_user_db, now_iso, new_id
-    from app.routers.openai_llm_client import run_llm_json
+    from app.core.common import load_user_queue_config
+    from google.cloud import tasks_v2
     import json
+    import base64
 
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
     job_id = body.job_id
+
+    # queue.json 読み込み
+    queue = load_user_queue_config(uid)
+    queue_full_name = queue["queue_full_name"]
+
+    client = tasks_v2.CloudTasksClient()
 
     local_task_path = local_task_db_path(uid, job_id)
     conn = open_user_db(local_task_path)
 
     try:
         cur = conn.execute("""
-            SELECT chunk_id, job_id, job_item_id, prompt, prompt_type, chunk_no
+            SELECT chunk_id, chunk_no
             FROM knowledge_job_chunks
             ORDER BY chunk_no
         """)
         rows = cur.fetchall()
-        total_chunks = len(rows)
 
-        print(f"[RUN START] job_id={job_id} total_chunks={total_chunks}", flush=True)
+        for row in rows:
+            payload = {
+                "uid": uid,
+                "job_id": job_id,
+                "chunk_id": row["chunk_id"]
+            }
 
-        for idx, row in enumerate(rows, start=1):
-            chunk_id = row["chunk_id"]
-            chunk_no = row["chunk_no"]
-            prompt_type = row["prompt_type"]
-            prompt = row["prompt"]
+            task = {
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": f"https://YOUR_CLOUD_RUN_URL/task/execute_chunk",
+                    "headers": {"Content-Type": "application/json"},
+                    "body": base64.b64encode(json.dumps(payload).encode()).decode(),
+                }
+            }
 
-            print(
-                f"[CHUNK START] job_id={job_id} progress={idx}/{total_chunks} "
-                f"chunk_no={chunk_no} chunk_id={chunk_id} prompt_type={prompt_type} "
-                f"prompt_len={len(prompt or '')}",
-                flush=True
+            client.create_task(
+                parent=queue_full_name,
+                task=task
             )
 
-            result = run_llm_json(
-                prompt,
-                log_prefix=f"job={job_id} chunk={chunk_no}"
-            )
-
-            items = result.get("items") or result.get("qas") or result.get("data") or []
-            print(
-                f"[CHUNK RESPONSE] job_id={job_id} progress={idx}/{total_chunks} "
-                f"chunk_no={chunk_no} item_count={len(items)}",
-                flush=True
-            )
-
-            for i, item in enumerate(items):
-                if prompt_type == "qa":
-                    conn.execute("""
-                        INSERT INTO knowledge_items (
-                            knowledge_id,
-                            job_id,
-                            job_item_id,
-                            knowledge_type,
-                            question,
-                            answer,
-                            sort_no,
-                            created_at,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        new_id(),
-                        row["job_id"],
-                        row["job_item_id"],
-                        "qa",
-                        item.get("question"),
-                        item.get("answer"),
-                        i,
-                        now_iso(),
-                        now_iso()
-                    ))
-
-                elif prompt_type == "plain":
-                    conn.execute("""
-                        INSERT INTO knowledge_items (
-                            knowledge_id,
-                            job_id,
-                            job_item_id,
-                            knowledge_type,
-                            content,
-                            sort_no,
-                            created_at,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        new_id(),
-                        row["job_id"],
-                        row["job_item_id"],
-                        "plain",
-                        item.get("content"),
-                        i,
-                        now_iso(),
-                        now_iso()
-                    ))
-
-            conn.commit()
-
-            print(
-                f"[CHUNK DONE] job_id={job_id} progress={idx}/{total_chunks} "
-                f"chunk_no={chunk_no}",
-                flush=True
-            )
-
-        print(f"[RUN DONE] job_id={job_id} total_chunks={total_chunks}", flush=True)
-        conn.commit()
-
-    except Exception as e:
-        print(f"[RUN ERROR] job_id={job_id} error={e}", flush=True)
-        raise
     finally:
         conn.close()
 
     return {
         "job_id": job_id,
-        "status": "done"
+        "status": "queued"
     }
+
+@router.post("/task/execute_chunk")
+def execute_chunk(body: dict):
+    from .knowledge_generate_common import open_user_db, now_iso, new_id
+    from app.routers.openai_llm_client import run_llm_json
+
+    uid = body["uid"]
+    job_id = body["job_id"]
+    chunk_id = body["chunk_id"]
+
+    local_task_path = local_task_db_path(uid, job_id)
+    conn = open_user_db(local_task_path)
+
+    try:
+        row = conn.execute("""
+            SELECT *
+            FROM knowledge_job_chunks
+            WHERE chunk_id = ?
+        """, (chunk_id,)).fetchone()
+
+        if not row:
+            return {"status": "skip"}
+
+        prompt = row["prompt"]
+        prompt_type = row["prompt_type"]
+
+        result = run_llm_json(prompt)
+
+        items = result.get("items") or result.get("qas") or result.get("data") or []
+
+        for i, item in enumerate(items):
+            if prompt_type == "qa":
+                conn.execute("""
+                    INSERT INTO knowledge_items (
+                        knowledge_id,
+                        job_id,
+                        job_item_id,
+                        knowledge_type,
+                        question,
+                        answer,
+                        sort_no,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    new_id(),
+                    row["job_id"],
+                    row["job_item_id"],
+                    "qa",
+                    item.get("question"),
+                    item.get("answer"),
+                    i,
+                    now_iso(),
+                    now_iso()
+                ))
+
+            elif prompt_type == "plain":
+                conn.execute("""
+                    INSERT INTO knowledge_items (
+                        knowledge_id,
+                        job_id,
+                        job_item_id,
+                        knowledge_type,
+                        content,
+                        sort_no,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    new_id(),
+                    row["job_id"],
+                    row["job_item_id"],
+                    "plain",
+                    item.get("content"),
+                    i,
+                    now_iso(),
+                    now_iso()
+                ))
+
+        conn.commit()
+
+    except Exception as e:
+        print(f"[TASK ERROR] {e}", flush=True)
+        raise
+
+    finally:
+        conn.close()
+
+    return {"status": "done"}
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
 def get_status(uid: str, job_id: str):
