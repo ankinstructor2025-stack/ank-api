@@ -368,87 +368,114 @@ def execute_chunk(body: dict):
         prompt = row["prompt"]
         prompt_type = row["prompt_type"]
 
-        result = run_llm_json(
-            prompt,
-            log_prefix=f"job={job_id} chunk={row['chunk_no']}"
-        )
+        try:
+            result = run_llm_json(
+                prompt,
+                log_prefix=f"job={job_id} chunk={row['chunk_no']}"
+            )
 
-        items = result.get("items") or result.get("qas") or result.get("data") or []
+            items = result.get("items") or result.get("qas") or result.get("data") or []
 
-        qa_count = 0
-        plain_count = 0
+            print(
+                f"[TASK RESPONSE] job_id={job_id} chunk_no={row['chunk_no']} "
+                f"prompt_type={prompt_type} item_count={len(items)}",
+                flush=True
+            )
 
-        if prompt_type == "qa":
-            qa_count = len(items)
-        elif prompt_type == "plain":
-            plain_count = len(items)
+            for i, item in enumerate(items):
+                if prompt_type == "qa":
+                    conn.execute("""
+                        INSERT INTO knowledge_items (
+                            knowledge_id,
+                            job_id,
+                            job_item_id,
+                            knowledge_type,
+                            question,
+                            answer,
+                            sort_no,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_id(),
+                        row["job_id"],
+                        row["job_item_id"],
+                        "qa",
+                        item.get("question"),
+                        item.get("answer"),
+                        i,
+                        now_iso(),
+                        now_iso()
+                    ))
 
-        print(
-            f"[TASK RESPONSE] job_id={job_id} chunk_no={row['chunk_no']} "
-            f"prompt_type={prompt_type} qa_count={qa_count} plain_count={plain_count}",
-            flush=True
-        )
+                elif prompt_type == "plain":
+                    conn.execute("""
+                        INSERT INTO knowledge_items (
+                            knowledge_id,
+                            job_id,
+                            job_item_id,
+                            knowledge_type,
+                            content,
+                            sort_no,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        new_id(),
+                        row["job_id"],
+                        row["job_item_id"],
+                        "plain",
+                        item.get("content"),
+                        i,
+                        now_iso(),
+                        now_iso()
+                    ))
 
-        for i, item in enumerate(items):
-            if prompt_type == "qa":
-                conn.execute("""
-                    INSERT INTO knowledge_items (
-                        knowledge_id,
-                        job_id,
-                        job_item_id,
-                        knowledge_type,
-                        question,
-                        answer,
-                        sort_no,
-                        created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    new_id(),
-                    row["job_id"],
-                    row["job_item_id"],
-                    "qa",
-                    item.get("question"),
-                    item.get("answer"),
-                    i,
-                    now_iso(),
-                    now_iso()
-                ))
+            conn.execute("""
+                UPDATE knowledge_job_chunks
+                SET status = 'done',
+                    error_message = NULL,
+                    updated_at = ?
+                WHERE chunk_id = ?
+            """, (now_iso(), chunk_id))
 
-            elif prompt_type == "plain":
-                conn.execute("""
-                    INSERT INTO knowledge_items (
-                        knowledge_id,
-                        job_id,
-                        job_item_id,
-                        knowledge_type,
-                        content,
-                        sort_no,
-                        created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    new_id(),
-                    row["job_id"],
-                    row["job_item_id"],
-                    "plain",
-                    item.get("content"),
-                    i,
-                    now_iso(),
-                    now_iso()
-                ))
+            conn.commit()
+            upload_job_task_db(uid, job_id, local_task_path)
 
-        conn.commit()
-        upload_job_task_db(uid, job_id, local_task_path)
+            return {
+                "status": "done",
+                "chunk_id": chunk_id,
+                "item_count": len(items)
+            }
 
-    except Exception as e:
-        print(f"[TASK ERROR] {e}", flush=True)
-        raise
+        except Exception as e:
+            error_message = str(e)[:1000]
+
+            print(
+                f"[TASK ERROR] job_id={job_id} chunk_no={row['chunk_no']} "
+                f"chunk_id={chunk_id} error={error_message}",
+                flush=True
+            )
+
+            conn.execute("""
+                UPDATE knowledge_job_chunks
+                SET status = 'error',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE chunk_id = ?
+            """, (error_message, now_iso(), chunk_id))
+
+            conn.commit()
+            upload_job_task_db(uid, job_id, local_task_path)
+
+            return {
+                "status": "error",
+                "chunk_id": chunk_id,
+                "error_message": error_message
+            }
 
     finally:
         conn.close()
-
-    return {"status": "done"}
 
 @router.get("/status", response_model=KnowledgeJobStatusResponse)
 def get_status(uid: str, job_id: str):
