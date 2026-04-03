@@ -289,7 +289,7 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
 @router.post("/run")
 def run_job(body: KnowledgeRunRequest, request: Request):
     from .knowledge_generate_common import open_user_db, now_iso, new_id
-    from app.core.openai_llm_client import run_llm_json
+    from app.routers.openai_llm_client import run_llm_json
     import json
 
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
