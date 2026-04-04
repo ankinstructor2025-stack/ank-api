@@ -7,7 +7,7 @@ from app.routers.user_init import get_uid_from_auth_header
 
 router = APIRouter(prefix="/job-status", tags=["job-status"])
 
-BUCKET_NAME = os.getenv("BUCKET_NAME")
+BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
 
 
 def get_gcs_client():
