@@ -3,6 +3,8 @@ from google.cloud import storage
 import os
 import json
 
+from app.routers.user_init import get_uid_from_auth_header
+
 router = APIRouter(prefix="/job-status", tags=["job-status"])
 
 BUCKET_NAME = os.getenv("BUCKET_NAME")
@@ -15,7 +17,7 @@ def get_gcs_client():
 @router.get("")
 async def list_job_status(request: Request):
     try:
-        uid = request.state.uid  # 既存の認証使う前提
+        uid = get_uid_from_auth_header(request.headers.get("Authorization"))
 
         client = get_gcs_client()
         bucket = client.bucket(BUCKET_NAME)
