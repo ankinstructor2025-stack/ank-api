@@ -15,10 +15,12 @@ except ImportError:
 from zoneinfo import ZoneInfo
 from datetime import datetime
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 from google.cloud import storage
 from openai import OpenAI
+
+from app.core.common import user_task_db_path, local_task_db_path
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -36,8 +38,8 @@ QA_DEDUP_THRESHOLD = float(os.getenv("KNOWLEDGE_QA_DEDUP_THRESHOLD", "0.85"))
 PLAIN_DEDUP_THRESHOLD = float(os.getenv("KNOWLEDGE_PLAIN_DEDUP_THRESHOLD", "0.95"))
 
 
-def user_db_path(uid: str) -> str:
-    return f"users/{uid}/ank.db"
+def job_status_json_path(uid: str, job_id: str) -> str:
+    return f"users/{uid}/job_status/{job_id}.json"
 
 
 def now_jst_iso() -> str:
@@ -253,44 +255,60 @@ class RefineActionResponse(BaseModel):
     message: str
 
 
-def download_user_db(uid: str) -> str:
+def download_job_db(uid: str, job_id: str) -> str:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
+    db_gcs_path = user_task_db_path(uid, job_id)
     db_blob = bucket.blob(db_gcs_path)
     if not db_blob.exists():
         raise HTTPException(
-            status_code=400,
-            detail=f"ank.db not found. call /v1/user/init first. path={db_gcs_path}",
+            status_code=404,
+            detail=f"job db not found: {db_gcs_path}",
         )
 
-    local_db_path = f"/tmp/ank_{uid}_knowledge_refine.db"
+    local_db_path = local_task_db_path(uid, job_id)
     db_blob.download_to_filename(local_db_path)
     return local_db_path
 
 
-def upload_user_db(uid: str, local_db_path: str) -> None:
+def upload_job_db(uid: str, job_id: str, local_db_path: str) -> None:
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    db_gcs_path = user_db_path(uid)
+    db_gcs_path = user_task_db_path(uid, job_id)
     blob = bucket.blob(db_gcs_path)
     blob.upload_from_filename(local_db_path, content_type="application/octet-stream")
     print("UPLOAD FINISHED:", db_gcs_path)
 
-    verify_path = f"/tmp/verify_{uid}.db"
-    blob.download_to_filename(verify_path)
 
-    conn = sqlite3.connect(verify_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            "SELECT job_id, status, phase FROM knowledge_jobs ORDER BY requested_at DESC LIMIT 1"
-        ).fetchone()
-        print("GCS DB AFTER UPLOAD:", dict(row) if row else None)
-    finally:
-        conn.close()
+def read_job_status_json(uid: str, job_id: str) -> dict:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(job_status_json_path(uid, job_id))
+    if not blob.exists():
+        return {}
+    text = blob.download_as_text(encoding="utf-8")
+    data = json.loads(text)
+    return data if isinstance(data, dict) else {}
+
+
+def write_job_status_json(uid: str, job_id: str, data: dict) -> None:
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(job_status_json_path(uid, job_id))
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        content_type="application/json",
+    )
+
+
+def update_job_status_json(uid: str, job_id: str, updates: dict) -> dict:
+    data = read_job_status_json(uid, job_id)
+    data.update(updates)
+    data["updated_at"] = now_jst_iso()
+    write_job_status_json(uid, job_id, data)
+    return data
 
 
 def knowledge_template_db_path() -> str:
@@ -1429,88 +1447,66 @@ def list_refine_jobs(
     limit: int = Query(default=100, ge=1, le=500),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
-
-    conn = sqlite3.connect(local_db_path)
-    conn.row_factory = sqlite3.Row
 
     try:
-        where_clauses = []
-        params: list[object] = []
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        prefix = f"users/{uid}/job_status/"
+        blobs = client.list_blobs(bucket, prefix=prefix)
 
-        if source_type:
-            where_clauses.append("source_type = ?")
-            params.append(source_type)
+        jobs: list[RefineJobRow] = []
 
-        if status:
-            where_clauses.append("status = ?")
-            params.append(status)
+        for blob in blobs:
+            if not blob.name.endswith(".json"):
+                continue
 
-        where_sql = ""
-        if where_clauses:
-            where_sql = "WHERE " + " AND ".join(where_clauses)
+            data = json.loads(blob.download_as_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
 
-        sql = f"""
-            SELECT
-                job_id,
-                source_type,
-                source_name,
-                request_type,
-                status,
-                phase,
-                selected_count,
-                qa_count,
-                plain_count,
-                error_count,
-                requested_at,
-                started_at,
-                finished_at,
-                error_message
-            FROM knowledge_jobs
-            {where_sql}
-            ORDER BY requested_at DESC, job_id DESC
-            LIMIT ?
-        """
-        params.append(limit)
+            base_status = str(data.get("status") or "").lower()
+            error_chunks = int(data.get("error_chunks") or 0)
+            if base_status != "done" or error_chunks != 0:
+                continue
 
-        cur = conn.execute(sql, params)
-        rows = cur.fetchall()
+            refine_status = str(data.get("refine_status") or "new")
+            refine_phase = data.get("refine_phase")
 
-        jobs = [
-            RefineJobRow(
-                job_id=row["job_id"],
-                source_type=row["source_type"],
-                source_name=row["source_name"],
-                request_type=row["request_type"],
-                status=row["status"],
-                phase=row["phase"] if "phase" in row.keys() else None,
-                selected_count=row["selected_count"] or 0,
-                qa_count=row["qa_count"] or 0,
-                plain_count=row["plain_count"] or 0,
-                error_count=row["error_count"] or 0,
-                requested_at=row["requested_at"],
-                started_at=row["started_at"],
-                finished_at=row["finished_at"],
-                error_message=row["error_message"],
+            if source_type and data.get("source_type") != source_type:
+                continue
+            if status and refine_status != status:
+                continue
+
+            jobs.append(
+                RefineJobRow(
+                    job_id=str(data.get("job_id") or ""),
+                    source_type=str(data.get("source_type") or ""),
+                    source_name=data.get("source_name"),
+                    request_type=data.get("request_type"),
+                    status=refine_status,
+                    phase=refine_phase,
+                    selected_count=int(data.get("selected_count") or 0),
+                    qa_count=int(data.get("qa_count") or 0),
+                    plain_count=int(data.get("plain_count") or 0),
+                    error_count=1 if refine_status == "error" else 0,
+                    requested_at=data.get("refine_requested_at") or data.get("requested_at"),
+                    started_at=data.get("refine_started_at"),
+                    finished_at=data.get("refine_finished_at"),
+                    error_message=data.get("refine_error_message"),
+                )
             )
-            for row in rows
-        ]
+
+        jobs.sort(key=lambda x: x.requested_at or "", reverse=True)
+        jobs = jobs[:limit]
 
         return RefineJobListResponse(
             jobs=jobs,
             total_count=len(jobs),
         )
 
-    except sqlite3.Error as e:
-        logger.exception("list_refine_jobs sqlite error")
-        raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
-
     except Exception as e:
         logger.exception("list_refine_jobs failed")
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        conn.close()
 
 
 @router.get("/jobs/{job_id}/items", response_model=RefineJobItemListResponse)
@@ -1520,7 +1516,15 @@ def list_refine_job_items(
     limit: int = Query(default=500, ge=1, le=2000),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
+    update_job_status_json(uid, job_id, {
+        "refine_status": "running",
+        "refine_phase": "cleanse",
+        "refine_requested_at": read_job_status_json(uid, job_id).get("refine_requested_at") or now_jst_iso(),
+        "refine_started_at": now_jst_iso(),
+        "refine_finished_at": None,
+        "refine_error_message": None,
+    })
+    local_db_path = download_job_db(uid, job_id)
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
@@ -1681,7 +1685,7 @@ def normalize_refine_job(
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
+    local_db_path = download_job_db(uid, job_id)
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
@@ -1741,10 +1745,17 @@ def normalize_refine_job(
         conn = None
         print("CONN CLOSED")
 
-        upload_user_db(uid, local_db_path)
+        upload_job_db(uid, job_id, local_db_path)
         print("UPLOAD DONE")
 
         print("=== CLEANSE END ===")
+
+        update_job_status_json(uid, job_id, {
+            "refine_status": "done",
+            "refine_phase": "cleansed",
+            "refine_finished_at": now_jst_iso(),
+            "refine_error_message": None,
+        })
 
         return RefineActionResponse(
             ok=True,
@@ -1754,7 +1765,12 @@ def normalize_refine_job(
             message=f"cleansed: {normalized_count}",
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": e.detail if hasattr(e, "detail") else str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         if conn is not None:
             conn.close()
             conn = None
@@ -1766,6 +1782,11 @@ def normalize_refine_job(
             conn.close()
             conn = None
         print("SQLITE ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": f"sqlite error: {e}",
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
@@ -1774,6 +1795,11 @@ def normalize_refine_job(
             conn.close()
             conn = None
         print("GENERAL ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -1787,7 +1813,15 @@ def vectorize_refine_job(
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
+    update_job_status_json(uid, job_id, {
+        "refine_status": "running",
+        "refine_phase": "vectorize",
+        "refine_requested_at": read_job_status_json(uid, job_id).get("refine_requested_at") or now_jst_iso(),
+        "refine_started_at": now_jst_iso(),
+        "refine_finished_at": None,
+        "refine_error_message": None,
+    })
+    local_db_path = download_job_db(uid, job_id)
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
@@ -1833,10 +1867,17 @@ def vectorize_refine_job(
         conn = None
         print("CONN CLOSED")
 
-        upload_user_db(uid, local_db_path)
+        upload_job_db(uid, job_id, local_db_path)
         print("UPLOAD DONE")
 
         print("=== VECTORIZE END ===")
+
+        update_job_status_json(uid, job_id, {
+            "refine_status": "done",
+            "refine_phase": "vectorized",
+            "refine_finished_at": now_jst_iso(),
+            "refine_error_message": None,
+        })
 
         return RefineActionResponse(
             ok=True,
@@ -1846,7 +1887,12 @@ def vectorize_refine_job(
             message=f"vectorized: {vectorized_count}",
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": e.detail if hasattr(e, "detail") else str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         if conn is not None:
             conn.close()
             conn = None
@@ -1858,6 +1904,11 @@ def vectorize_refine_job(
             conn.close()
             conn = None
         print("SQLITE ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": f"sqlite error: {e}",
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
@@ -1866,6 +1917,11 @@ def vectorize_refine_job(
             conn.close()
             conn = None
         print("GENERAL ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -1879,7 +1935,15 @@ def deduplicate_refine_job(
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
+    update_job_status_json(uid, job_id, {
+        "refine_status": "running",
+        "refine_phase": "deduplicate",
+        "refine_requested_at": read_job_status_json(uid, job_id).get("refine_requested_at") or now_jst_iso(),
+        "refine_started_at": now_jst_iso(),
+        "refine_finished_at": None,
+        "refine_error_message": None,
+    })
+    local_db_path = download_job_db(uid, job_id)
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
@@ -1930,10 +1994,17 @@ def deduplicate_refine_job(
         conn = None
         print("CONN CLOSED")
 
-        upload_user_db(uid, local_db_path)
+        upload_job_db(uid, job_id, local_db_path)
         print("UPLOAD DONE")
 
         print("=== DEDUPLICATE END ===")
+
+        update_job_status_json(uid, job_id, {
+            "refine_status": "done",
+            "refine_phase": "deduplicated",
+            "refine_finished_at": now_jst_iso(),
+            "refine_error_message": None,
+        })
 
         return RefineActionResponse(
             ok=True,
@@ -1951,7 +2022,12 @@ def deduplicate_refine_job(
             ),
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": e.detail if hasattr(e, "detail") else str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         if conn is not None:
             conn.close()
             conn = None
@@ -1963,6 +2039,11 @@ def deduplicate_refine_job(
             conn.close()
             conn = None
         print("SQLITE ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": f"sqlite error: {e}",
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
@@ -1971,6 +2052,11 @@ def deduplicate_refine_job(
             conn.close()
             conn = None
         print("GENERAL ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -1984,7 +2070,15 @@ def build_knowledge_db_job(
     authorization: str | None = Header(default=None),
 ):
     uid = get_uid_from_auth_header(authorization)
-    local_db_path = download_user_db(uid)
+    update_job_status_json(uid, job_id, {
+        "refine_status": "running",
+        "refine_phase": "build-knowledge-db",
+        "refine_requested_at": read_job_status_json(uid, job_id).get("refine_requested_at") or now_jst_iso(),
+        "refine_started_at": now_jst_iso(),
+        "refine_finished_at": None,
+        "refine_error_message": None,
+    })
+    local_db_path = download_job_db(uid, job_id)
 
     conn = sqlite3.connect(local_db_path)
     conn.row_factory = sqlite3.Row
@@ -2030,10 +2124,19 @@ def build_knowledge_db_job(
         conn = None
         print("CONN CLOSED")
 
-        upload_user_db(uid, local_db_path)
+        upload_job_db(uid, job_id, local_db_path)
         print("UPLOAD DONE")
 
         print("=== BUILD KNOWLEDGE DB END ===")
+
+        update_job_status_json(uid, job_id, {
+            "refine_status": "done",
+            "refine_phase": "built",
+            "refine_finished_at": now_jst_iso(),
+            "refine_error_message": None,
+            "knowledge_db_filename": result.get("filename"),
+            "knowledge_db_gcs_path": result.get("gcs_path"),
+        })
 
         return RefineActionResponse(
             ok=True,
@@ -2048,7 +2151,12 @@ def build_knowledge_db_job(
             ),
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": e.detail if hasattr(e, "detail") else str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         if conn is not None:
             conn.close()
             conn = None
@@ -2060,6 +2168,11 @@ def build_knowledge_db_job(
             conn.close()
             conn = None
         print("SQLITE ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": f"sqlite error: {e}",
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=f"sqlite error: {e}")
 
     except Exception as e:
@@ -2068,6 +2181,11 @@ def build_knowledge_db_job(
             conn.close()
             conn = None
         print("GENERAL ERROR:", e)
+        update_job_status_json(uid, job_id, {
+            "refine_status": "error",
+            "refine_error_message": str(e),
+            "refine_finished_at": now_jst_iso(),
+        })
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
