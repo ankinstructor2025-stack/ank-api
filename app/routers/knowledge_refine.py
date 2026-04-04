@@ -882,11 +882,6 @@ def vectorize_knowledge_items_for_job(
                 content_vector = ?
         """
 
-        if update_sets:
-            sql += ", " + ", ".join(update_sets)
-            if "updated_at" in columns:
-                params.append(now_jst_iso())
-
         sql += " WHERE knowledge_id = ?"
         params.append(row["knowledge_id"])
 
@@ -950,15 +945,13 @@ def normalize_knowledge_items_for_job(
             SET
                 question_normalize = ?,
                 answer_normalize = ?,
-                content_normalize = ?,
-                updated_at = ?
+                content_normalize = ?
             WHERE knowledge_id = ?
             """,
             (
                 question_normalize or None,
                 answer_normalize or None,
                 content_normalize or None,
-                now_jst_iso(),
                 row["knowledge_id"],
             ),
         )
@@ -1124,13 +1117,11 @@ def mark_single_item(
             dedup_score = NULL,
             dedup_key = NULL,
             dedup_version = ?,
-            dedup_at = ?,
-            updated_at = ?
+            dedup_at = ?
         WHERE knowledge_id = ?
         """,
         (
             dedup_version,
-            now_jst_iso(),
             now_jst_iso(),
             row["knowledge_id"],
         ),
@@ -1164,8 +1155,7 @@ def mark_group_item(
             dedup_score = ?,
             dedup_key = ?,
             dedup_version = ?,
-            dedup_at = ?,
-            updated_at = ?
+            dedup_at = ?
         WHERE knowledge_id = ?
         """,
         (
@@ -1178,7 +1168,6 @@ def mark_group_item(
             dedup_score,
             dedup_key,
             dedup_version,
-            now_jst_iso(),
             now_jst_iso(),
             row["knowledge_id"],
         ),
@@ -1229,7 +1218,6 @@ def deduplicate_knowledge_items_for_job(
         "dedup_key",
         "dedup_version",
         "dedup_at",
-        "updated_at",
     }
     missing = [c for c in required_columns if c not in columns]
     if missing:
@@ -1274,8 +1262,7 @@ def deduplicate_knowledge_items_for_job(
             dedup_key,
             dedup_version,
             dedup_at,
-            created_at,
-            updated_at
+            created_at
         FROM knowledge_items
         WHERE job_id = ?
         ORDER BY sort_no ASC, knowledge_id ASC
