@@ -631,7 +631,22 @@ def execute_chunk(body: dict):
                 log_prefix=f"job={job_id} chunk={row['chunk_no']}"
             )
 
-            items = result.get("items") or result.get("qas") or result.get("data") or []
+            if prompt_type == "qa":
+                items = (
+                    result.get("qa_list")
+                    or result.get("items")
+                    or result.get("qas")
+                    or result.get("data")
+                    or []
+                )
+            else:
+                items = (
+                    result.get("plain_list")
+                    or result.get("items")
+                    or result.get("qas")
+                    or result.get("data")
+                    or []
+                )            
 
             print(
                 f"[TASK RESPONSE] job_id={job_id} chunk_no={row['chunk_no']} "
