@@ -12,11 +12,12 @@ from pydantic import BaseModel, Field
 from app.core.common import CLOUD_RUN_BASE_URL
 
 from .knowledge_generate_common import (
-    create_job_record,
     create_job_item_record,
     open_user_db,
     insert_opendata_contents_from_files,
     insert_job_chunks,
+    now_iso,
+    new_id,
 )
 
 from .knowledge_generate_kokkai import SOURCE_TYPE as KOKKAI_SOURCE_TYPE
@@ -194,7 +195,6 @@ def upload_job_task_db(uid: str, job_id: str, local_path: str) -> None:
 
     task_gcs_path = user_task_db_path(uid, job_id)
     blob = bucket.blob(task_gcs_path)
-
     blob.upload_from_filename(local_path)
 
 
@@ -247,8 +247,6 @@ def build_job_status_dict(
     forced_phase: Optional[str] = None,
     forced_error_message: Optional[str] = None,
 ) -> dict[str, Any]:
-    from .knowledge_generate_common import now_iso
-
     job_row = conn.execute(
         """
         SELECT
@@ -453,14 +451,8 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
     local_user_path = local_user_db_path(uid)
 
-    job_id, requested_at = create_job_record(
-        uid=uid,
-        source_type=body.source_type,
-        source_name=body.source_name or body.source_type,
-        request_type=body.request_type,
-        selected_count=len(body.items),
-        preview_only=body.preview_only,
-    )
+    job_id = new_id()
+    requested_at = now_iso()
 
     local_task_path = ensure_job_task_db(uid, job_id)
 
@@ -511,7 +503,6 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
 def run_job(body: KnowledgeRunRequest, request: Request):
     from app.core.common import load_user_queue_config
     from google.cloud import tasks_v2
-    from .knowledge_generate_common import now_iso
     import base64
 
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
@@ -591,7 +582,6 @@ def run_job(body: KnowledgeRunRequest, request: Request):
 
 @router.post("/task/execute_chunk")
 def execute_chunk(body: dict):
-    from .knowledge_generate_common import open_user_db, now_iso, new_id
     from app.routers.openai_llm_client import run_llm_json
 
     uid = body["uid"]
@@ -646,7 +636,7 @@ def execute_chunk(body: dict):
                     or result.get("qas")
                     or result.get("data")
                     or []
-                )            
+                )
 
             print(
                 f"[TASK RESPONSE] job_id={job_id} chunk_no={row['chunk_no']} "
@@ -655,6 +645,8 @@ def execute_chunk(body: dict):
             )
 
             for i, item in enumerate(items):
+                created_at = now_iso()
+
                 if prompt_type == "qa":
                     conn.execute("""
                         INSERT INTO knowledge_items (
@@ -665,8 +657,10 @@ def execute_chunk(body: dict):
                             question,
                             answer,
                             sort_no,
+                            status,
+                            review_status,
                             created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         new_id(),
                         row["job_id"],
@@ -675,7 +669,9 @@ def execute_chunk(body: dict):
                         item.get("question"),
                         item.get("answer"),
                         i,
-                        now_iso()
+                        "active",
+                        "new",
+                        created_at
                     ))
 
                 elif prompt_type == "plain":
@@ -687,8 +683,10 @@ def execute_chunk(body: dict):
                             knowledge_type,
                             content,
                             sort_no,
+                            status,
+                            review_status,
                             created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         new_id(),
                         row["job_id"],
@@ -696,7 +694,9 @@ def execute_chunk(body: dict):
                         "plain",
                         item.get("content"),
                         i,
-                        now_iso()
+                        "active",
+                        "new",
+                        created_at
                     ))
 
             conn.execute("""
