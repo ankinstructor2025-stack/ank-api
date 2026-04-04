@@ -44,3 +44,69 @@ async def list_job_status(request: Request):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/running")
+async def list_job_status_running(request: Request):
+    try:
+        uid = get_uid_from_auth_header(request.headers.get("Authorization"))
+
+        client = get_gcs_client()
+        bucket = client.bucket(BUCKET_NAME)
+
+        prefix = f"users/{uid}/job_status/"
+        blobs = client.list_blobs(bucket, prefix=prefix)
+
+        jobs = []
+
+        for blob in blobs:
+            if not blob.name.endswith(".json"):
+                continue
+
+            content = blob.download_as_text(encoding="utf-8")
+            data = json.loads(content)
+
+            status = str(data.get("status") or "").lower()
+
+            # 実行中 or エラーをモニター対象にする
+            if status in ("running", "error"):
+                jobs.append(data)
+
+        jobs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return {"jobs": jobs}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/completed")
+async def list_job_status_completed(request: Request):
+    try:
+        uid = get_uid_from_auth_header(request.headers.get("Authorization"))
+
+        client = get_gcs_client()
+        bucket = client.bucket(BUCKET_NAME)
+
+        prefix = f"users/{uid}/job_status/"
+        blobs = client.list_blobs(bucket, prefix=prefix)
+
+        jobs = []
+
+        for blob in blobs:
+            if not blob.name.endswith(".json"):
+                continue
+
+            content = blob.download_as_text(encoding="utf-8")
+            data = json.loads(content)
+
+            status = str(data.get("status") or "").lower()
+            error_chunks = int(data.get("error_chunks") or 0)
+
+            if status == "done" and error_chunks == 0:
+                jobs.append(data)
+
+        jobs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return {"jobs": jobs}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
