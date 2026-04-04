@@ -441,6 +441,53 @@ def insert_task_job_record(
     )
 
 
+def insert_completed_job_to_user_db(uid: str, status_data: dict[str, Any]) -> None:
+    if status_data.get("status") != "done":
+        return
+
+    local_user_path = local_user_db_path(uid)
+    conn = open_user_db(local_user_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO jobs (
+                job_id,
+                source_type,
+                source_name,
+                request_type,
+                status,
+                selected_count,
+                qa_count,
+                plain_count,
+                error_count,
+                requested_at,
+                started_at,
+                finished_at,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                status_data["job_id"],
+                status_data.get("source_type"),
+                status_data.get("source_name"),
+                status_data.get("request_type"),
+                status_data.get("status"),
+                int(status_data.get("selected_count") or 0),
+                int(status_data.get("qa_count") or 0),
+                int(status_data.get("plain_count") or 0),
+                int(status_data.get("error_chunks") or 0),
+                status_data.get("requested_at"),
+                status_data.get("started_at"),
+                status_data.get("finished_at"),
+                status_data.get("error_message"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @router.post("/job", response_model=KnowledgeJobCreateResponse)
 def create_job(request: Request, body: KnowledgeJobCreateRequest):
     validate_source_type(body.source_type)
@@ -717,6 +764,13 @@ def execute_chunk(body: dict):
                 forced_phase=None,
                 forced_error_message=None,
             )
+
+            if (
+                status_data.get("status") == "done"
+                and int(status_data.get("error_chunks") or 0) == 0
+                and int(status_data.get("done_chunks") or 0) == int(status_data.get("total_chunks") or 0)
+            ):
+                insert_completed_job_to_user_db(uid, status_data)
 
             return {
                 "status": status_data["status"],
