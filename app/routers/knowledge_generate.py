@@ -450,7 +450,7 @@ def insert_completed_job_to_user_db(uid: str, status_data: dict[str, Any]) -> No
     try:
         conn.execute(
             """
-            INSERT OR REPLACE INTO jobs (
+            INSERT OR REPLACE INTO knowledge_jobs (
                 job_id,
                 source_type,
                 source_name,
