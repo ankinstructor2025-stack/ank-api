@@ -20,7 +20,12 @@ from pydantic import BaseModel
 from google.cloud import storage
 from openai import OpenAI
 
-from app.core.common import user_task_db_path, local_task_db_path
+from app.core.common import (
+    user_db_path,
+    local_user_db_path,
+    user_task_db_path,
+    local_task_db_path,
+)
 
 import firebase_admin
 from firebase_admin import auth as fb_auth
@@ -449,24 +454,56 @@ def upsert_knowledge_meta(
 
 
 def insert_knowledge_db_row(
-    conn: sqlite3.Connection,
+    uid: str,
     database_name: str,
     source_type: str,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO knowledge_db (
-            database_name,
-            source_type,
-            created_at
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    ank_db_gcs_path = user_db_path(uid)
+    ank_db_blob = bucket.blob(ank_db_gcs_path)
+
+    if not ank_db_blob.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"ank.db not found: {ank_db_gcs_path}",
         )
-        VALUES (?, ?, ?)
-        """,
-        (
-            database_name,
-            source_type,
-            now_jst_iso(),
-        ),
+
+    local_ank_db_path = local_user_db_path(uid)
+    ank_db_blob.download_to_filename(local_ank_db_path)
+
+    conn = sqlite3.connect(local_ank_db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO knowledge_db (
+                database_name,
+                source_type,
+                created_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                database_name,
+                source_type,
+                now_jst_iso(),
+            ),
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    ank_db_blob.upload_from_filename(
+        local_ank_db_path,
+        content_type="application/octet-stream",
     )
 
 
@@ -663,7 +700,7 @@ def build_knowledge_db_for_job(
     gcs_path = upload_knowledge_db(uid, local_knowledge_db_path, filename)
 
     insert_knowledge_db_row(
-        conn=conn,
+        uid=uid,
         database_name=filename,
         source_type=job_source_type,
     )
