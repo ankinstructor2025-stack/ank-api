@@ -3,7 +3,7 @@ from google.cloud import storage
 import os
 import json
 
-router = APIRouter(prefix="/v1/job-status", tags=["job-status"])
+router = APIRouter(prefix="/job-status", tags=["job-status"])
 
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
