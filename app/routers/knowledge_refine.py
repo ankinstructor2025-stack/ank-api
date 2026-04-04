@@ -1237,7 +1237,6 @@ def deduplicate_knowledge_items_for_job(
             knowledge_id,
             job_id,
             job_item_id,
-            source_type,
             source_id,
             source_item_id,
             row_id,
