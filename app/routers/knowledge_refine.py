@@ -475,6 +475,15 @@ def build_knowledge_db_for_job(
     uid: str,
     job_id: str,
 ) -> dict[str, object]:
+    job_row = ensure_job_exists(conn, job_id)
+    job_source_type = str(job_row["source_type"] or "").strip()
+
+    if not job_source_type:
+        raise HTTPException(
+            status_code=500,
+            detail=f"source_type not found for job_id={job_id}",
+        )
+
     columns = get_table_columns(conn, "knowledge_items")
     required_columns = {
         "knowledge_id",
@@ -487,7 +496,6 @@ def build_knowledge_db_for_job(
         "question_vector",
         "answer_vector",
         "content_vector",
-        "source_type",
         "source_item_id",
         "language",
         "sort_no",
@@ -514,7 +522,6 @@ def build_knowledge_db_for_job(
             question_vector,
             answer_vector,
             content_vector,
-            source_type,
             source_item_id,
             language,
             sort_no
@@ -617,7 +624,7 @@ def build_knowledge_db_for_job(
                     row["content"],
                     search_text,
                     embedding_json,
-                    row["source_type"],
+                    job_source_type,
                     row["source_item_id"],
                     source_label or None,
                     row["language"],
@@ -655,18 +662,10 @@ def build_knowledge_db_for_job(
 
     gcs_path = upload_knowledge_db(uid, local_knowledge_db_path, filename)
 
-    job_row = ensure_job_exists(conn, job_id)
-    source_type = str(job_row["source_type"] or "").strip()
-    if not source_type:
-        raise HTTPException(
-            status_code=500,
-            detail=f"source_type not found for job_id={job_id}",
-        )
-
     insert_knowledge_db_row(
         conn=conn,
         database_name=filename,
-        source_type=source_type,
+        source_type=job_source_type,
     )
 
     return {
@@ -675,7 +674,7 @@ def build_knowledge_db_for_job(
         "entry_count": entry_count,
         "qa_count": qa_count,
         "plain_count": plain_count,
-        "source_type": source_type,
+        "source_type": job_source_type,
     }
 
 
