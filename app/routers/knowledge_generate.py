@@ -754,6 +754,36 @@ def execute_chunk(body: dict):
             """, (chunk_id,))
 
             conn.commit()
+
+            done_chunks = _count_one(
+                conn,
+                "SELECT COUNT(*) FROM knowledge_job_chunks WHERE job_id = ? AND status = 'done'",
+                (job_id,),
+            )
+            total_chunks = _count_one(
+                conn,
+                "SELECT COUNT(*) FROM knowledge_job_chunks WHERE job_id = ?",
+                (job_id,),
+            )
+            error_chunks = _count_one(
+                conn,
+                "SELECT COUNT(*) FROM knowledge_job_chunks WHERE job_id = ? AND status = 'error'",
+                (job_id,),
+            )
+
+            if error_chunks == 0 and done_chunks == total_chunks:
+                conn.execute(
+                    """
+                    UPDATE knowledge_jobs
+                    SET status = 'done',
+                        finished_at = ?,
+                        error_message = NULL
+                    WHERE job_id = ?
+                    """,
+                    (now_iso(), job_id),
+                )
+                conn.commit()
+
             upload_job_task_db(uid, job_id, local_task_path)
 
             status_data = write_job_status_json(
