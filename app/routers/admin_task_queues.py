@@ -1,97 +1,44 @@
-from fastapi import APIRouter, HTTPException
-from google.cloud import tasks_v2
+from fastapi import APIRouter, HTTPException, Request
+from google.cloud import storage
 import os
+import json
 
-router = APIRouter(prefix="/admin/task-queues", tags=["admin-task-queues"])
+router = APIRouter(prefix="/v1/job-status", tags=["job-status"])
 
-PROJECT_ID = os.getenv("PROJECT_ID")
-LOCATION = os.getenv("LOCATION", "asia-northeast1")
-
-
-def get_client():
-    return tasks_v2.CloudTasksClient()
+BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 
-def get_parent():
-    if not PROJECT_ID:
-        raise RuntimeError("PROJECT_ID is not set")
-    return f"projects/{PROJECT_ID}/locations/{LOCATION}"
+def get_gcs_client():
+    return storage.Client()
 
 
-def parse_queue_short_name(full_name: str) -> str:
-    return full_name.split("/")[-1] if full_name else ""
-
-
-def parse_task_short_name(full_name: str) -> str:
-    return full_name.split("/")[-1] if full_name else ""
-
-
-# =========================
-# キュー一覧
-# =========================
 @router.get("")
-def list_queues():
+async def list_job_status(request: Request):
     try:
-        client = get_client()
-        parent = get_parent()
+        uid = request.state.uid  # 既存の認証使う前提
 
-        queues = client.list_queues(parent=parent)
+        client = get_gcs_client()
+        bucket = client.bucket(BUCKET_NAME)
 
-        result = []
-        for q in queues:
-            queue_name = q.name
-            short_name = parse_queue_short_name(queue_name)
+        prefix = f"users/{uid}/job_status/"
 
-            # タスク数は別途取得（軽く1回だけ）
-            task_count = 0
-            try:
-                tasks = client.list_tasks(parent=queue_name)
-                task_count = sum(1 for _ in tasks)
-            except Exception:
-                task_count = -1  # 取得失敗
+        blobs = client.list_blobs(bucket, prefix=prefix)
 
-            result.append({
-                "name": queue_name,
-                "queue_name": short_name,
-                "state": str(q.state).replace("State.", ""),
-                "task_count": task_count
-            })
+        jobs = []
 
-        return {"queues": result}
+        for blob in blobs:
+            if not blob.name.endswith(".json"):
+                continue
+
+            content = blob.download_as_text()
+            data = json.loads(content)
+
+            jobs.append(data)
+
+        # 更新日時でソート（新しい順）
+        jobs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return {"jobs": jobs}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list_queues failed: {str(e)}")
-
-
-# =========================
-# タスク一覧
-# =========================
-@router.get("/{queue_name}/tasks")
-def list_tasks(queue_name: str):
-    try:
-        client = get_client()
-        parent = f"{get_parent()}/queues/{queue_name}"
-
-        tasks = client.list_tasks(parent=parent)
-
-        result = []
-        for t in tasks:
-            http_request = t.http_request
-
-            url = ""
-            if http_request:
-                url = http_request.url
-
-            result.append({
-                "name": t.name,
-                "short_name": parse_task_short_name(t.name),
-                "schedule_time": t.schedule_time.isoformat() if t.schedule_time else "",
-                "dispatch_count": t.dispatch_count,
-                "response_count": t.response_count,
-                "url": url
-            })
-
-        return {"tasks": result}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list_tasks failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
