@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-import os
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException
+
 from .knowledge_generate_common import (
+    PROMPT_TEMPLATE_PATHS,
     load_chunk_config,
     load_template_text,
     now_iso,
     open_user_db,
 )
+from .openai_chunking import ChunkConfig, build_chunks, render_chunk_text
+
 
 SOURCE_TYPE = "kokkai"
 
-BUCKET_NAME = os.getenv("UPLOAD_BUCKET", "ank-bucket")
-KOKKAI_QA_PROMPT_PATH = "template/kokkai_qa_prompt.txt"
-KOKKAI_PLAIN_PROMPT_PATH = "template/kokkai_plain_prompt.txt"
-OPENAI_CHUNK_CONFIG_PATH = "template/openai_chunk.json"
 
-DEFAULT_KOKKAI_QA_PROMPT = ""
-DEFAULT_KOKKAI_PLAIN_PROMPT = ""
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def normalize_text(value: Any) -> str:
@@ -31,36 +32,63 @@ def normalize_text(value: Any) -> str:
     return merged.strip()
 
 
-def load_template_text_with_default(template_path: str, default_template: str) -> str:
-    text = load_template_text(BUCKET_NAME, template_path)
-    return text if text else default_template
+def get_required_kokkai_chunk_conf(
+    chunk_config: dict[str, Any],
+    prompt_type: str,
+) -> dict[str, Any]:
+    if not chunk_config:
+        raise RuntimeError("openai_chunk.json is empty or not loaded")
+
+    kokkai_conf = chunk_config.get("kokkai")
+    if not kokkai_conf:
+        raise RuntimeError("openai_chunk.json: 'kokkai' section missing")
+
+    conf = kokkai_conf.get(prompt_type)
+    if not conf:
+        raise RuntimeError(f"openai_chunk.json: kokkai.{prompt_type} missing")
+
+    return conf
 
 
-def get_required_kokkai_chunk_conf(chunk_config: dict[str, Any], prompt_type: str) -> dict[str, Any]:
-    kokkai_conf = chunk_config.get("kokkai", {})
-    return kokkai_conf.get(prompt_type, {})
+def to_chunk_config(conf: dict[str, Any]) -> ChunkConfig:
+    required_keys = ["max_chars", "max_items", "overlap_items"]
+
+    for key in required_keys:
+        if key not in conf:
+            raise RuntimeError(f"openai_chunk.json missing key: {key}")
+
+    return ChunkConfig(
+        max_chars=int(conf["max_chars"]),
+        max_items=int(conf["max_items"]),
+        overlap_items=int(conf["overlap_items"]),
+    )
 
 
-def fetch_kokkai_source_rows(local_db_path: str, issue_id: str) -> list[sqlite3.Row]:
-    conn = open_user_db(local_db_path)
-    try:
-        cur = conn.execute(
-            """
-            SELECT
-                issue_id,
-                speech_id,
-                speech_order,
-                speaker,
-                speech
-            FROM kokkai_document_rows
-            WHERE issue_id = ?
-            ORDER BY speech_order, speech_id
-            """,
-            (issue_id,),
+def prompt_reserved_chars(prompt_template: str) -> int:
+    template = (prompt_template or "").strip()
+    if not template:
+        raise RuntimeError("prompt template is empty")
+    return len(template) + 2
+
+
+def to_prompt_safe_chunk_config(
+    base_config: ChunkConfig,
+    prompt_template: str,
+) -> ChunkConfig:
+    reserved = prompt_reserved_chars(prompt_template)
+    usable_chars = int(base_config.max_chars) - reserved
+
+    if usable_chars <= 0:
+        raise RuntimeError(
+            f"max_chars is too small for prompt template. "
+            f"max_chars={base_config.max_chars}, reserved={reserved}"
         )
-        return cur.fetchall()
-    finally:
-        conn.close()
+
+    return ChunkConfig(
+        max_chars=usable_chars,
+        max_items=int(base_config.max_items),
+        overlap_items=int(base_config.overlap_items),
+    )
 
 
 def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row | None:
@@ -87,113 +115,183 @@ def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sq
     return cur.fetchone()
 
 
-def insert_kokkai_contents(conn: sqlite3.Connection, job_id: str, job_item_id: str, source_rows: list[sqlite3.Row]) -> int:
-    conn.execute("DELETE FROM knowledge_contents WHERE job_item_id = ?", (job_item_id,))
-    count = 0
-    for idx, row in enumerate(source_rows, start=1):
-        conn.execute(
-            """
-            INSERT INTO knowledge_contents (
-                job_id,
-                job_item_id,
-                source_type,
-                source_id,
-                source_item_id,
-                row_id,
-                content_type,
-                content_text,
-                sort_no,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                job_item_id,
-                SOURCE_TYPE,
-                row["issue_id"],
-                row["speech_id"],
-                row["speech_id"],
-                "row",
-                normalize_text(row["speech"]),
-                idx,
-                now_iso(),
-                now_iso(),
-            ),
-        )
-        count += 1
-    return count
-
-
-def fetch_kokkai_content_rows(conn: sqlite3.Connection, job_item_id: str) -> list[sqlite3.Row]:
+def fetch_kokkai_speech_rows_for_chunk(
+    conn: sqlite3.Connection,
+    issue_id: str,
+) -> list[sqlite3.Row]:
     cur = conn.execute(
         """
         SELECT
-            source_item_id,
-            row_id,
-            content_type,
-            content_text,
-            sort_no
-        FROM knowledge_contents
-        WHERE job_item_id = ?
-        ORDER BY sort_no
+            issue_id,
+            speech_id,
+            speech_order,
+            status,
+            speaker,
+            speech,
+            created_at,
+            updated_at
+        FROM kokkai_document_rows
+        WHERE issue_id = ?
+        ORDER BY speech_order, speech_id
         """,
-        (job_item_id,),
+        (issue_id,),
     )
     return cur.fetchall()
 
 
-def build_kokkai_prompt_texts(
+def speech_row_to_chunk_text(row: sqlite3.Row) -> str:
+    speaker = normalize_text(row["speaker"])
+    speech = normalize_text(row["speech"])
+
+    if not speech:
+        return ""
+
+    if speaker:
+        return f"発言者: {speaker}\n本文: {speech}"
+
+    return speech
+
+
+def build_kokkai_chunk_inputs(
     conn: sqlite3.Connection,
     job_item_id: str,
-    prompt_type: str,
-) -> list[str]:
-    rows = fetch_kokkai_content_rows(conn, job_item_id)
+) -> list[dict[str, Any]]:
+    meta = fetch_kokkai_job_item_meta(conn, job_item_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
+
+    issue_id = normalize_text(meta["parent_source_id"])
+    if not issue_id:
+        raise HTTPException(status_code=400, detail=f"parent_source_id is empty: {job_item_id}")
+
+    rows = fetch_kokkai_speech_rows_for_chunk(conn, issue_id)
     if not rows:
-        return []
+        raise HTTPException(status_code=400, detail=f"kokkai_document_rows is empty: {issue_id}")
 
-    # 第一段階の仮実装: 1件に全部まとめる
-    content_lines = []
+    chunk_inputs: list[dict[str, Any]] = []
+    sort_no = 1
+
     for row in rows:
-        content_lines.append(row["content_text"] or "")
+        text = speech_row_to_chunk_text(row)
+        if not text:
+            continue
 
-    header = f"[SOURCE_TYPE={SOURCE_TYPE}][JOB_ITEM_ID={job_item_id}][PROMPT_TYPE={prompt_type}]"
-    body = "\n\n".join(x for x in content_lines if x).strip()
-    if not body:
-        return []
-    return [f"{header}\n\n{body}"]
+        source_item_id = normalize_text(row["speech_id"]) or f"speech_{sort_no}"
+        row_id = f'{issue_id}:{source_item_id}'
+
+        chunk_inputs.append(
+            {
+                "sort_no": sort_no,
+                "content_text": text,
+                "source_item_id": source_item_id,
+                "content_type": "speech",
+                "row_id": row_id,
+            }
+        )
+        sort_no += 1
+
+    if not chunk_inputs:
+        raise HTTPException(status_code=400, detail=f"chunk inputs are empty: {issue_id}")
+
+    return chunk_inputs
+
+
+def build_prompt_text(
+    prompt_template: str,
+    chunk,
+    *,
+    max_prompt_chars: int | None = None,
+) -> str:
+    template = (prompt_template or "").strip()
+    if not template:
+        raise RuntimeError("prompt template is empty")
+
+    chunk_text = render_chunk_text(chunk, include_source_item_id=False).strip()
+    if not chunk_text:
+        raise RuntimeError("chunk_text is empty")
+
+    prompt = f"{template}\n\n{chunk_text}".strip()
+
+    if max_prompt_chars is not None and len(prompt) > int(max_prompt_chars):
+        raise RuntimeError(
+            f"prompt exceeds max_chars after template merge: "
+            f"len={len(prompt)}, max_chars={max_prompt_chars}, chunk_no={chunk.chunk_no}"
+        )
+
+    return prompt
 
 
 def build_kokkai_chunk_rows(
     conn: sqlite3.Connection,
     job_item_id: str,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    chunk_config = load_chunk_config()
+    if not chunk_config:
+        raise HTTPException(status_code=500, detail="openai_chunk.json could not be loaded from GCS")
 
-    qa_prompts = build_kokkai_prompt_texts(conn, job_item_id, "qa")
-    for idx, prompt in enumerate(qa_prompts, start=1):
-        rows.append(
+    qa_conf = get_required_kokkai_chunk_conf(chunk_config, "qa")
+    plain_conf = get_required_kokkai_chunk_conf(chunk_config, "plain")
+
+    qa_chunk_config_raw = to_chunk_config(qa_conf)
+    plain_chunk_config_raw = to_chunk_config(plain_conf)
+
+    qa_template = load_template_text(PROMPT_TEMPLATE_PATHS["kokkai"]["qa"])
+    plain_template = load_template_text(PROMPT_TEMPLATE_PATHS["kokkai"]["plain"])
+
+    if not qa_template:
+        raise HTTPException(status_code=500, detail="kokkai QA prompt template is empty")
+
+    if not plain_template:
+        raise HTTPException(status_code=500, detail="kokkai PLAIN prompt template is empty")
+
+    qa_chunk_config = to_prompt_safe_chunk_config(qa_chunk_config_raw, qa_template)
+    plain_chunk_config = to_prompt_safe_chunk_config(plain_chunk_config_raw, plain_template)
+
+    chunk_inputs = build_kokkai_chunk_inputs(conn, job_item_id)
+    created_at = utc_now_iso()
+
+    chunk_rows: list[dict[str, Any]] = []
+
+    qa_chunks = build_chunks(chunk_inputs, qa_chunk_config)
+    for chunk in qa_chunks:
+        prompt = build_prompt_text(
+            qa_template,
+            chunk,
+            max_prompt_chars=qa_chunk_config_raw.max_chars,
+        )
+        chunk_rows.append(
             {
-                "chunk_no": idx,
+                "chunk_no": chunk.chunk_no,
                 "prompt_type": "qa",
                 "prompt": prompt,
-                "row_count": 0,
+                "row_count": chunk.item_count,
                 "status": "new",
+                "created_at": created_at,
             }
         )
 
-    plain_prompts = build_kokkai_prompt_texts(conn, job_item_id, "plain")
-    base_no = len(rows)
-    for idx, prompt in enumerate(plain_prompts, start=1):
-        rows.append(
+    plain_chunks = build_chunks(chunk_inputs, plain_chunk_config)
+    plain_chunk_no_base = len(qa_chunks)
+
+    for chunk in plain_chunks:
+        actual_chunk_no = plain_chunk_no_base + chunk.chunk_no
+        prompt = build_prompt_text(
+            plain_template,
+            chunk,
+            max_prompt_chars=plain_chunk_config_raw.max_chars,
+        )
+        chunk_rows.append(
             {
-                "chunk_no": base_no + idx,
+                "chunk_no": actual_chunk_no,
                 "prompt_type": "plain",
                 "prompt": prompt,
-                "row_count": 0,
+                "row_count": chunk.item_count,
                 "status": "new",
+                "created_at": created_at,
             }
         )
 
-    return rows
+    if not chunk_rows:
+        raise HTTPException(status_code=400, detail=f"chunk generation result is empty: {job_item_id}")
+
+    return chunk_rows

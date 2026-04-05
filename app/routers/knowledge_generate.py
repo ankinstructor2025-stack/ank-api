@@ -24,8 +24,6 @@ from .knowledge_generate_common import (
 
 from .knowledge_generate_kokkai import SOURCE_TYPE as KOKKAI_SOURCE_TYPE
 from .knowledge_generate_kokkai import (
-    fetch_kokkai_source_rows,
-    insert_kokkai_contents,
     build_kokkai_chunk_rows,
 )
 
@@ -137,8 +135,6 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     )
 
     if source_type == KOKKAI_SOURCE_TYPE:
-        source_rows = fetch_kokkai_source_rows(local_db_path, item.parent_source_id or "")
-        insert_kokkai_contents(conn, job_id, job_item_id, source_rows)
         chunk_rows = build_kokkai_chunk_rows(conn, job_item_id)
 
     elif source_type == OPENDATA_SOURCE_TYPE:
