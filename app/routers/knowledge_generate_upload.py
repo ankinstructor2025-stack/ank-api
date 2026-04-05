@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException
 from google.cloud import storage
 
 from .knowledge_generate_common import (
@@ -11,7 +12,6 @@ from .knowledge_generate_common import (
     PROMPT_TEMPLATE_PATHS,
     load_chunk_config,
     load_template_text,
-    now_iso,
     open_user_db,
 )
 from .content_splitter_csv import split_csv_records
@@ -21,19 +21,15 @@ from .openai_chunking import ChunkConfig, build_chunks, render_chunk_text
 
 
 SOURCE_TYPE = "upload"
-SUPPORTED_UPLOAD_EXTS = {"pdf", "csv", "txt"}
+SUPPORTED_UPLOAD_EXTS = {"pdf", "csv", "txt", "json"}
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def build_chunk_id(
-    job_item_id: str,
-    prompt_type: str,
-    chunk_no: int,
-) -> str:
-    return f"{job_item_id}_{prompt_type}_{chunk_no}"
+def normalize_text(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def normalize_upload_ext(ext: str | None) -> str:
@@ -43,21 +39,52 @@ def normalize_upload_ext(ext: str | None) -> str:
     return value
 
 
+def build_chunk_id(
+    job_id: str,
+    job_item_id: str,
+    prompt_type: str,
+    chunk_no: int,
+) -> str:
+    return f"{job_id}_{job_item_id}_{prompt_type}_{chunk_no}"
+
+
+def stringify_csv_row(record: dict[str, Any]) -> str:
+    values: list[str] = []
+
+    for key, value in record.items():
+        key_text = str(key or "").strip()
+        value_text = str(value or "").strip()
+
+        if not key_text and not value_text:
+            continue
+
+        if key_text:
+            values.append(f"{key_text}: {value_text}")
+        else:
+            values.append(value_text)
+
+    return " | ".join(values).strip()
+
+
 def build_upload_gcs_path(file_row: sqlite3.Row) -> str:
     """
-    upload_files に gcs_path が無い前提。
-    既存の保存規則 users/{uid}/uploads/... はここでは復元できないため、
-    file_name に既に GCSパスが入っている運用を前提にしない。
-    代わりに upload_files に gcs_path がある場合を優先し、
-    無ければ file_name が users/ から始まるときだけ GCSパスとして扱う。
+    upload_files に gcs_path がある場合はそれを優先。
+    無い場合は file_name が users/ から始まるときだけ GCS パスとして扱う。
     """
-    gcs_path = str(file_row["gcs_path"] or "").strip() if "gcs_path" in file_row.keys() else ""
-    if gcs_path:
-        return gcs_path
+    keys = set(file_row.keys())
 
-    file_name = str(file_row["file_name"] or "").strip()
+    if "gcs_path" in keys:
+        gcs_path = str(file_row["gcs_path"] or "").strip()
+        if gcs_path:
+            return gcs_path
+
+    file_name = str(file_row["file_name"] or "").strip() if "file_name" in keys else ""
     if file_name.startswith("users/"):
         return file_name
+
+    file_path = str(file_row["file_path"] or "").strip() if "file_path" in keys else ""
+    if file_path.startswith("users/"):
+        return file_path
 
     raise RuntimeError("upload gcs_path not found. upload_files.gcs_path is required.")
 
@@ -78,6 +105,7 @@ def download_gcs_binary(gcs_path: str) -> bytes:
 
 def get_required_upload_chunk_conf(
     chunk_config: dict[str, Any],
+    ext: str,
     prompt_type: str,
 ) -> dict[str, Any]:
     if not chunk_config:
@@ -87,11 +115,21 @@ def get_required_upload_chunk_conf(
     if not upload_conf:
         raise RuntimeError("openai_chunk.json: 'upload' section missing")
 
-    conf = upload_conf.get(prompt_type)
-    if not conf:
-        raise RuntimeError(f"openai_chunk.json: upload.{prompt_type} missing")
+    ext_norm = normalize_upload_ext(ext)
 
-    return conf
+    # 新形式: upload.<ext>.<prompt_type>
+    ext_conf = upload_conf.get(ext_norm)
+    if isinstance(ext_conf, dict):
+        conf = ext_conf.get(prompt_type)
+        if conf:
+            return conf
+
+    # 後方互換: upload.<prompt_type>
+    legacy_conf = upload_conf.get(prompt_type)
+    if legacy_conf:
+        return legacy_conf
+
+    raise RuntimeError(f"openai_chunk.json: upload.{ext_norm}.{prompt_type} missing")
 
 
 def to_chunk_config(conf: dict[str, Any]) -> ChunkConfig:
@@ -207,28 +245,10 @@ def split_upload_binary(
     if ext_norm == "csv":
         return split_csv_records(binary, max_rows=2000)
 
-    if ext_norm == "txt":
+    if ext_norm in {"txt", "json"}:
         return split_text_records(binary, max_rows=2000)
 
     raise RuntimeError(f"unsupported upload ext: {ext_norm}")
-
-
-def csv_record_to_text(record: dict[str, Any]) -> str:
-    values: list[str] = []
-
-    for key, value in record.items():
-        key_text = str(key or "").strip()
-        value_text = str(value or "").strip()
-
-        if not key_text and not value_text:
-            continue
-
-        if key_text:
-            values.append(f"{key_text}: {value_text}")
-        else:
-            values.append(value_text)
-
-    return " | ".join(values).strip()
 
 
 def record_to_content_text(
@@ -239,7 +259,7 @@ def record_to_content_text(
 
     if ext_norm == "csv":
         if isinstance(record, dict):
-            return csv_record_to_text(record)
+            return stringify_csv_row(record)
         return str(record or "").strip()
 
     if isinstance(record, dict):
@@ -264,7 +284,7 @@ def record_to_suffix(
 def expand_upload_contents_to_chunk_inputs(
     conn: sqlite3.Connection,
     job_item_id: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     content_rows = fetch_upload_content_rows(conn, job_item_id)
 
     if not content_rows:
@@ -272,25 +292,28 @@ def expand_upload_contents_to_chunk_inputs(
 
     expanded_rows: list[dict[str, Any]] = []
     global_sort_no = 1
+    detected_ext: str | None = None
 
     for content_row in content_rows:
         file_path = normalize_text(content_row["content_text"])
-        ext = normalize_upload_chunk_ext(content_row["content_type"])
+        ext = normalize_upload_ext(content_row["content_type"])
 
         if not file_path:
             continue
 
-        if ext not in {"pdf", "csv", "txt"}:
+        if ext not in SUPPORTED_UPLOAD_EXTS:
             raise HTTPException(status_code=400, detail=f"unsupported upload ext: {ext}")
 
-        binary = download_gcs_binary(file_path)
+        if detected_ext is None:
+            detected_ext = ext
+        elif detected_ext != ext:
+            raise HTTPException(
+                status_code=400,
+                detail=f"multiple upload content types are not supported in one job_item: {job_item_id}",
+            )
 
-        if ext == "pdf":
-            records = split_pdf_records(binary, max_rows=2000)
-        elif ext == "csv":
-            records = split_csv_records(binary, max_rows=2000)
-        else:
-            records = split_text_records(binary, max_rows=2000)
+        binary = download_gcs_binary(file_path)
+        records = split_upload_binary(binary, ext=ext)
 
         base_source_item_id = normalize_text(content_row["source_item_id"]) or file_path
         base_row_id = normalize_text(content_row["row_id"]) or file_path
@@ -299,20 +322,11 @@ def expand_upload_contents_to_chunk_inputs(
         for record in records:
             local_index += 1
 
-            if ext == "csv":
-                text = stringify_csv_row(record if isinstance(record, dict) else {"value": record})
-            elif isinstance(record, dict):
-                text = normalize_text(record.get("text"))
-            else:
-                text = normalize_text(record)
-
+            text = record_to_content_text(ext, record)
             if not text:
                 continue
 
-            if ext == "pdf" and isinstance(record, dict):
-                suffix = f"page_{record.get('page', local_index)}"
-            else:
-                suffix = str(local_index)
+            suffix = record_to_suffix(ext, record, local_index)
 
             expanded_rows.append(
                 {
@@ -328,7 +342,10 @@ def expand_upload_contents_to_chunk_inputs(
     if not expanded_rows:
         raise HTTPException(status_code=400, detail=f"expanded content is empty: {job_item_id}")
 
-    return expanded_rows
+    if not detected_ext:
+        raise HTTPException(status_code=400, detail=f"upload ext could not be determined: {job_item_id}")
+
+    return expanded_rows, detected_ext
 
 
 def build_prompt_text(
@@ -365,8 +382,10 @@ def build_upload_chunk_rows(
     if not chunk_config:
         raise HTTPException(status_code=500, detail="openai_chunk.json could not be loaded from GCS")
 
-    qa_conf = get_required_upload_chunk_conf(chunk_config, "qa")
-    plain_conf = get_required_upload_chunk_conf(chunk_config, "plain")
+    expanded_rows, upload_ext = expand_upload_contents_to_chunk_inputs(conn, job_item_id)
+
+    qa_conf = get_required_upload_chunk_conf(chunk_config, upload_ext, "qa")
+    plain_conf = get_required_upload_chunk_conf(chunk_config, upload_ext, "plain")
 
     qa_chunk_config_raw = to_chunk_config(qa_conf)
     plain_chunk_config_raw = to_chunk_config(plain_conf)
@@ -383,9 +402,7 @@ def build_upload_chunk_rows(
     qa_chunk_config = to_prompt_safe_chunk_config(qa_chunk_config_raw, qa_template)
     plain_chunk_config = to_prompt_safe_chunk_config(plain_chunk_config_raw, plain_template)
 
-    expanded_rows = expand_upload_contents_to_chunk_inputs(conn, job_item_id)
     created_at = utc_now_iso()
-
     chunk_rows: list[dict[str, Any]] = []
 
     qa_chunks = build_chunks(expanded_rows, qa_chunk_config)
