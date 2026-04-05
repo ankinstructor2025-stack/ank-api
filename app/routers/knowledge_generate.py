@@ -135,7 +135,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
     )
 
     if source_type == KOKKAI_SOURCE_TYPE:
-        chunk_rows = build_kokkai_chunk_rows(conn, job_item_id)
+        chunk_rows = build_kokkai_chunk_rows(conn, local_db_path, job_item_id)
 
     elif source_type == OPENDATA_SOURCE_TYPE:
         insert_opendata_contents_from_files(
