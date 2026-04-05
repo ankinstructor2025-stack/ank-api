@@ -98,7 +98,7 @@ async def upload_and_register(
             raise HTTPException(status_code=409, detail="同名ファイルはアップロードできません")
 
         # ⚠ GCSパスは一旦現状維持（壊さない）
-        upload_blob_path = f"users/{uid}/uploads/{file_id}_{file_name}"
+        upload_blob_path = f"users/{uid}/uploads/{file_id}.{ext}"
         upload_blob = bucket.blob(upload_blob_path)
 
         file.file.seek(0)
@@ -109,12 +109,13 @@ async def upload_and_register(
         cur.execute(
             """
             INSERT INTO upload_files
-            (file_id, file_name, ext, created_at)
-            VALUES (?, ?, ?, ?)
+            (file_id, file_name, file_path, ext, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 file_id,
                 file_name,
+                upload_blob_path,
                 ext,
                 created_at,
             ),
@@ -130,7 +131,7 @@ async def upload_and_register(
             "file_name": file_name,
             "ext": ext,
             "created_at": created_at,
-            "gcs_path": upload_blob_path
+            "file_path": upload_blob_path
         }
 
     finally:
