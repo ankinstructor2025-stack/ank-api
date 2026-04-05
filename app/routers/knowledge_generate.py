@@ -332,7 +332,7 @@ def build_job_status_dict(
 
     now = now_iso()
 
-    if status in ("queued", "running") and not started_at:
+    if status == "running" and not started_at:
         started_at = now
 
     if status in ("done", "partial_error") and not finished_at:
@@ -614,6 +614,15 @@ def execute_chunk(body: dict):
             ("running", now_iso(), job_id),
         )
         conn.commit()
+
+        write_job_status_json(
+            conn=conn,
+            uid=uid,
+            job_id=job_id,
+            forced_status="running",
+            forced_phase="execute_chunk",
+            forced_error_message=None,
+        )
 
         try:
             result = run_llm_json(
