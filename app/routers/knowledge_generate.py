@@ -19,6 +19,7 @@ from .knowledge_generate_common import (
     insert_job_chunks,
     now_iso,
     new_id,
+    download_user_db_from_gcs,
 )
 
 from .knowledge_generate_kokkai import SOURCE_TYPE as KOKKAI_SOURCE_TYPE
@@ -456,7 +457,7 @@ def create_job(request: Request, body: KnowledgeJobCreateRequest):
         raise HTTPException(status_code=400, detail="items is empty")
 
     uid = get_uid_from_auth_header(request.headers.get("Authorization"))
-    local_user_path = local_user_db_path(uid)
+    local_user_path = download_user_db_from_gcs(uid)
 
     job_id = new_id()
     requested_at = now_iso()

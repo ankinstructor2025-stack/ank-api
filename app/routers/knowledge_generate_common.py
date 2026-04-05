@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
+from google.cloud import storage
 
 from app.core.common import local_user_db_path
 
@@ -333,6 +334,27 @@ def insert_upload_contents_from_files(
     )
 
     return 1
+
+
+from google.cloud import storage
+
+
+def download_user_db_from_gcs(uid: str) -> str:
+    local_db_path = local_user_db_path(uid)
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    gcs_path = f"users/{uid}/ank.db"
+    blob = bucket.blob(gcs_path)
+
+    if not blob.exists():
+        raise RuntimeError(f"user ank.db not found in GCS: gs://{BUCKET_NAME}/{gcs_path}")
+
+    os.makedirs(os.path.dirname(local_db_path), exist_ok=True)
+    blob.download_to_filename(local_db_path)
+
+    return local_db_path
 
 
 # -----------------------------
