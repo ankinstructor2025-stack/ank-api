@@ -39,8 +39,6 @@ from .knowledge_generate_upload import (
 
 from .knowledge_generate_public_url import SOURCE_TYPE as PUBLIC_URL_SOURCE_TYPE
 from .knowledge_generate_public_url import (
-    fetch_url_page_rows,
-    insert_url_contents,
     build_public_url_chunk_rows,
 )
 
@@ -158,9 +156,7 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
         chunk_rows = build_upload_chunk_rows(conn, job_id, job_item_id)
 
     elif source_type == PUBLIC_URL_SOURCE_TYPE:
-        source_rows = fetch_url_page_rows(local_db_path, item.parent_source_id or "")
-        insert_url_contents(conn, job_id, job_item_id, source_rows)
-        chunk_rows = build_public_url_chunk_rows(conn, job_item_id)
+        chunk_rows = build_public_url_chunk_rows(conn, local_db_path, job_item_id)
 
     else:
         raise HTTPException(status_code=400, detail=f"unsupported source_type: {source_type}")
