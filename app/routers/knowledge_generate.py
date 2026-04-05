@@ -15,6 +15,7 @@ from .knowledge_generate_common import (
     create_job_item_record,
     open_user_db,
     insert_opendata_contents_from_files,
+    insert_upload_contents_from_files,
     insert_job_chunks,
     now_iso,
     new_id,
@@ -26,16 +27,17 @@ from .knowledge_generate_kokkai import (
     insert_kokkai_contents,
     build_kokkai_chunk_rows,
 )
+
 from .knowledge_generate_opendata import SOURCE_TYPE as OPENDATA_SOURCE_TYPE
 from .knowledge_generate_opendata import (
     build_opendata_chunk_rows,
 )
+
 from .knowledge_generate_upload import SOURCE_TYPE as UPLOAD_SOURCE_TYPE
 from .knowledge_generate_upload import (
-    fetch_upload_file_row,
-    insert_upload_contents,
     build_upload_chunk_rows,
 )
+
 from .knowledge_generate_public_url import SOURCE_TYPE as PUBLIC_URL_SOURCE_TYPE
 from .knowledge_generate_public_url import (
     fetch_url_page_rows,
@@ -149,9 +151,14 @@ def prepare_job_item(conn, local_db_path: str, job_id: str, item: KnowledgeTarge
         chunk_rows = build_opendata_chunk_rows(conn, job_id, job_item_id)
 
     elif source_type == UPLOAD_SOURCE_TYPE:
-        file_row = fetch_upload_file_row(local_db_path, item.parent_source_id or "")
-        insert_upload_contents(conn, job_id, job_item_id, file_row)
-        chunk_rows = build_upload_chunk_rows(conn, job_item_id)
+        insert_upload_contents_from_files(
+            conn=conn,
+            local_db_path=local_db_path,
+            job_id=job_id,
+            job_item_id=job_item_id,
+            source_id=item.parent_source_id or "",
+        )
+        chunk_rows = build_upload_chunk_rows(conn, job_id, job_item_id)
 
     elif source_type == PUBLIC_URL_SOURCE_TYPE:
         source_rows = fetch_url_page_rows(local_db_path, item.parent_source_id or "")

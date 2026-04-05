@@ -255,6 +255,86 @@ def insert_opendata_contents_from_files(
     return count
 
 
+def insert_upload_contents_from_files(
+    conn: sqlite3.Connection,
+    local_db_path: str,
+    job_id: str,
+    job_item_id: str,
+    source_id: str,
+) -> int:
+
+    src_conn = open_user_db(local_db_path)
+    try:
+        row = src_conn.execute(
+            """
+            SELECT
+                file_id,
+                file_name,
+                file_path,
+                ext
+            FROM upload_files
+            WHERE file_id = ?
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+    finally:
+        src_conn.close()
+
+    if not row:
+        return 0
+
+    file_id = str(row["file_id"] or "").strip()
+    file_path = str(row["file_path"] or "").strip()
+    ext = str(row["ext"] or "").strip().lower()
+
+    if not file_id:
+        raise RuntimeError(f"upload_files.file_id is empty: source_id={source_id}")
+
+    if not file_path:
+        raise RuntimeError(f"upload_files.file_path is empty: source_id={source_id}")
+
+    if ext == "text":
+        ext = "txt"
+
+    if ext not in {"pdf", "csv", "txt"}:
+        raise RuntimeError(f"unsupported upload ext: {ext}")
+
+    conn.execute(
+        """
+        INSERT INTO knowledge_contents (
+            job_id,
+            job_item_id,
+            source_type,
+            source_id,
+            source_item_id,
+            row_id,
+            content_type,
+            content_text,
+            sort_no,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            job_item_id,
+            "upload",
+            file_id,
+            file_id,
+            file_id,
+            ext,
+            file_path,
+            1,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    return 1
+
+
 # -----------------------------
 # CHUNK
 # -----------------------------
