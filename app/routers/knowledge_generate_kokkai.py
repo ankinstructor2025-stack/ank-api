@@ -10,7 +10,6 @@ from .knowledge_generate_common import (
     PROMPT_TEMPLATE_PATHS,
     load_chunk_config,
     load_template_text,
-    now_iso,
     open_user_db,
 )
 from .openai_chunking import ChunkConfig, build_chunks, render_chunk_text
@@ -91,23 +90,21 @@ def to_prompt_safe_chunk_config(
     )
 
 
-def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sqlite3.Row | None:
-    cur = conn.execute(
+def fetch_kokkai_job_item_meta(
+    task_conn: sqlite3.Connection,
+    job_item_id: str,
+) -> sqlite3.Row | None:
+    cur = task_conn.execute(
         """
         SELECT
-            ji.job_item_id,
-            ji.parent_source_id,
-            ji.parent_label,
-            ji.parent_key1,
-            ji.parent_key2,
-            ji.row_count,
-            d.name_of_house,
-            d.name_of_meeting,
-            d.logical_name
-        FROM knowledge_job_items ji
-        LEFT JOIN kokkai_documents d
-          ON d.issue_id = ji.parent_source_id
-        WHERE ji.job_item_id = ?
+            job_item_id,
+            parent_source_id,
+            parent_label,
+            parent_key1,
+            parent_key2,
+            row_count
+        FROM knowledge_job_items
+        WHERE job_item_id = ?
         LIMIT 1
         """,
         (job_item_id,),
@@ -115,28 +112,61 @@ def fetch_kokkai_job_item_meta(conn: sqlite3.Connection, job_item_id: str) -> sq
     return cur.fetchone()
 
 
-def fetch_kokkai_speech_rows_for_chunk(
-    conn: sqlite3.Connection,
+def fetch_kokkai_document_meta(
+    local_db_path: str,
+    issue_id: str,
+) -> sqlite3.Row | None:
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                issue_id,
+                status,
+                logical_name,
+                source_key,
+                name_of_house,
+                name_of_meeting,
+                row_count,
+                source_url,
+                created_at
+            FROM kokkai_documents
+            WHERE issue_id = ?
+            LIMIT 1
+            """,
+            (issue_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def fetch_kokkai_speech_rows(
+    local_db_path: str,
     issue_id: str,
 ) -> list[sqlite3.Row]:
-    cur = conn.execute(
-        """
-        SELECT
-            issue_id,
-            speech_id,
-            speech_order,
-            status,
-            speaker,
-            speech,
-            created_at,
-            updated_at
-        FROM kokkai_document_rows
-        WHERE issue_id = ?
-        ORDER BY speech_order, speech_id
-        """,
-        (issue_id,),
-    )
-    return cur.fetchall()
+    conn = open_user_db(local_db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                issue_id,
+                speech_id,
+                speech_order,
+                status,
+                speaker,
+                speech,
+                created_at,
+                updated_at
+            FROM kokkai_document_rows
+            WHERE issue_id = ?
+            ORDER BY speech_order, speech_id
+            """,
+            (issue_id,),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
 
 
 def speech_row_to_chunk_text(row: sqlite3.Row) -> str:
@@ -153,10 +183,11 @@ def speech_row_to_chunk_text(row: sqlite3.Row) -> str:
 
 
 def build_kokkai_chunk_inputs(
-    conn: sqlite3.Connection,
+    task_conn: sqlite3.Connection,
+    local_db_path: str,
     job_item_id: str,
 ) -> list[dict[str, Any]]:
-    meta = fetch_kokkai_job_item_meta(conn, job_item_id)
+    meta = fetch_kokkai_job_item_meta(task_conn, job_item_id)
     if not meta:
         raise HTTPException(status_code=404, detail=f"knowledge_job_items not found: {job_item_id}")
 
@@ -164,7 +195,11 @@ def build_kokkai_chunk_inputs(
     if not issue_id:
         raise HTTPException(status_code=400, detail=f"parent_source_id is empty: {job_item_id}")
 
-    rows = fetch_kokkai_speech_rows_for_chunk(conn, issue_id)
+    doc_meta = fetch_kokkai_document_meta(local_db_path, issue_id)
+    if not doc_meta:
+        raise HTTPException(status_code=404, detail=f"kokkai_documents not found: {issue_id}")
+
+    rows = fetch_kokkai_speech_rows(local_db_path, issue_id)
     if not rows:
         raise HTTPException(status_code=400, detail=f"kokkai_document_rows is empty: {issue_id}")
 
@@ -177,7 +212,7 @@ def build_kokkai_chunk_inputs(
             continue
 
         source_item_id = normalize_text(row["speech_id"]) or f"speech_{sort_no}"
-        row_id = f'{issue_id}:{source_item_id}'
+        row_id = f"{issue_id}:{source_item_id}"
 
         chunk_inputs.append(
             {
@@ -222,7 +257,8 @@ def build_prompt_text(
 
 
 def build_kokkai_chunk_rows(
-    conn: sqlite3.Connection,
+    task_conn: sqlite3.Connection,
+    local_db_path: str,
     job_item_id: str,
 ) -> list[dict[str, Any]]:
     chunk_config = load_chunk_config()
@@ -247,7 +283,7 @@ def build_kokkai_chunk_rows(
     qa_chunk_config = to_prompt_safe_chunk_config(qa_chunk_config_raw, qa_template)
     plain_chunk_config = to_prompt_safe_chunk_config(plain_chunk_config_raw, plain_template)
 
-    chunk_inputs = build_kokkai_chunk_inputs(conn, job_item_id)
+    chunk_inputs = build_kokkai_chunk_inputs(task_conn, local_db_path, job_item_id)
     created_at = utc_now_iso()
 
     chunk_rows: list[dict[str, Any]] = []
